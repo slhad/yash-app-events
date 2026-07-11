@@ -1,7 +1,7 @@
 /target/
+/artifacts/gui-acceptance/
 **/*.rs.bk
 .idea/
 .vscode/
 *.swp
 result
-

@@ -92,7 +92,20 @@ impl Worker {
                 };
                 runtime.block_on(async move {
                     let mut client = None;
+                    let mut preview_requested = false;
+                    let mut freeze_requested = false;
                     while let Some(request) = request_receiver.recv().await {
+                        match request.method {
+                            method::PREVIEW_START => preview_requested = true,
+                            method::PREVIEW_STOP => {
+                                preview_requested = false;
+                                freeze_requested = false;
+                            }
+                            method::PREVIEW_FREEZE => freeze_requested = true,
+                            method::PREVIEW_UNFREEZE => freeze_requested = false,
+                            _ => {}
+                        }
+                        let mut reconnected = false;
                         if client.is_none() {
                             match UnixRpcClient::connect(
                                 &socket,
@@ -102,7 +115,10 @@ impl Worker {
                             )
                             .await
                             {
-                                Ok(connected) => client = Some(connected),
+                                Ok(connected) => {
+                                    client = Some(connected);
+                                    reconnected = true;
+                                }
                                 Err(error) => {
                                     let _ = response_sender.send(Response {
                                         kind: request.kind,
@@ -110,6 +126,30 @@ impl Worker {
                                     });
                                     continue;
                                 }
+                            }
+                        }
+                        if reconnected
+                            && preview_requested
+                            && request.method != method::PREVIEW_START
+                        {
+                            let restore = async {
+                                let client = client.as_mut().expect("client was initialized");
+                                client.call(method::PREVIEW_START, Value::Null).await?;
+                                if freeze_requested {
+                                    client.call(method::PREVIEW_FREEZE, Value::Null).await?;
+                                }
+                                Ok::<(), ClientError>(())
+                            }
+                            .await;
+                            if let Err(error) = restore {
+                                client = None;
+                                let _ = response_sender.send(Response {
+                                    kind: request.kind,
+                                    payload: Payload::Error(format!(
+                                        "restore preview session: {error}"
+                                    )),
+                                });
+                                continue;
                             }
                         }
                         let params = if request.kind == RequestKind::Replay {
@@ -313,6 +353,7 @@ impl App {
                     self.preview_pending = false;
                 }
                 Payload::Preview(image) => {
+                    self.error = None;
                     let color = egui::ColorImage::from_rgba_unmultiplied(
                         [image.width, image.height],
                         &image.rgba,
@@ -329,6 +370,7 @@ impl App {
                     original,
                     processed,
                 } => {
+                    self.error = None;
                     self.detector_result = value;
                     self.original_texture = Some(load_preview_texture(
                         context,
@@ -355,56 +397,65 @@ impl App {
                         ));
                     }
                 }
-                Payload::Json(value) => match response.kind {
-                    RequestKind::Profiles => self.apply_profiles(value),
-                    RequestKind::Status => self.status = value,
-                    RequestKind::State => {
-                        let sequence = value["sequence"].as_u64().unwrap_or(0);
-                        if sequence > self.last_state_sequence {
-                            self.push_timeline(format!(
-                                "transition {} · seq {sequence} · {}",
-                                value["updated_at"].as_str().unwrap_or("unknown time"),
-                                value["events"]
-                            ));
-                            self.last_state_sequence = sequence;
+                Payload::Json(value) => {
+                    self.error = None;
+                    match response.kind {
+                        RequestKind::Profiles => self.apply_profiles(value),
+                        RequestKind::Status => self.status = value,
+                        RequestKind::State => {
+                            let sequence = value["sequence"].as_u64().unwrap_or(0);
+                            if sequence > self.last_state_sequence {
+                                self.push_timeline(format!(
+                                    "transition {} · seq {sequence} · {}",
+                                    value["updated_at"].as_str().unwrap_or("unknown time"),
+                                    value["events"]
+                                ));
+                                self.last_state_sequence = sequence;
+                            }
+                            self.state = value;
                         }
-                        self.state = value;
-                    }
-                    RequestKind::Commit => {
-                        self.error = None;
-                        self.dirty_since = None;
-                        self.draft_saved = false;
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
-                    }
-                    RequestKind::Draft => self.draft_saved = true,
-                    RequestKind::Mutation | RequestKind::Create => {
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
-                    }
-                    RequestKind::Capture => self.capture_status = value,
-                    RequestKind::PreviewStart => {
-                        self.preview_enabled = value["enabled"].as_bool().unwrap_or(false);
-                    }
-                    RequestKind::PreviewStop => {
-                        self.preview_enabled = false;
-                        self.preview_pending = false;
-                    }
-                    RequestKind::PreviewFrame => {}
-                    RequestKind::DetectorTest => {
-                        self.detector_result = value;
-                        self.test_pending = false;
-                    }
-                    RequestKind::TemplateCapture => {
-                        if let Some(path) = value["path"].as_str() {
-                            self.add_template_path(path.into());
+                        RequestKind::Commit => {
+                            self.error = None;
+                            self.dirty_since = None;
+                            self.draft_saved = false;
+                            self.worker.send(
+                                RequestKind::Profiles,
+                                method::PROFILE_LIST,
+                                Value::Null,
+                            );
+                        }
+                        RequestKind::Draft => self.draft_saved = true,
+                        RequestKind::Mutation | RequestKind::Create => {
+                            self.worker.send(
+                                RequestKind::Profiles,
+                                method::PROFILE_LIST,
+                                Value::Null,
+                            );
+                        }
+                        RequestKind::Capture => self.capture_status = value,
+                        RequestKind::PreviewStart => {
+                            self.preview_enabled = value["enabled"].as_bool().unwrap_or(false);
+                        }
+                        RequestKind::PreviewStop => {
+                            self.preview_enabled = false;
+                            self.preview_pending = false;
+                        }
+                        RequestKind::PreviewFrame => {}
+                        RequestKind::DetectorTest => {
+                            self.detector_result = value;
+                            self.test_pending = false;
+                        }
+                        RequestKind::TemplateCapture => {
+                            if let Some(path) = value["path"].as_str() {
+                                self.add_template_path(path.into());
+                            }
+                        }
+                        RequestKind::Replay => {
+                            self.replay_result = value;
+                            self.replay_frame = 0;
                         }
                     }
-                    RequestKind::Replay => {
-                        self.replay_result = value;
-                        self.replay_frame = 0;
-                    }
-                },
+                }
             }
         }
     }
@@ -1063,17 +1114,15 @@ impl App {
             }
             return;
         }
+        if response.clicked() {
+            self.selected_region = pointer_position.and_then(|position| {
+                region_at_position(&profile.elements, canvas, self.zoom, self.pan, position)
+            });
+        }
         if response.drag_started() {
             if let Some(position) = pointer_position {
-                self.selected_region = profile
-                    .elements
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, element)| {
-                        region_rect(canvas, self.zoom, self.pan, element.region).contains(position)
-                    })
-                    .map(|(index, _)| index);
+                self.selected_region =
+                    region_at_position(&profile.elements, canvas, self.zoom, self.pan, position);
                 if let Some(index) = self.selected_region {
                     let rect =
                         region_rect(canvas, self.zoom, self.pan, profile.elements[index].region);
@@ -1177,6 +1226,21 @@ fn region_rect(
         canvas.min + pan + egui::vec2(region.x * size.x, region.y * size.y),
         egui::vec2(region.width * size.x, region.height * size.y),
     )
+}
+
+fn region_at_position(
+    elements: &[Element],
+    canvas: egui::Rect,
+    zoom: f32,
+    pan: egui::Vec2,
+    position: egui::Pos2,
+) -> Option<usize> {
+    elements
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, element)| region_rect(canvas, zoom, pan, element.region).contains(position))
+        .map(|(index, _)| index)
 }
 
 fn fit_rect(outer: egui::Rect, size: egui::Vec2) -> egui::Rect {
@@ -1329,6 +1393,45 @@ mod tests {
                 width: 0.5,
                 height: 0.5
             }
+        );
+    }
+
+    #[test]
+    fn ordinary_click_hit_testing_selects_topmost_region() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let elements = vec![
+            default_element(NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            default_element(NormalizedRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.5,
+                height: 0.5,
+            }),
+        ];
+        assert_eq!(
+            region_at_position(
+                &elements,
+                canvas,
+                1.0,
+                egui::Vec2::ZERO,
+                egui::pos2(30.0, 30.0)
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            region_at_position(
+                &elements,
+                canvas,
+                1.0,
+                egui::Vec2::ZERO,
+                egui::pos2(90.0, 90.0)
+            ),
+            None
         );
     }
 }

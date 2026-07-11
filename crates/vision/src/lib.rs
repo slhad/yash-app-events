@@ -170,7 +170,11 @@ impl Detector for ColorBarDetector {
         let confidence = if lines == 0 {
             0.0
         } else {
-            line_scores.iter().sum::<f32>() / lines as f32
+            line_scores
+                .iter()
+                .map(|score| (score - 0.5).abs() * 2.0)
+                .sum::<f32>()
+                / lines as f32
         };
         Detection {
             value: Some(fill),
@@ -399,5 +403,29 @@ mod tests {
         );
         assert_eq!(result.status, DetectionStatus::Valid);
         assert_eq!(result.value, Some(0.5));
+    }
+
+    #[test]
+    fn low_fill_can_still_have_high_classification_confidence() {
+        let frame = bar_frame(1, false);
+        let mut detector = ColorBarDetector::new(ColorBarConfig {
+            direction: BarDirection::LeftToRight,
+            minimum_rgb: [180, 0, 0],
+            maximum_rgb: [255, 60, 60],
+            line_match_fraction: 0.8,
+            mask: None,
+        })
+        .unwrap();
+        let detection = detector.detect(
+            &frame,
+            NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(detection.value, Some(0.1));
+        assert_eq!(detection.confidence, Some(1.0));
     }
 }

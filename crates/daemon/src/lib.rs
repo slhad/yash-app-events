@@ -751,6 +751,61 @@ fn synthetic_health_frame(
     .map(Arc::new)
 }
 
+fn synthetic_color_bar_frame(
+    sequence: u64,
+    fill: u8,
+    direction: BarDirection,
+    minimum_rgb: [u8; 3],
+    maximum_rgb: [u8; 3],
+) -> Result<Arc<Frame>, yash_app_events_capture::FrameError> {
+    let (width, height) = match direction {
+        BarDirection::LeftToRight | BarDirection::RightToLeft => (10_usize, 2_usize),
+        BarDirection::TopToBottom | BarDirection::BottomToTop => (2_usize, 10_usize),
+    };
+    let mut background = minimum_rgb;
+    if let Some(channel) =
+        (0..3).find(|&channel| minimum_rgb[channel] > 0 || maximum_rgb[channel] < u8::MAX)
+    {
+        background[channel] = if minimum_rgb[channel] > 0 {
+            minimum_rgb[channel] - 1
+        } else {
+            maximum_rgb[channel] + 1
+        };
+    }
+    let fill = usize::from(fill.min(10));
+    let mut bytes = vec![0_u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let position = match direction {
+                BarDirection::LeftToRight => x,
+                BarDirection::RightToLeft => width - 1 - x,
+                BarDirection::TopToBottom => y,
+                BarDirection::BottomToTop => height - 1 - y,
+            };
+            let color = if position < fill {
+                minimum_rgb
+            } else {
+                background
+            };
+            let offset = (y * width + x) * 4;
+            bytes[offset..offset + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+        }
+    }
+    Frame::new(
+        sequence,
+        Duration::from_millis(sequence.saturating_mul(100)),
+        FrameLayout {
+            width: u32::try_from(width).unwrap_or(10),
+            height: u32::try_from(height).unwrap_or(2),
+            row_stride: width * 4,
+            format: PixelFormat::Rgba8,
+        },
+        Some("replay".into()),
+        Arc::from(bytes),
+    )
+    .map(Arc::new)
+}
+
 fn set_output_error(state: &State, error: &str) {
     tracing::error!(%error, "output write failed");
     *state
@@ -905,7 +960,7 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
     let mut processor = FrameProcessor::new(
         AnalysisScheduler::new(10).map_err(internal_error)?,
         detector,
-        element.region,
+        full_frame_region(),
         detector_id(&element.detector),
         element.id,
         numeric_rule,
@@ -945,7 +1000,7 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
     let mut processor = FrameProcessor::new(
         AnalysisScheduler::new(10).map_err(internal_error)?,
         configured_detector(&element.detector, &directory)?,
-        element.region,
+        full_frame_region(),
         detector_id(&element.detector),
         element.id,
         NumericRule::new(NumericRuleConfig {
@@ -960,15 +1015,21 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
         })
         .map_err(internal_error)?,
     );
-    let transitions = ReplaySource::new(frames)
-        .filter_map(|frame| processor.process(&frame)?.transition)
-        .collect::<Vec<_>>();
+    let mut observations = Vec::new();
+    let mut transitions = Vec::new();
+    for frame in ReplaySource::new(frames) {
+        let Some(processed) = processor.process(&frame) else {
+            continue;
+        };
+        observations.push(processed.observation);
+        transitions.extend(processed.transition);
+    }
     let metrics = evaluate_replay(
         &manifest.expected_events,
         &transitions,
         &manifest.regression,
     );
-    serde_json::to_value(json!({"metrics":metrics,"events":transitions})).map_err(internal_error)
+    Ok(json!({"metrics":metrics,"observations":observations,"events":transitions}))
 }
 
 fn replay_fixture_frames(
@@ -983,9 +1044,19 @@ fn replay_fixture_frames(
         .map(|(index, value)| {
             let sequence = u64::try_from(index).unwrap_or(u64::MAX);
             match detector {
-                ProfileDetector::ColorBar { .. } => {
-                    synthetic_health_frame(sequence, value.min(10)).map_err(internal_error)
-                }
+                ProfileDetector::ColorBar {
+                    direction,
+                    minimum_rgb,
+                    maximum_rgb,
+                    ..
+                } => synthetic_color_bar_frame(
+                    sequence,
+                    value,
+                    *direction,
+                    *minimum_rgb,
+                    *maximum_rgb,
+                )
+                .map_err(internal_error),
                 ProfileDetector::Template { templates, .. } => {
                     let template = templates.first().ok_or_else(|| {
                         RpcError::new(error_code::INVALID_PARAMS, "no template asset")
@@ -1004,6 +1075,15 @@ fn replay_fixture_frames(
             }
         })
         .collect()
+}
+
+const fn full_frame_region() -> NormalizedRegion {
+    NormalizedRegion {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2391,6 +2471,32 @@ mod tests {
         let preview = bounded_gray_preview(&image, 512).unwrap();
         assert_eq!((preview.width, preview.height), (480, 15));
         assert_eq!(preview.pixels.len(), 480 * 15);
+    }
+
+    #[test]
+    fn configured_color_replay_fixture_preserves_fill_value() {
+        let frame = synthetic_color_bar_frame(
+            0,
+            8,
+            BarDirection::LeftToRight,
+            [175, 175, 175],
+            [255, 255, 255],
+        )
+        .unwrap();
+        let mut detector = ColorBarDetector::new(ColorBarConfig {
+            direction: BarDirection::LeftToRight,
+            minimum_rgb: [175, 175, 175],
+            maximum_rgb: [255, 255, 255],
+            line_match_fraction: 0.8,
+            mask: None,
+        })
+        .unwrap();
+        let detection = detector.detect(&frame, full_frame_region());
+        assert_eq!(detection.value, Some(0.8));
+        assert_eq!(
+            detection.status,
+            yash_app_events_vision::DetectionStatus::Valid
+        );
     }
 
     #[tokio::test]
