@@ -12,6 +12,11 @@ workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 yash-app-events-capture = { path = "../capture" }
 yash-app-events-capture-pw = { path = "../capture-pw" }
 yash-app-events-engine = { path = "../engine" }
@@ -20,3 +25,5 @@ yash-app-events-profile = { path = "../profile" }
 yash-app-events-protocol = { path = "../protocol" }
 yash-app-events-vision = { path = "../vision" }
 
+[dev-dependencies]
+tempfile.workspace = true

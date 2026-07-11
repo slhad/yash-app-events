@@ -503,3 +503,9 @@ SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test;
 SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata (2026-07-11)
 SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
 SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)
+SPEC-ARCH-001 | IN_PROGRESS | daemon owns `ProfileStore`; concurrent GUI/CLI protocol clients are supported, capture/engine ownership remains pending
+SPEC-IPC-001 | VERIFIED | Tokio Unix-socket integration tests verify documented path configuration, runtime dir 0700, socket 0600, safe stale recovery, and no network listener (2026-07-11)
+SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB message, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)
+SPEC-IPC-003 | VERIFIED | transport test rejects pre-handshake methods and accepts protocol-v1 identification; incompatible version has stable structured code (2026-07-11)
+SPEC-IPC-004 | IN_PROGRESS | version/capabilities/status/shutdown, core profile operations, state, and subscriptions implemented; capture, full profile lifecycle, detector, and preview methods pending
+SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subscription.lagged`; bounded-channel test proves overwrite/lag behavior (2026-07-11)
