@@ -418,6 +418,7 @@ mod tests {
             socket_path: socket.clone(),
             data_root: directory.join("data"),
             config_root: directory.join("config"),
+            state_root: directory.join("state"),
             maximum_connections: 8,
         }));
         for _ in 0..100 {

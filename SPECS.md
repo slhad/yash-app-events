@@ -513,15 +513,17 @@ SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with globa
 SPEC-CAP-001 | IN_PROGRESS | validated backend-neutral CPU frame carries monotonic timestamp, dimensions, stride, RGB/RGBA format, and source identity; non-CPU representations pending
 SPEC-ARCH-003 | VERIFIED | `LatestFrameSlot` owns at most one frame; 10,000-frame test proves 9,999 replacements and next analysis receives sequence 9,999 (2026-07-11)
 SPEC-PROD-004 | IN_PROGRESS | scheduler validates 1–10 FPS and test proves 60 timestamped FPS yields exactly 10 analyses; daemon configuration integration pending
-SPEC-DET-001 | IN_PROGRESS | typed observation value/status/confidence/diagnostic contract implemented; detector integration pending
-SPEC-EVENT-001 | IN_PROGRESS | temporal `NumericRule` consumes observations independently from output; end-to-end sink wiring pending
+SPEC-DET-001 | VERIFIED | `FrameProcessor` attaches stable detector/element IDs to typed value/status/confidence/diagnostic results; errors retain no fabricated value; replay integration evidence (2026-07-11)
+SPEC-EVENT-001 | VERIFIED | detector output becomes an observation, `NumericRule` alone creates transitions, and only transitions reach sinks in daemon replay integration (2026-07-11)
 SPEC-EVENT-002 | IN_PROGRESS | numeric threshold, confidence, N-of-M, hysteresis, and cooldown implemented and tested; remaining eventual primitives pending
 SPEC-EVENT-003 | VERIFIED | synthetic health history emits exactly `entered` then `left`; no per-frame output and low-confidence/unknown samples add no false evidence (2026-07-11)
 SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1 JSON object per transition with all required fields (2026-07-11)
-SPEC-OUT-002 | IN_PROGRESS | schema-v1 atomic `StateSnapshot` implemented with interruption test; daemon live-state integration pending
+SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/timestamp/capture/profile/observations/events; atomic interruption and daemon `state.get` equality tests (2026-07-11)
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | IN_PROGRESS | output errors are typed/non-panicking and failure-injection tested; daemon status/log/IPC/GUI surfacing pending
 SPEC-DET-002 | IN_PROGRESS | RGB range detector supports four directions, configurable channel thresholds, optional binary mask, line threshold, normalized fill/confidence/diagnostic; broader synthetic variation and RPC pending
 SPEC-REPLAY-001 | IN_PROGRESS | `ReplaySource` frames feed the same `FrameProcessor<Detector>` boundary intended for live capture; daemon live wiring pending
 SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
 SPEC-REPLAY-003 | IN_PROGRESS | redistributable in-memory synthetic health fixtures cover bounded frames and transitions; repository manifest/fixture format pending
+SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
+SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)

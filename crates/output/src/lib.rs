@@ -25,7 +25,7 @@ pub struct EventRecord {
     pub event: String,
     pub state: EventState,
     pub value: Value,
-    pub confidence: f32,
+    pub confidence: f64,
 }
 
 impl EventRecord {

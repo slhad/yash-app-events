@@ -108,6 +108,11 @@ bash scripts/check-readme-claims.sh
 cargo doc --workspace --no-deps
 ```
 
+The CI-safe replay vertical slice is covered by the daemon test
+`synthetic_health_replay_reaches_files_state_and_live_subscription`; it asserts that
+the same two transitions appear in `events.jsonl`, atomic `state.json`, `state.get`,
+and a live protocol subscription.
+
 ## Project principles
 
 - Linux/Wayland first, with replaceable capture backends.

@@ -160,6 +160,7 @@ pub mod method {
     pub const STATE_GET: &str = "state.get";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
+    pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
 }
 
 pub mod error_code {

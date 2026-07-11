@@ -14,6 +14,7 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
   `profile.duplicate`, `profile.validate`, `profile.import`, `profile.export`,
   `profile.trash`, `profile.restore`, `profile.activate`
 - `state.get`, `events.subscribe`, `status.subscribe`
+- `replay.synthetic_health` (CI-safe synthetic vertical-slice fixture)
 
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.

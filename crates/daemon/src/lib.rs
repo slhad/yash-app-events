@@ -4,9 +4,11 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use chrono::{TimeDelta, TimeZone as _, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -14,15 +16,21 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
+use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
+use yash_app_events_engine::{
+    AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig, TransitionState,
+};
+use yash_app_events_output::{EventRecord, EventState, OutputConfig, OutputWriter, StateSnapshot};
 use yash_app_events_profile::{
-    export_profile, import_profile, ImportLimits, LocalConfig, Profile, ProfileId, ProfileStore,
-    StoreError,
+    export_profile, import_profile, BarDirection, DetectorId, ElementId, ImportLimits, LocalConfig,
+    NormalizedRegion, Profile, ProfileId, ProfileStore, RuleId, StoreError,
 };
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
     Request, RequestId, Response, RpcError, Status, MAXIMUM_MESSAGE_BYTES, MAXIMUM_NESTING_DEPTH,
     PROTOCOL_VERSION,
 };
+use yash_app_events_vision::{ColorBarConfig, ColorBarDetector};
 
 const SUBSCRIPTION_CAPACITY: usize = 64;
 
@@ -32,6 +40,7 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub data_root: PathBuf,
     pub config_root: PathBuf,
+    pub state_root: PathBuf,
     pub maximum_connections: usize,
 }
 
@@ -45,6 +54,10 @@ struct State {
     maximum_connections: usize,
     shutdown: Notify,
     notifications: broadcast::Sender<Value>,
+    sequence: AtomicU64,
+    output: Mutex<OutputWriter>,
+    latest_snapshot: Mutex<Value>,
+    output_error: Mutex<Option<String>>,
 }
 
 /// Runs the daemon until a graceful-shutdown RPC or process cancellation.
@@ -55,14 +68,32 @@ struct State {
 pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let listener = bind_socket(&config.socket_path).await?;
     let (notifications, _) = broadcast::channel(SUBSCRIPTION_CAPACITY);
+    let instance = Uuid::new_v4();
+    let initial_state = serde_json::to_value(StateSnapshot {
+        schema: 1,
+        daemon_instance: instance,
+        sequence: 0,
+        updated_at: EventRecord::timestamp_rfc3339(Utc::now()),
+        capture: json!({"active":false,"source":null}),
+        active_profile: None,
+        observations: json!({}),
+        events: json!({}),
+    })?;
     let state = Arc::new(State {
-        instance: Uuid::new_v4(),
+        instance,
         profiles: ProfileStore::new(config.data_root, 20),
         local_config: LocalConfig::new(config.config_root),
         connected: AtomicUsize::new(0),
         maximum_connections: config.maximum_connections,
         shutdown: Notify::new(),
         notifications,
+        sequence: AtomicU64::new(0),
+        output: Mutex::new(OutputWriter::new(
+            config.state_root,
+            OutputConfig::default(),
+        )),
+        latest_snapshot: Mutex::new(initial_state),
+        output_error: Mutex::new(None),
     });
     loop {
         tokio::select! {
@@ -209,6 +240,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
         }
         if request.method == method::STATUS_SUBSCRIBE || request.method == method::EVENTS_SUBSCRIBE
         {
+            let receiver = state.notifications.subscribe();
             write_response(
                 &mut writer,
                 &Response::success(
@@ -217,7 +249,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
                 ),
             )
             .await?;
-            return serve_subscription(&mut writer, state.notifications.subscribe()).await;
+            return serve_subscription(&mut writer, receiver).await;
         }
         let response = dispatch(request, &state);
         write_response(&mut writer, &response).await?;
@@ -325,9 +357,13 @@ fn dispatch(request: Request, state: &State) -> Response {
                 .map_err(internal_error)?;
             Ok(json!({"active_profile": params.profile_id}))
         }),
-        method::STATE_GET => Ok(
-            json!({"schema": 1, "daemon_instance": state.instance, "sequence": 0, "observations": {}, "events": {}}),
-        ),
+        method::STATE_GET => Ok(state
+            .latest_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()),
+        method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(request.params)
+            .and_then(|params| run_synthetic_health(state, params)),
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -367,6 +403,190 @@ fn internal_error(error: impl std::fmt::Display) -> RpcError {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<Value, RpcError> {
+    if params.fills.is_empty()
+        || params.fills.len() > 10_000
+        || params.fills.iter().any(|&fill| fill > 10)
+    {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "fills must contain 1..=10000 values within 0..=10",
+        ));
+    }
+    let detector_id = DetectorId::new();
+    let element_id = ElementId::new();
+    let detector = ColorBarDetector::new(ColorBarConfig {
+        direction: BarDirection::LeftToRight,
+        minimum_rgb: [180, 0, 0],
+        maximum_rgb: [255, 60, 60],
+        line_match_fraction: 0.8,
+        mask: None,
+    })
+    .map_err(internal_error)?;
+    let rule = NumericRule::new(NumericRuleConfig {
+        id: RuleId::new(),
+        event: "critical_health".into(),
+        enter_below: 0.2,
+        leave_above: 0.3,
+        minimum_confidence: 0.0,
+        required_samples: 2,
+        sample_window: 3,
+        cooldown: Duration::ZERO,
+    })
+    .map_err(internal_error)?;
+    let mut processor = FrameProcessor::new(
+        AnalysisScheduler::new(10).map_err(internal_error)?,
+        detector,
+        NormalizedRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        },
+        detector_id,
+        element_id,
+        rule,
+    );
+    let frames = params
+        .fills
+        .into_iter()
+        .enumerate()
+        .map(|(index, fill)| synthetic_health_frame(u64::try_from(index).unwrap_or(u64::MAX), fill))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)?;
+    let start = Utc
+        .with_ymd_and_hms(2026, 7, 11, 16, 43, 27)
+        .single()
+        .ok_or_else(|| internal_error("invalid replay epoch"))?;
+    let mut observations = serde_json::Map::new();
+    let mut event_states = serde_json::Map::new();
+    let mut emitted = Vec::new();
+    let mut processed_count = 0_usize;
+    for frame in ReplaySource::new(frames) {
+        let Some(processed) = processor.process(&frame) else {
+            continue;
+        };
+        processed_count = processed_count.saturating_add(1);
+        observations.insert(
+            element_id.to_string(),
+            serde_json::to_value(&processed.observation).map_err(internal_error)?,
+        );
+        if let Some(transition) = processed.transition {
+            let sequence = state
+                .sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let timestamp = start
+                + TimeDelta::milliseconds(
+                    i64::try_from(transition.timestamp_ms).unwrap_or(i64::MAX),
+                );
+            let event_state = match transition.state {
+                TransitionState::Entered => EventState::Entered,
+                TransitionState::Left => EventState::Left,
+            };
+            event_states.insert(
+                transition.event.clone(),
+                json!(matches!(event_state, EventState::Entered)),
+            );
+            let record = EventRecord {
+                schema: 1,
+                daemon_instance: state.instance,
+                sequence,
+                timestamp: EventRecord::timestamp_rfc3339(timestamp),
+                profile_id: params.profile_id.clone(),
+                game: params.game.clone(),
+                event: transition.event,
+                state: event_state,
+                value: json!(transition.value),
+                confidence: f64::from(transition.confidence),
+            };
+            let record_value = serde_json::to_value(&record).map_err(internal_error)?;
+            match state
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .append_event(&record)
+            {
+                Ok(()) => {}
+                Err(error) => set_output_error(state, &error.to_string()),
+            }
+            let _ = state.notifications.send(record_value.clone());
+            emitted.push(record_value);
+        }
+        let timestamp = start
+            + TimeDelta::milliseconds(
+                i64::try_from(processed.observation.timestamp_ms).unwrap_or(i64::MAX),
+            );
+        let snapshot = StateSnapshot {
+            schema: 1,
+            daemon_instance: state.instance,
+            sequence: state.sequence.load(Ordering::Relaxed),
+            updated_at: EventRecord::timestamp_rfc3339(timestamp),
+            capture: json!({"active":false,"source":"replay","resolution":[10,2],"pixel_format":"rgba8"}),
+            active_profile: Some(params.profile_id.clone()),
+            observations: Value::Object(observations.clone()),
+            events: Value::Object(event_states.clone()),
+        };
+        let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
+        match state
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_state(&snapshot)
+        {
+            Ok(()) => {}
+            Err(error) => set_output_error(state, &error.to_string()),
+        }
+        *state
+            .latest_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_value;
+    }
+    Ok(json!({"frames": processed_count, "events": emitted}))
+}
+
+fn synthetic_health_frame(
+    sequence: u64,
+    fill: u8,
+) -> Result<Arc<Frame>, yash_app_events_capture::FrameError> {
+    let mut bytes = vec![0_u8; 10 * 2 * 4];
+    for y in 0..2 {
+        for x in 0..10 {
+            let offset = (y * 10 + x) * 4;
+            bytes[offset..offset + 4].copy_from_slice(if x < usize::from(fill) {
+                &[220, 20, 20, 255]
+            } else {
+                &[10, 10, 10, 255]
+            });
+        }
+    }
+    Frame::new(
+        sequence,
+        Duration::from_millis(sequence.saturating_mul(100)),
+        FrameLayout {
+            width: 10,
+            height: 2,
+            row_stride: 40,
+            format: PixelFormat::Rgba8,
+        },
+        Some("replay".into()),
+        Arc::from(bytes),
+    )
+    .map(Arc::new)
+}
+
+fn set_output_error(state: &State, error: &str) {
+    tracing::error!(%error, "output write failed");
+    *state
+        .output_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_owned());
+    let _ = state
+        .notifications
+        .send(json!({"type":"output_error","error":error}));
+}
+
 fn status(state: &State) -> Status {
     Status {
         daemon_instance: state.instance,
@@ -377,7 +597,11 @@ fn status(state: &State) -> Status {
         input_fps: 0.0,
         analysis_fps: 0.0,
         replaced_frames: 0,
-        output_error: None,
+        output_error: state
+            .output_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
     }
 }
 
@@ -442,6 +666,21 @@ struct ExportParams {
     profile_id: ProfileId,
     path: PathBuf,
 }
+#[derive(Deserialize)]
+struct SyntheticReplayParams {
+    fills: Vec<u8>,
+    #[serde(default = "default_profile_id")]
+    profile_id: String,
+    #[serde(default = "default_game")]
+    game: String,
+}
+
+fn default_profile_id() -> String {
+    "synthetic-health".into()
+}
+fn default_game() -> String {
+    "synthetic_game".into()
+}
 
 /// Daemon transport failure.
 #[derive(Debug, Error)]
@@ -477,6 +716,7 @@ mod tests {
             socket_path: socket.clone(),
             data_root: directory.join("data"),
             config_root: directory.join("config"),
+            state_root: directory.join("state"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config));
@@ -515,6 +755,15 @@ mod tests {
         )
         .await;
         assert_eq!(response["result"]["protocol"], 1);
+    }
+
+    async fn notification(connection: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), connection.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
     }
 
     #[tokio::test]
@@ -585,6 +834,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn synthetic_health_replay_reaches_files_state_and_live_subscription() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, task) = start(directory.path()).await;
+        let mut subscriber = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        let mut control = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        handshake(&mut subscriber).await;
+        handshake(&mut control).await;
+        let acknowledgement = call(&mut subscriber, 2, method::EVENTS_SUBSCRIBE, Value::Null).await;
+        assert_eq!(acknowledgement["result"]["capacity"], 64);
+        let replay = call(
+            &mut control,
+            2,
+            method::REPLAY_SYNTHETIC_HEALTH,
+            json!({"fills":[8,8,1,1,1,4,4],"profile_id":"synthetic","game":"synthetic_game"}),
+        )
+        .await;
+        assert_eq!(replay["result"]["events"].as_array().unwrap().len(), 2);
+        let entered = notification(&mut subscriber).await;
+        let left = notification(&mut subscriber).await;
+        assert_eq!(entered["method"], "event");
+        assert_eq!(entered["params"]["state"], "entered");
+        assert_eq!(entered["params"]["sequence"], 1);
+        assert_eq!(left["params"]["state"], "left");
+        assert_eq!(left["params"]["sequence"], 2);
+
+        let state = call(&mut control, 3, method::STATE_GET, Value::Null).await;
+        assert_eq!(state["result"]["sequence"], 2);
+        assert_eq!(state["result"]["events"]["critical_health"], false);
+        let durable_state: Value =
+            serde_json::from_slice(&fs::read(directory.path().join("state/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(durable_state, state["result"]);
+        let lines: Vec<Value> = fs::read_to_string(directory.path().join("state/events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], entered["params"]);
+        assert_eq!(lines[1], left["params"]);
+        call(&mut control, 4, method::SHUTDOWN, Value::Null).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_socket_is_recovered_but_regular_file_is_never_removed() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("control.sock");
@@ -594,6 +888,7 @@ mod tests {
             socket_path: socket.clone(),
             data_root: directory.path().join("data"),
             config_root: directory.path().join("config"),
+            state_root: directory.path().join("state"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config.clone()));
