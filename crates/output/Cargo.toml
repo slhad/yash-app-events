@@ -9,7 +9,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 yash-app-events-protocol = { path = "../protocol" }
 
+[dev-dependencies]
+tempfile.workspace = true

@@ -9,7 +9,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
 yash-app-events-capture = { path = "../capture" }
 yash-app-events-profile = { path = "../profile" }
 yash-app-events-vision = { path = "../vision" }
-
