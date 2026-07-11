@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use yash_app_events_capture::Frame;
 use yash_app_events_profile::{DetectorId, ElementId, NormalizedRegion, RuleId};
+use yash_app_events_vision::{DetectionStatus, Detector};
 
 /// Default detector analysis rate in frames per second.
 pub const DEFAULT_ANALYSIS_FPS: u8 = 10;
@@ -309,10 +311,81 @@ pub enum EngineError {
     InvalidRule,
 }
 
+/// One analyzed frame's observation and optional meaningful transition.
+#[derive(Clone, Debug)]
+pub struct ProcessedFrame {
+    pub observation: Observation,
+    pub transition: Option<Transition>,
+}
+
+/// Identical detector/rule path used by replay and live capture frames.
+#[derive(Debug)]
+pub struct FrameProcessor<D: Detector> {
+    scheduler: AnalysisScheduler,
+    detector: D,
+    region: NormalizedRegion,
+    detector_id: DetectorId,
+    element_id: ElementId,
+    rule: NumericRule,
+}
+
+impl<D: Detector> FrameProcessor<D> {
+    #[must_use]
+    pub fn new(
+        scheduler: AnalysisScheduler,
+        detector: D,
+        region: NormalizedRegion,
+        detector_id: DetectorId,
+        element_id: ElementId,
+        rule: NumericRule,
+    ) -> Self {
+        Self {
+            scheduler,
+            detector,
+            region,
+            detector_id,
+            element_id,
+            rule,
+        }
+    }
+
+    /// Processes an eligible timestamped frame through detector then temporal rule.
+    pub fn process(&mut self, frame: &Frame) -> Option<ProcessedFrame> {
+        if !self.scheduler.should_analyze(frame.timestamp) {
+            return None;
+        }
+        let detection = self.detector.detect(frame, self.region);
+        let observation = Observation {
+            detector_id: self.detector_id,
+            element_id: self.element_id,
+            timestamp_ms: u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX),
+            value: detection
+                .value
+                .map_or(ObservationValue::None, ObservationValue::Number),
+            confidence: detection.confidence,
+            status: match detection.status {
+                DetectionStatus::Valid => ObservationStatus::Valid,
+                DetectionStatus::Unknown => ObservationStatus::Unknown,
+                DetectionStatus::Error => ObservationStatus::Error,
+            },
+            diagnostic: detection.diagnostic,
+        };
+        let transition = self.rule.observe(&observation);
+        Some(ProcessedFrame {
+            observation,
+            transition,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
     use yash_app_events_profile::{DetectorId, ElementId, RuleId};
+    use yash_app_events_vision::{ColorBarConfig, ColorBarDetector};
 
     fn observation(timestamp_ms: u64, value: f64, confidence: f32) -> Observation {
         Observation {
@@ -399,6 +472,92 @@ mod tests {
                 width: 25,
                 height: 25
             }
+        );
+    }
+
+    fn health_frame(sequence: u64, fill: usize) -> Arc<Frame> {
+        let mut bytes = vec![0_u8; 10 * 2 * 4];
+        for y in 0..2 {
+            for x in 0..10 {
+                let offset = (y * 10 + x) * 4;
+                bytes[offset..offset + 4].copy_from_slice(if x < fill {
+                    &[220, 20, 20, 255]
+                } else {
+                    &[10, 10, 10, 255]
+                });
+            }
+        }
+        Arc::new(
+            Frame::new(
+                sequence,
+                Duration::from_millis(sequence * 100),
+                FrameLayout {
+                    width: 10,
+                    height: 2,
+                    row_stride: 40,
+                    format: PixelFormat::Rgba8,
+                },
+                Some("replay".into()),
+                Arc::from(bytes),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn replay_frames_share_detector_and_rule_path_deterministically() {
+        let detector_id = DetectorId::new();
+        let element_id = ElementId::new();
+        let build = || {
+            FrameProcessor::new(
+                AnalysisScheduler::new(10).unwrap(),
+                ColorBarDetector::new(ColorBarConfig {
+                    direction: yash_app_events_profile::BarDirection::LeftToRight,
+                    minimum_rgb: [180, 0, 0],
+                    maximum_rgb: [255, 60, 60],
+                    line_match_fraction: 0.8,
+                    mask: None,
+                })
+                .unwrap(),
+                NormalizedRegion {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                detector_id,
+                element_id,
+                NumericRule::new(NumericRuleConfig {
+                    id: RuleId::new(),
+                    event: "critical_health".into(),
+                    enter_below: 0.2,
+                    leave_above: 0.3,
+                    minimum_confidence: 0.0,
+                    required_samples: 2,
+                    sample_window: 3,
+                    cooldown: Duration::ZERO,
+                })
+                .unwrap(),
+            )
+        };
+        let frames: Vec<_> = [8, 8, 1, 1, 1, 4, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(index, fill)| health_frame(index as u64, fill))
+            .collect();
+        let run = |mut processor: FrameProcessor<ColorBarDetector>| {
+            ReplaySource::new(frames.clone())
+                .filter_map(|frame| processor.process(&frame)?.transition)
+                .map(|transition| transition.state)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(build()),
+            vec![TransitionState::Entered, TransitionState::Left]
+        );
+        assert_eq!(
+            run(build()),
+            vec![TransitionState::Entered, TransitionState::Left]
         );
     }
 }

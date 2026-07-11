@@ -521,3 +521,7 @@ SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1
 SPEC-OUT-002 | IN_PROGRESS | schema-v1 atomic `StateSnapshot` implemented with interruption test; daemon live-state integration pending
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | IN_PROGRESS | output errors are typed/non-panicking and failure-injection tested; daemon status/log/IPC/GUI surfacing pending
+SPEC-DET-002 | IN_PROGRESS | RGB range detector supports four directions, configurable channel thresholds, optional binary mask, line threshold, normalized fill/confidence/diagnostic; broader synthetic variation and RPC pending
+SPEC-REPLAY-001 | IN_PROGRESS | `ReplaySource` frames feed the same `FrameProcessor<Detector>` boundary intended for live capture; daemon live wiring pending
+SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
+SPEC-REPLAY-003 | IN_PROGRESS | redistributable in-memory synthetic health fixtures cover bounded frames and transitions; repository manifest/fixture format pending

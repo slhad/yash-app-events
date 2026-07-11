@@ -10,4 +10,4 @@ workspace = true
 
 [dependencies]
 yash-app-events-capture = { path = "../capture" }
-
+yash-app-events-profile = { path = "../profile" }
