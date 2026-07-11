@@ -46,6 +46,15 @@ frames, 30 replacements, 93 ms frame age, and no error, and an explicitly reques
 4K PNG snapshot completed atomically with a 30-second debug-build CLI timeout. That
 temporary snapshot was inspected for normalized HUD regions and deleted after use.
 
-Selection and successful frame flow are therefore verified on Hyprland. Cancellation,
-denial, restore-token behavior (this backend returned no token), and an independent
-GNOME/KDE portal remain required release evidence.
+Selection and successful frame flow are therefore verified on Hyprland. A later
+ExplicitlyRevoked selection stored a restore token outside the portable profile. After
+stopping capture, `capture select --profile-id` restored the approved 3840×2160 source
+as node 160 in 35 ms, reported `restore_token_saved: true`, and resumed packed RGBA
+frames without opening a picker. The token itself is deliberately excluded from this
+report, logs, and exported profiles.
+
+The backend's persisted permission caused a nominal no-token smoke to immediately reuse
+the approved display, so that run cannot count as cancellation evidence. Shared portal
+permissions were not deleted because the permission store also contains OBS and other
+applications. Interactive cancellation/denial and an independent GNOME/KDE portal
+remain required release evidence.

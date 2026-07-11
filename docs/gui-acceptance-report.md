@@ -53,6 +53,11 @@ Local evidence (intentionally ignored by Git because it contains copyrighted gam
 - Color-bar confidence incorrectly equaled fill percentage, suppressing low-health rules.
 - Preview/freeze leases were not restored after worker reconnect.
 - Successful RPC/preview responses did not clear stale GUI error messages.
+- When the GUI's initial profile request ran before the daemon was available, later
+  status reconnects succeeded but never reloaded the profile list. Every successful
+  reconnect now refreshes profiles before continuing; the installed GUI was launched
+  with the daemon stopped, then recovered revision 3 and all five zones after daemon
+  startup without restarting the GUI (`09-daemon-late-reconnect.png`).
 - GUI source selection inherited the three-second ordinary RPC deadline. The portal
   remained interactive after the GUI worker disconnected, leading to a late broken
   pipe and a misleading compositor-looking failure. `capture.select` now waits up to

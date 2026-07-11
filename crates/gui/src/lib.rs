@@ -153,6 +153,31 @@ impl Worker {
                                 continue;
                             }
                         }
+                        if reconnected && request.method != method::PROFILE_LIST {
+                            let refresh = client
+                                .as_mut()
+                                .expect("client was initialized")
+                                .call(method::PROFILE_LIST, Value::Null)
+                                .await;
+                            match refresh {
+                                Ok(value) => {
+                                    let _ = response_sender.send(Response {
+                                        kind: RequestKind::Profiles,
+                                        payload: Payload::Json(value),
+                                    });
+                                }
+                                Err(error) => {
+                                    client = None;
+                                    let _ = response_sender.send(Response {
+                                        kind: RequestKind::Profiles,
+                                        payload: Payload::Error(format!(
+                                            "reload profiles after reconnect: {error}"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         let params = if request.kind == RequestKind::Replay {
                             request.params["path"].as_str().map_or_else(
                                 || Err("replay path is required".into()),

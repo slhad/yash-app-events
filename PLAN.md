@@ -23,7 +23,9 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
   dependency while retaining replaceable project-owned boundaries.
 - Phase 5: implementation complete; interactive portal evidence on two Wayland
   environments remains outstanding.
-- Phase 6: implementation complete; interactive portal acceptance remains outstanding.
+- Phase 6: complete (2026-07-11). Installed native GUI source selection, bounded
+  high-detail preview/freeze, normalized region persistence, detector diagnostics,
+  live metrics/evidence, and daemon-late reconnect recovery pass on Hyprland.
 - Phase 7: complete (2026-07-11). Detector/rule forms, frozen and continuous testing,
   diagnostic previews, explicit template capture, temporal state, and the bounded
   observation/transition timeline complete the no-code deterministic authoring path.
