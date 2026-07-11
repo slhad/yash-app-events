@@ -469,7 +469,7 @@ async fn dispatch(
         method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(request.params)
             .and_then(|params| run_synthetic_health(state, params)),
         method::DETECTOR_TEST => parse::<DetectorTestParams>(request.params)
-            .and_then(|params| test_detector(state, params, frozen_frame)),
+            .and_then(|params| test_detector(state, &params, frozen_frame)),
         method::DETECTOR_CAPTURE_TEMPLATE => parse::<CaptureTemplateParams>(request.params)
             .and_then(|params| capture_template(state, &params)),
         method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
@@ -495,7 +495,8 @@ async fn dispatch(
         method::PREVIEW_STOP => {
             Ok(json!({"enabled":false,"clients":state.preview_clients.load(Ordering::Relaxed)}))
         }
-        method::PREVIEW_FRAME => preview_frame(state),
+        method::PREVIEW_FRAME => parse::<PreviewFrameParams>(request.params)
+            .and_then(|params| preview_frame(state, &params)),
         method::PREVIEW_FREEZE => Ok(
             json!({"frozen":frozen_frame.is_some(),"sequence":frozen_frame.as_ref().map(|frame|frame.sequence)}),
         ),
@@ -1089,18 +1090,28 @@ const fn full_frame_region() -> NormalizedRegion {
 #[allow(clippy::too_many_lines)]
 fn test_detector(
     state: &State,
-    params: DetectorTestParams,
+    params: &DetectorTestParams,
     frozen_frame: Option<Arc<Frame>>,
 ) -> Result<Value, RpcError> {
     let profile = state
         .profiles
         .load(params.profile_id)
         .map_err(store_error)?;
-    let element = profile
+    let stored_element = profile
         .elements
         .iter()
         .find(|element| element.id == params.element_id)
         .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
+    let element = params
+        .element
+        .as_ref()
+        .map_or(stored_element, |element| element);
+    if element.id != params.element_id {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "draft element ID does not match element_id",
+        ));
+    }
     let directory = state.profiles.profile_directory(profile.id);
     let full_region = NormalizedRegion {
         x: 0.0,
@@ -1116,6 +1127,9 @@ fn test_detector(
             )
         })?;
         let mut detector = configured_detector(&element.detector, &directory)?;
+        let first = detector.detect(&frame, element.region);
+        // Stateful detectors need a baseline and a sample. Testing the same frozen
+        // frame twice makes that lifecycle visible without fabricating a change.
         let detection = detector.detect(&frame, element.region);
         let original = grayscale_crop(&frame, element.region).map_err(internal_error)?;
         let processed = match &element.detector {
@@ -1127,7 +1141,7 @@ fn test_detector(
             .apply(&original)
             .map_err(internal_error)?,
         };
-        return detector_test_response(element, &[detection], &original, &processed);
+        return detector_test_response(element, &[first, detection], &original, &processed);
     }
     let (detections, original, processed_preview) = match &element.detector {
         ProfileDetector::ColorBar {
@@ -1652,7 +1666,7 @@ fn snapshot_capture(state: &State, path: &Path) -> Result<Value, RpcError> {
     Ok(json!({"saved":true,"path":path,"width":frame.width,"height":frame.height,"explicit":true}))
 }
 
-fn preview_frame(state: &State) -> Result<Value, RpcError> {
+fn preview_frame(state: &State, params: &PreviewFrameParams) -> Result<Value, RpcError> {
     if state.preview_clients.load(Ordering::Relaxed) == 0 {
         return Err(RpcError::new(
             error_code::INVALID_REQUEST,
@@ -1665,7 +1679,9 @@ fn preview_frame(state: &State) -> Result<Value, RpcError> {
             "no captured frame is available",
         )
     })?;
-    let preview = downscale_frame(&frame, 320, 180)?;
+    let maximum_width = params.maximum_width.clamp(320, 1600);
+    let maximum_height = params.maximum_height.clamp(180, 900);
+    let preview = downscale_frame(&frame, maximum_width, maximum_height)?;
     let bytes = encode_frame_png(&preview)?;
     Ok(
         json!({"sequence":frame.sequence,"timestamp_ms":u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX),"width":preview.width,"height":preview.height,"mime":"image/png","bytes":bytes}),
@@ -1896,7 +1912,7 @@ struct SyntheticReplayParams {
     #[serde(default = "default_game")]
     game: String,
 }
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Deserialize)]
 struct DetectorTestParams {
     profile_id: ProfileId,
     element_id: ElementId,
@@ -1906,6 +1922,23 @@ struct DetectorTestParams {
     change_value: u8,
     #[serde(default)]
     use_frozen: bool,
+    #[serde(default)]
+    element: Option<yash_app_events_profile::Element>,
+}
+#[derive(Deserialize)]
+struct PreviewFrameParams {
+    #[serde(default = "default_preview_width")]
+    maximum_width: u32,
+    #[serde(default = "default_preview_height")]
+    maximum_height: u32,
+}
+
+const fn default_preview_width() -> u32 {
+    1280
+}
+
+const fn default_preview_height() -> u32 {
+    720
 }
 #[derive(Deserialize)]
 struct CaptureTemplateParams {
@@ -2607,7 +2640,14 @@ mod tests {
         {
             let mut lease = PreviewLease::new(Arc::clone(&state));
             lease.start();
-            let preview = preview_frame(&state).unwrap();
+            let preview = preview_frame(
+                &state,
+                &PreviewFrameParams {
+                    maximum_width: 320,
+                    maximum_height: 180,
+                },
+            )
+            .unwrap();
             assert!(preview["width"].as_u64().unwrap() <= 320);
             assert_eq!(preview["bytes"][0], 137);
             assert_eq!(state.preview_clients.load(Ordering::Relaxed), 1);

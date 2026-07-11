@@ -69,12 +69,17 @@ including an independently implemented GNOME or KDE portal backend.
 2. Open the GUI.
 3. Select a game window through the desktop portal.
 4. Freeze or inspect the live preview.
-5. Draw normalized HUD regions.
+5. Draw normalized HUD regions, or select an existing named zone from the zone list above the preview.
 6. Assign a detector to each region.
 7. Convert observations into temporal event rules.
 8. Test the profile against live frames or a replay.
 9. Save or export the profile.
 10. Consume events from files, the CLI, or JSON-RPC subscriptions.
+
+The preview requests a bounded high-detail image up to 1600×900; it never changes the
+full-resolution frame used by detectors. The always-visible **Live evidence** panel shows
+capture resolution/rates/errors, current observations, event states, and the most recent
+manual detector-test value, confidence, status, and diagnostic.
 
 Implemented CLI usage:
 

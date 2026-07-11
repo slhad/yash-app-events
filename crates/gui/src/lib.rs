@@ -506,7 +506,7 @@ impl App {
             self.worker.send(
                 RequestKind::PreviewFrame,
                 method::PREVIEW_FRAME,
-                Value::Null,
+                json!({"maximum_width":1600,"maximum_height":900}),
             );
             self.preview_pending = true;
             self.last_preview = Instant::now();
@@ -545,7 +545,7 @@ impl App {
                 self.worker.send(
                     RequestKind::DetectorTest,
                     method::DETECTOR_TEST,
-                    json!({"profile_id":profile.id,"element_id":element.id,"use_frozen":self.frozen}),
+                    json!({"profile_id":profile.id,"element_id":element.id,"use_frozen":self.frozen,"element":element}),
                 );
                 self.test_pending = true;
                 self.last_test = Instant::now();
@@ -685,6 +685,50 @@ impl App {
             });
     }
 
+    fn runtime_panel(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::bottom("runtime_evidence")
+            .resizable(true)
+            .default_height(150.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Live evidence");
+                    let active = self.capture_status["active"].as_bool().unwrap_or(false);
+                    ui.colored_label(
+                        if active { egui::Color32::LIGHT_GREEN } else { egui::Color32::YELLOW },
+                        if active { "CAPTURING" } else { "CAPTURE STOPPED" },
+                    );
+                    ui.label(format!(
+                        "{}×{} {} · input {:.1} FPS · analysis {:.1} FPS · latency {} ms · errors {}",
+                        self.capture_status["metrics"]["width"].as_u64().unwrap_or(0),
+                        self.capture_status["metrics"]["height"].as_u64().unwrap_or(0),
+                        self.capture_status["metrics"]["pixel_format"].as_str().unwrap_or("—"),
+                        self.capture_status["metrics"]["input_fps"].as_f64().unwrap_or(0.0),
+                        self.capture_status["metrics"]["analysis_fps"].as_f64().unwrap_or(0.0),
+                        display_json(&self.capture_status["metrics"]["last_processing_latency_ms"]),
+                        self.capture_status["metrics"]["detector_errors"].as_u64().unwrap_or(0),
+                    ));
+                });
+                ui.columns(3, |columns| {
+                    columns[0].strong("Observations");
+                    columns[0].label(display_json(&self.state["observations"]));
+                    columns[1].strong("Event states");
+                    columns[1].label(display_json(&self.state["events"]));
+                    columns[2].strong("Latest detector test");
+                    if let Some(observation) = self.detector_result["observations"].as_array().and_then(|items| items.last()) {
+                        columns[2].label(format!(
+                            "status: {}\nvalue: {}\nconfidence: {}\ndiagnostic: {}",
+                            observation["status"].as_str().unwrap_or("unknown"),
+                            display_json(&observation["value"]),
+                            display_json(&observation["confidence"]),
+                            display_json(&observation["diagnostic"]),
+                        ));
+                    } else {
+                        columns[2].label("No test yet — select a zone and click Test detector");
+                    }
+                });
+            });
+    }
+
     #[allow(clippy::too_many_lines)]
     fn editor(&mut self, context: &egui::Context) {
         egui::CentralPanel::default().show(context, |ui| {
@@ -723,6 +767,28 @@ impl App {
                 } else {
                     "committed"
                 });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Zones ({})", profile.elements.len()));
+                for (index, element) in profile.elements.iter().enumerate() {
+                    let detector = match element.detector {
+                        Detector::ColorBar { .. } => "color bar",
+                        Detector::Template { .. } => "template",
+                        Detector::RegionChange { .. } => "region change",
+                    };
+                    let label = format!(
+                        "{} · {}{}",
+                        element.name,
+                        detector,
+                        if element.enabled { "" } else { " · disabled" }
+                    );
+                    if ui
+                        .selectable_label(self.selected_region == Some(index), label)
+                        .clicked()
+                    {
+                        self.selected_region = Some(index);
+                    }
+                }
             });
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.drawing, "Draw region");
@@ -1159,9 +1225,20 @@ impl eframe::App for App {
         self.schedule();
         self.topbar(context);
         self.replay_panel(context);
+        self.runtime_panel(context);
         self.sidebar(context);
         self.editor(context);
         context.request_repaint_after(Duration::from_millis(50));
+    }
+}
+
+fn display_json(value: &Value) -> String {
+    match value {
+        Value::Null => "—".into(),
+        Value::String(value) => value.clone(),
+        Value::Object(map) if map.is_empty() => "None yet".into(),
+        Value::Array(items) if items.is_empty() => "None yet".into(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| "unavailable".into()),
     }
 }
 
