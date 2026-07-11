@@ -5,8 +5,9 @@
 It will capture a selected game window through the Wayland ScreenCast portal and PipeWire, analyze user-configured regions, turn visual observations into debounced state transitions, and expose results through JSON files, a CLI, and local JSON-RPC IPC.
 
 > Status: engineering baseline implemented. The workspace builds and its placeholder
-> binaries run, but capture, profile management, detection, IPC, and the GUI workflow
-> are not implemented yet.
+> binaries run. The internal profile library now provides validated schema-v1 storage,
+> revision recovery, duplication, trash/restore, and safe portable archives; live IPC,
+> capture, detection, and the GUI workflow are not implemented yet.
 
 ## Intended use cases
 

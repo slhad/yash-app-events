@@ -492,11 +492,10 @@ No requirements are verified at repository initialization.
 
 SPEC-ARCH-002 | VERIFIED | Cargo workspace manifests and `docs/architecture.md`; `cargo fmt --all -- --check`, strict workspace Clippy, tests, and docs pass (2026-07-11)
 SPEC-OBS-001 | IN_PROGRESS | `yash-app-eventsd` initializes configurable `tracing` output; structured operational fields and redaction tests remain pending
-SPEC-PROFILE-002 | IN_PROGRESS | `AppPaths` resolves documented XDG locations with deterministic override tests; settings and capture-binding persistence remain pending
+SPEC-PROFILE-002 | VERIFIED | XDG resolution tests plus atomic `settings.toml` and separate `capture-bindings.toml` round trips; portal tokens never enter portable profile trees (2026-07-11)
 SPEC-PROFILE-003 | VERIFIED | typed UUID identities, stable-name validation, duplicate-ID and dangling-reference rejection in profile tests (2026-07-11)
 SPEC-PROFILE-004 | VERIFIED | schema-v1 `NormalizedRegion` and layout metadata validation tests reject out-of-bounds regions with field paths (2026-07-11)
 SPEC-PROFILE-005 | VERIFIED | same-directory temporary write, flush, sync, and rename; injected pre-rename failure test proves the prior document remains valid (2026-07-11)
-SPEC-PROFILE-009 | IN_PROGRESS | every profile carries schema version 1 and load validates without rewriting; migration dispatcher and golden fixture remain pending
 SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft separation, revision increment/history pruning, and tests with configurable bounded history (2026-07-11)
 SPEC-PROFILE-007 | VERIFIED | stale-commit test proves structured expected/current revision conflict without overwrite (2026-07-11)
 SPEC-PROFILE-008 | VERIFIED | tests prove profile assets are deep-copied with all internal IDs rekeyed and element rules copy only on explicit request (2026-07-11)

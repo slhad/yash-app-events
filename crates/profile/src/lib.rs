@@ -11,8 +11,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod archive;
+mod local;
 mod store;
 pub use archive::{export_profile, import_profile, ArchiveError, ImportLimits, Manifest};
+pub use local::{CaptureBinding, LocalConfig, LocalConfigError, Settings};
 pub use store::{ProfileStore, StoreError};
 
 /// Current portable profile schema version.

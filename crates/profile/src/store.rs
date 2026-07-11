@@ -229,6 +229,16 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Permanently removes an already-trashed profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error; active profiles are never accepted by this trash-only path.
+    pub fn permanently_delete_trashed(&self, id: ProfileId) -> Result<(), StoreError> {
+        fs::remove_dir_all(self.trash.join(id.to_string()))?;
+        Ok(())
+    }
+
     fn profile_directory(&self, id: ProfileId) -> PathBuf {
         self.profiles.join(id.to_string())
     }

@@ -7,7 +7,10 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 0: complete (2026-07-11). Workspace formatting, strict Clippy, tests,
   documentation, and README claim checks pass locally; see the requirements evidence
   index in `SPECS.md`.
-- Phases 1–10: not yet complete.
+- Phase 1: complete (2026-07-11). Profile schemas, atomic local storage, revisions,
+  duplication, trash/restore, migration dispatch, and resource-limited portable
+  archives pass sixteen profile tests.
+- Phases 2–10: not yet complete.
 
 ## Planning principles
 
