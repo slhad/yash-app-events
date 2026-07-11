@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod archive;
 mod store;
+pub use archive::{export_profile, import_profile, ArchiveError, ImportLimits, Manifest};
 pub use store::{ProfileStore, StoreError};
 
 /// Current portable profile schema version.
@@ -462,6 +464,8 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("profile JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("unsupported profile schema {0}")]
+    UnsupportedSchema(u64),
 }
 
 /// Loads, migrates, and validates a profile without modifying its source.
@@ -470,7 +474,15 @@ pub enum StorageError {
 ///
 /// Returns I/O, JSON, or profile validation errors.
 pub fn load_profile(path: &Path) -> Result<Profile, StorageError> {
-    let profile: Profile = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+    let document: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+    let schema = document
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StorageError::UnsupportedSchema(0))?;
+    let profile: Profile = match schema {
+        1 => serde_json::from_value(document)?,
+        version => return Err(StorageError::UnsupportedSchema(version)),
+    };
     profile.validate()?;
     Ok(profile)
 }
@@ -552,6 +564,30 @@ mod tests {
         let profile = Profile::new("Demo", "demo_game", 1920, 1080);
         save_profile(&path, &profile).unwrap();
         assert_eq!(load_profile(&path).unwrap(), profile);
+    }
+
+    #[test]
+    fn version_one_golden_fixture_is_a_stable_external_contract() {
+        let profile = load_profile(Path::new("tests/fixtures/profile-v1.json")).unwrap();
+        assert_eq!(profile.schema, 1);
+        assert_eq!(
+            profile.id.to_string(),
+            "10000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(profile.elements.len(), 1);
+        assert_eq!(profile.rules[0].event, "critical_health");
+    }
+
+    #[test]
+    fn unsupported_schema_is_rejected_without_rewriting_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("future.json");
+        fs::write(&path, br#"{"schema":99}"#).unwrap();
+        assert!(matches!(
+            load_profile(&path),
+            Err(StorageError::UnsupportedSchema(99))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), br#"{"schema":99}"#);
     }
 
     #[test]

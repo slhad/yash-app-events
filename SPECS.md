@@ -501,3 +501,6 @@ SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft separation, revision incremen
 SPEC-PROFILE-007 | VERIFIED | stale-commit test proves structured expected/current revision conflict without overwrite (2026-07-11)
 SPEC-PROFILE-008 | VERIFIED | tests prove profile assets are deep-copied with all internal IDs rekeyed and element rules copy only on explicit request (2026-07-11)
 SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test; no implicit permanent deletion API (2026-07-11)
+SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata (2026-07-11)
+SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
+SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)

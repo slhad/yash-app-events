@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "id": "10000000-0000-4000-8000-000000000001",
+  "revision": 3,
+  "name": "Golden health profile",
+  "game": "synthetic_game",
+  "layout": {
+    "reference_width": 1920,
+    "reference_height": 1080,
+    "ui_scale": 1.0,
+    "language": "en"
+  },
+  "elements": [
+    {
+      "id": "20000000-0000-4000-8000-000000000001",
+      "name": "Health",
+      "enabled": true,
+      "color": "#ef4444",
+      "region": { "x": 0.1, "y": 0.8, "width": 0.4, "height": 0.05 },
+      "detector": {
+        "type": "color_bar",
+        "id": "30000000-0000-4000-8000-000000000001",
+        "direction": "left_to_right",
+        "minimum_rgb": [128, 0, 0],
+        "maximum_rgb": [255, 96, 96]
+      }
+    }
+  ],
+  "rules": [
+    {
+      "id": "40000000-0000-4000-8000-000000000001",
+      "element_id": "20000000-0000-4000-8000-000000000001",
+      "event": "critical_health",
+      "enter_below": 0.2,
+      "leave_above": 0.3,
+      "minimum_confidence": 0.8,
+      "required_samples": 2,
+      "sample_window": 3,
+      "cooldown_ms": 500
+    }
+  ]
+}
