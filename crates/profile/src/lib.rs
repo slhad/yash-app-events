@@ -1,5 +1,6 @@
 //! Portable profile schemas, validation, migration, and durable local storage.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write as _};
@@ -8,6 +9,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+mod store;
+pub use store::{ProfileStore, StoreError};
 
 /// Current portable profile schema version.
 pub const PROFILE_SCHEMA_VERSION: u16 = 1;
@@ -111,9 +115,22 @@ impl Profile {
         for (index, element) in self.elements.iter().enumerate() {
             element.validate(index, &mut errors);
         }
+        report_duplicate_ids(
+            self.elements.iter().map(|element| element.id),
+            "elements",
+            &mut errors,
+        );
+        let element_ids: HashSet<_> = self.elements.iter().map(|element| element.id).collect();
         for (index, rule) in self.rules.iter().enumerate() {
             rule.validate(index, &mut errors);
+            if !element_ids.contains(&rule.element_id) {
+                errors.push(ValidationError::new(
+                    format!("rules[{index}].element_id"),
+                    "must reference an existing element",
+                ));
+            }
         }
+        report_duplicate_ids(self.rules.iter().map(|rule| rule.id), "rules", &mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -180,6 +197,7 @@ impl Element {
             ));
         }
         self.region.validate(&format!("{base}.region"), errors);
+        self.detector.validate(&format!("{base}.detector"), errors);
     }
 }
 
@@ -202,6 +220,67 @@ pub enum Detector {
         id: DetectorId,
         threshold: f32,
     },
+}
+
+impl Detector {
+    fn assign_new_id(&mut self) {
+        match self {
+            Self::ColorBar { id, .. }
+            | Self::Template { id, .. }
+            | Self::RegionChange { id, .. } => {
+                *id = DetectorId::new();
+            }
+        }
+    }
+
+    fn validate(&self, path: &str, errors: &mut Vec<ValidationError>) {
+        match self {
+            Self::ColorBar {
+                minimum_rgb,
+                maximum_rgb,
+                ..
+            } => {
+                if minimum_rgb
+                    .iter()
+                    .zip(maximum_rgb)
+                    .any(|(minimum, maximum)| minimum > maximum)
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "minimum RGB channels must not exceed maximum channels",
+                    ));
+                }
+            }
+            Self::Template {
+                templates,
+                threshold,
+                ..
+            } => {
+                if templates.is_empty() {
+                    errors.push(ValidationError::new(
+                        format!("{path}.templates"),
+                        "must contain at least one template",
+                    ));
+                }
+                for (index, template) in templates.iter().enumerate() {
+                    if template.is_absolute()
+                        || template
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        errors.push(ValidationError::new(
+                            format!("{path}.templates[{index}]"),
+                            "must be a relative path without parent traversal",
+                        ));
+                    }
+                }
+                validate_unit_interval(&format!("{path}.threshold"), *threshold, errors);
+            }
+            Self::RegionChange { threshold, .. } => {
+                validate_unit_interval(&format!("{path}.threshold"), *threshold, errors);
+            }
+        }
+    }
 }
 
 /// Fill direction for a color bar.
@@ -264,6 +343,26 @@ fn validate_identifier(path: &str, value: &str, errors: &mut Vec<ValidationError
             path,
             "must be a lowercase stable identifier using letters, digits, and underscores",
         ));
+    }
+}
+
+fn validate_unit_interval(path: &str, value: f32, errors: &mut Vec<ValidationError>) {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        errors.push(ValidationError::new(
+            path,
+            "must be finite and within [0,1]",
+        ));
+    }
+}
+
+fn report_duplicate_ids<T: Copy + Eq + std::hash::Hash>(
+    ids: impl Iterator<Item = T>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut seen = HashSet::new();
+    if ids.into_iter().any(|id| !seen.insert(id)) {
+        errors.push(ValidationError::new(path, "contains duplicate stable IDs"));
     }
 }
 
