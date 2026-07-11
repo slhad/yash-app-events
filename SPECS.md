@@ -512,7 +512,7 @@ SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subsc
 SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with global compact `--json`, stable exit categories, timeouts, live event follow, profile lifecycle commands, and shared-library offline validation; golden and daemon-backed tests (2026-07-11)
 SPEC-CAP-001 | VERIFIED | backend-neutral validated CPU frame carries monotonic timestamp, dimensions, padded stride, RGB/RGBA format, memory bytes, and source identity; portal callback tests (2026-07-11)
 SPEC-ARCH-003 | VERIFIED | `LatestFrameSlot` owns at most one frame; 10,000-frame test proves 9,999 replacements and next analysis receives sequence 9,999 (2026-07-11)
-SPEC-PROD-004 | IN_PROGRESS | scheduler validates 1–10 FPS and test proves 60 timestamped FPS yields exactly 10 analyses; daemon configuration integration pending
+SPEC-PROD-004 | VERIFIED | local settings validate configurable 1–10 FPS; live latest-frame worker test feeds 60 timestamped FPS, analyzes at most 10, replaces 59 stale frames, and emits one transition (2026-07-11)
 SPEC-DET-001 | VERIFIED | `FrameProcessor` attaches stable detector/element IDs to typed value/status/confidence/diagnostic results; errors retain no fabricated value; replay integration evidence (2026-07-11)
 SPEC-EVENT-001 | VERIFIED | detector output becomes an observation, `NumericRule` alone creates transitions, and only transitions reach sinks in daemon replay integration (2026-07-11)
 SPEC-EVENT-002 | IN_PROGRESS | numeric threshold, confidence, N-of-M, hysteresis, and cooldown implemented and tested; remaining eventual primitives pending
@@ -535,6 +535,8 @@ SPEC-PROD-002 | IN_PROGRESS | ashpd portal/direct PipeWire backend builds on liv
 SPEC-CAP-002 | IN_PROGRESS | create/select/start/open-remote/session-close flow implemented with hidden cursor and actionable error categories; interactive smoke evidence pending
 SPEC-CAP-003 | IN_PROGRESS | machine-local token persistence, portal ExplicitlyRevoked mode, reuse, and stale-token explicit fallback implemented; interactive restoration evidence pending
 SPEC-CAP-004 | VERIFIED | negotiation requests RGB/RGBA/RGBx only; tests verify padded copies, RGBx alpha normalization, and actionable short/unsupported diagnostics (2026-07-11)
-SPEC-CAP-006 | IN_PROGRESS | callback and daemon/CLI expose input frames/FPS, replacements, frame age, resolution, format/error; live analysis FPS integration pending
+SPEC-CAP-006 | IN_PROGRESS | callback and daemon/CLI expose input/analysis FPS, replacements, frame age, resolution, format/error; interactive portal metric evidence pending
 SPEC-SEC-003 | VERIFIED | shared system/capture status and CLI expose active flag and selected portal node label (2026-07-11)
-SPEC-SEC-004 | IN_PROGRESS | backend persists nothing and snapshot RPC requires explicit destination; live snapshot/manual filesystem smoke pending
+SPEC-SEC-004 | IN_PROGRESS | backend persists nothing; snapshot RPC requires explicit destination and padded-frame PNG/atomic writer tests pass; manual portal filesystem smoke pending
+SPEC-PERF-001 | IN_PROGRESS | live-worker 60-FPS synthetic test remains bounded and emits output at configured analysis rate; real portal/reference CPU end-to-end profile pending
+SPEC-PERF-002 | IN_PROGRESS | daemon has no image timer until a profile-backed capture starts and analysis task stops with capture; idle CPU measurement pending

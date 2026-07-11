@@ -113,6 +113,12 @@ The CI-safe replay vertical slice is covered by the daemon test
 the same two transitions appear in `events.jsonl`, atomic `state.json`, `state.get`,
 and a live protocol subscription.
 
+The Wayland portal backend and capture CLI are implemented, but interactive support
+is not yet claimed. Run the opt-in procedure in `docs/capture-smoke.md`. Capture is
+daemon-owned; `yash-eventsctl capture select` opens the picker, `capture status`
+reports metrics, `capture snapshot <path>` explicitly saves one PNG, and `capture
+stop` releases the session.
+
 ## Project principles
 
 - Linux/Wayland first, with replaceable capture backends.

@@ -510,7 +510,7 @@ fn update_metrics(
         .metrics
         .replaced_frames
         .saturating_add(u64::from(replaced));
-    state.metrics.input_fps = state.metrics.input_frames as f32
+    state.metrics.input_fps = state.metrics.input_frames.saturating_sub(1) as f32
         / now
             .saturating_duration_since(first)
             .as_secs_f32()

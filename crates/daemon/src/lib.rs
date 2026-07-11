@@ -6,21 +6,22 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use chrono::{TimeDelta, TimeZone as _, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, oneshot, Notify};
 use uuid::Uuid;
 use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
 use yash_app_events_engine::{
-    AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig, TransitionState,
+    AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig, ProcessedFrame,
+    TransitionState,
 };
 use yash_app_events_output::{EventRecord, EventState, OutputConfig, OutputWriter, StateSnapshot};
 use yash_app_events_profile::{
@@ -67,6 +68,21 @@ struct State {
     output_error: Mutex<Option<String>>,
     latest_frame: LatestFrameSlot,
     capture: Mutex<Option<PortalCapture>>,
+    analysis: Mutex<Option<LiveAnalysis>>,
+    analysis_metrics: Mutex<AnalysisMetrics>,
+}
+
+#[derive(Debug)]
+struct LiveAnalysis {
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Default)]
+struct AnalysisMetrics {
+    frames: u64,
+    first: Option<Instant>,
+    last: Option<Instant>,
 }
 
 /// Runs the daemon until a graceful-shutdown RPC or process cancellation.
@@ -105,6 +121,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         output_error: Mutex::new(None),
         latest_frame: LatestFrameSlot::default(),
         capture: Mutex::new(None),
+        analysis: Mutex::new(None),
+        analysis_metrics: Mutex::new(AnalysisMetrics::default()),
     });
     loop {
         tokio::select! {
@@ -268,7 +286,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch(request: Request, state: &State) -> Response {
+async fn dispatch(request: Request, state: &Arc<State>) -> Response {
     let id = request.id;
     let result: Result<Value, RpcError> = match request.method.as_str() {
         method::VERSION => {
@@ -504,8 +522,7 @@ fn publish_replay<D: VisionDetector>(
         .with_ymd_and_hms(2026, 7, 11, 16, 43, 27)
         .single()
         .ok_or_else(|| internal_error("invalid replay epoch"))?;
-    let mut observations = serde_json::Map::new();
-    let mut event_states = serde_json::Map::new();
+    let mut publication = PublicationState::default();
     let mut emitted = Vec::new();
     let mut processed_count = 0_usize;
     for frame in ReplaySource::new(frames) {
@@ -513,82 +530,106 @@ fn publish_replay<D: VisionDetector>(
             continue;
         };
         processed_count = processed_count.saturating_add(1);
-        observations.insert(
-            processed.observation.element_id.to_string(),
-            serde_json::to_value(&processed.observation).map_err(internal_error)?,
-        );
-        if let Some(transition) = processed.transition {
-            let sequence = state
-                .sequence
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1);
-            let timestamp = start
-                + TimeDelta::milliseconds(
-                    i64::try_from(transition.timestamp_ms).unwrap_or(i64::MAX),
-                );
-            let event_state = match transition.state {
-                TransitionState::Entered => EventState::Entered,
-                TransitionState::Left => EventState::Left,
-            };
-            event_states.insert(
-                transition.event.clone(),
-                json!(matches!(event_state, EventState::Entered)),
-            );
-            let record = EventRecord {
-                schema: 1,
-                daemon_instance: state.instance,
-                sequence,
-                timestamp: EventRecord::timestamp_rfc3339(timestamp),
-                profile_id: profile_id.to_owned(),
-                game: game.to_owned(),
-                event: transition.event,
-                state: event_state,
-                value: json!(transition.value),
-                confidence: f64::from(transition.confidence),
-            };
-            let record_value = serde_json::to_value(&record).map_err(internal_error)?;
-            match state
-                .output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append_event(&record)
-            {
-                Ok(()) => {}
-                Err(error) => set_output_error(state, &error.to_string()),
-            }
-            let _ = state.notifications.send(record_value.clone());
-            emitted.push(record_value);
-        }
         let timestamp = start
             + TimeDelta::milliseconds(
                 i64::try_from(processed.observation.timestamp_ms).unwrap_or(i64::MAX),
             );
-        let snapshot = StateSnapshot {
+        if let Some(record) = publish_processed(
+            state,
+            processed,
+            profile_id,
+            game,
+            timestamp,
+            json!({"active":false,"source":"replay"}),
+            &mut publication,
+        )? {
+            emitted.push(record);
+        }
+    }
+    Ok(json!({"frames": processed_count, "events": emitted}))
+}
+
+#[derive(Debug, Default)]
+struct PublicationState {
+    observations: serde_json::Map<String, Value>,
+    event_states: serde_json::Map<String, Value>,
+}
+
+fn publish_processed(
+    state: &State,
+    processed: ProcessedFrame,
+    profile_id: &str,
+    game: &str,
+    timestamp: DateTime<Utc>,
+    capture: Value,
+    publication: &mut PublicationState,
+) -> Result<Option<Value>, RpcError> {
+    publication.observations.insert(
+        processed.observation.element_id.to_string(),
+        serde_json::to_value(&processed.observation).map_err(internal_error)?,
+    );
+    let mut emitted = None;
+    if let Some(transition) = processed.transition {
+        let sequence = state
+            .sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let event_state = match transition.state {
+            TransitionState::Entered => EventState::Entered,
+            TransitionState::Left => EventState::Left,
+        };
+        publication.event_states.insert(
+            transition.event.clone(),
+            json!(matches!(event_state, EventState::Entered)),
+        );
+        let record = EventRecord {
             schema: 1,
             daemon_instance: state.instance,
-            sequence: state.sequence.load(Ordering::Relaxed),
-            updated_at: EventRecord::timestamp_rfc3339(timestamp),
-            capture: json!({"active":false,"source":"replay","resolution":[10,2],"pixel_format":"rgba8"}),
-            active_profile: Some(profile_id.to_owned()),
-            observations: Value::Object(observations.clone()),
-            events: Value::Object(event_states.clone()),
+            sequence,
+            timestamp: EventRecord::timestamp_rfc3339(timestamp),
+            profile_id: profile_id.to_owned(),
+            game: game.to_owned(),
+            event: transition.event,
+            state: event_state,
+            value: json!(transition.value),
+            confidence: f64::from(transition.confidence),
         };
-        let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
-        match state
+        let record_value = serde_json::to_value(&record).map_err(internal_error)?;
+        if let Err(error) = state
             .output
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_state(&snapshot)
+            .append_event(&record)
         {
-            Ok(()) => {}
-            Err(error) => set_output_error(state, &error.to_string()),
+            set_output_error(state, &error.to_string());
         }
-        *state
-            .latest_snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_value;
+        let _ = state.notifications.send(record_value.clone());
+        emitted = Some(record_value);
     }
-    Ok(json!({"frames": processed_count, "events": emitted}))
+    let snapshot = StateSnapshot {
+        schema: 1,
+        daemon_instance: state.instance,
+        sequence: state.sequence.load(Ordering::Relaxed),
+        updated_at: EventRecord::timestamp_rfc3339(timestamp),
+        capture,
+        active_profile: Some(profile_id.to_owned()),
+        observations: Value::Object(publication.observations.clone()),
+        events: Value::Object(publication.event_states.clone()),
+    };
+    let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
+    if let Err(error) = state
+        .output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .write_state(&snapshot)
+    {
+        set_output_error(state, &error.to_string());
+    }
+    *state
+        .latest_snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_value;
+    Ok(emitted)
 }
 
 fn synthetic_health_frame(
@@ -1017,7 +1058,10 @@ fn gray_frame(
     .map(Arc::new)
 }
 
-async fn select_capture(state: &State, params: CaptureSelectParams) -> Result<Value, RpcError> {
+async fn select_capture(
+    state: &Arc<State>,
+    params: CaptureSelectParams,
+) -> Result<Value, RpcError> {
     if state
         .capture
         .lock()
@@ -1029,8 +1073,17 @@ async fn select_capture(state: &State, params: CaptureSelectParams) -> Result<Va
             "capture is already active",
         ));
     }
-    let restore_token = params
-        .profile_id
+    let profile_id = params.profile_id.or_else(|| {
+        state
+            .local_config
+            .load_settings()
+            .ok()
+            .and_then(|settings| settings.active_profile)
+    });
+    let live_pipeline = profile_id
+        .map(|profile_id| build_live_pipeline(state, profile_id))
+        .transpose()?;
+    let restore_token = profile_id
         .map(|profile_id| state.local_config.capture_binding(profile_id))
         .transpose()
         .map_err(internal_error)?
@@ -1058,7 +1111,7 @@ async fn select_capture(state: &State, params: CaptureSelectParams) -> Result<Va
     .await
     .map_err(internal_error)?;
     let selected = capture.selected_source().clone();
-    if let (Some(profile_id), Some(token)) = (params.profile_id, selected.restore_token.clone()) {
+    if let (Some(profile_id), Some(token)) = (profile_id, selected.restore_token.clone()) {
         state
             .local_config
             .set_capture_binding(
@@ -1074,12 +1127,24 @@ async fn select_capture(state: &State, params: CaptureSelectParams) -> Result<Va
         .capture
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capture);
+    if let Some(pipeline) = live_pipeline {
+        start_live_analysis(state, pipeline);
+    }
     Ok(
-        json!({"active":true,"source":selected.label,"pipewire_node_id":selected.pipewire_node_id,"restore_token_saved":params.profile_id.is_some() && selected.restore_token.is_some()}),
+        json!({"active":true,"source":selected.label,"pipewire_node_id":selected.pipewire_node_id,"restore_token_saved":profile_id.is_some() && selected.restore_token.is_some(),"analysis_profile":profile_id}),
     )
 }
 
 async fn stop_capture(state: &State) -> Result<Value, RpcError> {
+    let analysis = state
+        .analysis
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(analysis) = analysis {
+        let _ = analysis.stop.send(());
+        let _ = analysis.task.await;
+    }
     let capture = state
         .capture
         .lock()
@@ -1092,16 +1157,134 @@ async fn stop_capture(state: &State) -> Result<Value, RpcError> {
     Ok(json!({"active":false,"stopped":stopped}))
 }
 
+#[derive(Debug)]
+struct LivePipeline {
+    processor: FrameProcessor<ConfiguredDetector>,
+    profile_id: String,
+    game: String,
+}
+
+fn build_live_pipeline(state: &State, profile_id: ProfileId) -> Result<LivePipeline, RpcError> {
+    let profile = state.profiles.load(profile_id).map_err(store_error)?;
+    let element = profile
+        .elements
+        .iter()
+        .find(|element| element.enabled)
+        .ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_PARAMS,
+                "active profile has no enabled element",
+            )
+        })?;
+    let rule = profile
+        .rules
+        .iter()
+        .find(|rule| rule.element_id == element.id)
+        .ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_PARAMS,
+                "enabled element has no event rule",
+            )
+        })?;
+    let detector = configured_detector(
+        &element.detector,
+        &state.profiles.profile_directory(profile.id),
+    )?;
+    let settings = state.local_config.load_settings().map_err(internal_error)?;
+    let numeric_rule = NumericRule::new(NumericRuleConfig {
+        id: rule.id,
+        event: rule.event.clone(),
+        enter_below: rule.enter_below,
+        leave_above: rule.leave_above,
+        minimum_confidence: rule.minimum_confidence,
+        required_samples: usize::from(rule.required_samples),
+        sample_window: usize::from(rule.sample_window),
+        cooldown: Duration::from_millis(rule.cooldown_ms),
+    })
+    .map_err(internal_error)?;
+    Ok(LivePipeline {
+        processor: FrameProcessor::new(
+            AnalysisScheduler::new(settings.analysis_fps).map_err(internal_error)?,
+            detector,
+            element.region,
+            detector_id(&element.detector),
+            element.id,
+            numeric_rule,
+        ),
+        profile_id: profile.id.to_string(),
+        game: profile.game,
+    })
+}
+
+fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
+    let (stop, mut stopped) = oneshot::channel();
+    *state
+        .analysis_metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = AnalysisMetrics::default();
+    let task_state = Arc::clone(state);
+    let task = tokio::spawn(async move {
+        let mut publication = PublicationState::default();
+        let mut last_sequence = None;
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                () = tokio::time::sleep(Duration::from_millis(5)) => {
+                    let Some(frame) = task_state.latest_frame.latest() else { continue; };
+                    if last_sequence == Some(frame.sequence) { continue; }
+                    last_sequence = Some(frame.sequence);
+                    let Some(processed) = pipeline.processor.process(&frame) else { continue; };
+                    update_analysis_metrics(&task_state.analysis_metrics);
+                    let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
+                    if let Err(error) = publish_processed(&task_state,processed,&pipeline.profile_id,&pipeline.game,Utc::now(),capture,&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
+                }
+            }
+        }
+    });
+    *state
+        .analysis
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LiveAnalysis { stop, task });
+}
+
+fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>) {
+    let now = Instant::now();
+    let mut metrics = metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    metrics.first.get_or_insert(now);
+    metrics.last = Some(now);
+    metrics.frames = metrics.frames.saturating_add(1);
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn analysis_fps(state: &State) -> f32 {
+    let metrics = state
+        .analysis_metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    metrics
+        .first
+        .zip(metrics.last)
+        .map_or(0.0, |(first, last)| {
+            metrics.frames.saturating_sub(1) as f32
+                / last
+                    .saturating_duration_since(first)
+                    .as_secs_f32()
+                    .max(0.001)
+        })
+}
+
 fn capture_status(state: &State) -> Value {
     let capture = state
         .capture
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(capture) = capture.as_ref() else {
-        return json!({"active":false,"source":null,"metrics":{"input_fps":0.0,"analysis_fps":0.0,"replaced_frames":state.latest_frame.replacements()}});
+        return json!({"active":false,"source":null,"metrics":{"input_fps":0.0,"analysis_fps":analysis_fps(state),"replaced_frames":state.latest_frame.replacements()}});
     };
     let metrics = capture.metrics();
-    json!({"active":true,"source":capture.selected_source().label,"pipewire_node_id":capture.selected_source().pipewire_node_id,"metrics":{"input_frames":metrics.input_frames,"input_fps":metrics.input_fps,"analysis_fps":0.0,"replaced_frames":metrics.replaced_frames,"last_frame_age_ms":metrics.last_frame_age.and_then(|age|u64::try_from(age.as_millis()).ok()),"width":metrics.width,"height":metrics.height,"pixel_format":metrics.pixel_format,"error":metrics.error}})
+    json!({"active":true,"source":capture.selected_source().label,"pipewire_node_id":capture.selected_source().pipewire_node_id,"metrics":{"input_frames":metrics.input_frames,"input_fps":metrics.input_fps,"analysis_fps":analysis_fps(state),"replaced_frames":metrics.replaced_frames,"last_frame_age_ms":metrics.last_frame_age.and_then(|age|u64::try_from(age.as_millis()).ok()),"width":metrics.width,"height":metrics.height,"pixel_format":metrics.pixel_format,"error":metrics.error}})
 }
 
 fn snapshot_capture(state: &State, path: &Path) -> Result<Value, RpcError> {
@@ -1174,7 +1357,7 @@ fn status(state: &State) -> Status {
         input_fps: capture_metrics
             .as_ref()
             .map_or(0.0, |metrics| metrics.input_fps),
-        analysis_fps: 0.0,
+        analysis_fps: analysis_fps(state),
         replaced_frames: capture_metrics.as_ref().map_or_else(
             || state.latest_frame.replacements(),
             |metrics| metrics.replaced_frames,
@@ -1759,5 +1942,130 @@ mod tests {
             receiver.recv().await,
             Err(broadcast::error::RecvError::Lagged(1))
         ));
+    }
+
+    #[test]
+    fn explicit_snapshot_encoder_removes_row_padding_and_produces_png() {
+        let frame = Frame::new(
+            0,
+            Duration::ZERO,
+            FrameLayout {
+                width: 2,
+                height: 1,
+                row_stride: 8,
+                format: PixelFormat::Rgb8,
+            },
+            Some("test".into()),
+            Arc::from([255, 0, 0, 0, 255, 0, 99, 99]),
+        )
+        .unwrap();
+        let encoded = encode_frame_png(&frame).unwrap();
+        assert_eq!(&encoded[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_latest_frame_worker_throttles_sixty_fps_and_publishes_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let (notifications, _) = broadcast::channel(64);
+        let state = Arc::new(State {
+            instance: Uuid::new_v4(),
+            profiles: ProfileStore::new(directory.path().join("data"), 20),
+            local_config: LocalConfig::new(directory.path().join("config")),
+            connected: AtomicUsize::new(0),
+            maximum_connections: 8,
+            shutdown: Notify::new(),
+            notifications,
+            sequence: AtomicU64::new(0),
+            output: Mutex::new(OutputWriter::new(
+                directory.path().join("state"),
+                OutputConfig::default(),
+            )),
+            latest_snapshot: Mutex::new(json!({})),
+            output_error: Mutex::new(None),
+            latest_frame: LatestFrameSlot::default(),
+            capture: Mutex::new(None),
+            analysis: Mutex::new(None),
+            analysis_metrics: Mutex::new(AnalysisMetrics::default()),
+        });
+        state
+            .local_config
+            .save_settings(&yash_app_events_profile::Settings::default())
+            .unwrap();
+        let mut profile = Profile::new("Live", "synthetic_game", 10, 2);
+        let element_id = ElementId::new();
+        profile.elements.push(yash_app_events_profile::Element {
+            id: element_id,
+            name: "Health".into(),
+            enabled: true,
+            color: "#f00".into(),
+            region: NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: ProfileDetector::ColorBar {
+                id: DetectorId::new(),
+                direction: BarDirection::LeftToRight,
+                minimum_rgb: [180, 0, 0],
+                maximum_rgb: [255, 60, 60],
+                mask: None,
+            },
+        });
+        profile.rules.push(yash_app_events_profile::EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "critical_health".into(),
+            enter_below: 0.2,
+            leave_above: 0.3,
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+        });
+        state.profiles.create(&profile).unwrap();
+        let pipeline = build_live_pipeline(&state, profile.id).unwrap();
+        let mut receiver = state.notifications.subscribe();
+        start_live_analysis(&state, pipeline);
+        for sequence in 0..60_u64 {
+            let source =
+                synthetic_health_frame(sequence, if sequence < 30 { 8 } else { 1 }).unwrap();
+            let frame = Frame::new(
+                sequence,
+                Duration::from_nanos(sequence * 1_000_000_000 / 60),
+                FrameLayout {
+                    width: source.width,
+                    height: source.height,
+                    row_stride: source.row_stride,
+                    format: source.format,
+                },
+                source.source_id.clone(),
+                Arc::clone(&source.data),
+            )
+            .unwrap();
+            state.latest_frame.publish(Arc::new(frame));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["event"], "critical_health");
+        assert_eq!(event["state"], "entered");
+        let analysis = state.analysis.lock().unwrap().take().unwrap();
+        let _ = analysis.stop.send(());
+        analysis.task.await.unwrap();
+        let analyzed = state.analysis_metrics.lock().unwrap().frames;
+        assert!((2..=10).contains(&analyzed), "analyzed {analyzed} frames");
+        assert_eq!(state.latest_frame.replacements(), 59);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("state/events.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(state.latest_snapshot.lock().unwrap()["sequence"], 1);
     }
 }
