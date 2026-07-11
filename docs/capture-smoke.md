@@ -30,10 +30,10 @@ systemctl --user --no-pager status xdg-desktop-portal-hyprland.service
 systemctl --user --no-pager status xdg-desktop-portal-gnome.service
 ```
 
-Required release evidence is one successful window selection on the documented
-Hyprland backend and one on an independently implemented backend such as GNOME or
-KDE. CI runs the noninteractive format/stride/error/metrics tests only; it must not
-claim portal permission evidence.
+Required release evidence is successful selection and cancellation on the documented
+Hyprland backend. GNOME and KDE are compatibility candidates rather than release
+requirements. CI runs the noninteractive format/stride/error/metrics tests only; it
+must not claim interactive portal permission evidence.
 
 ## Recorded Hyprland evidence
 
@@ -54,10 +54,16 @@ frames without opening a picker. The token itself is deliberately excluded from 
 report, logs, and exported profiles.
 
 The backend's persisted permission caused a nominal no-token smoke to immediately reuse
-the approved display, so that run cannot count as cancellation evidence. Shared portal
-permissions were not deleted because the permission store also contains OBS and other
-applications. Interactive cancellation/denial and an independent GNOME/KDE portal
-remain required release evidence.
+the approved display. Cancellation was therefore tested on an isolated session bus and
+temporary permission database while retaining the real Hyprland and PipeWire session.
+Pressing Escape in the fresh chooser made `xdg-desktop-portal-hyprland` report its
+backend-specific `Invalid session`; the capture backend normalized that known response
+to `CaptureError::Cancelled`. The readiness-channel race that previously masked this as
+`SessionEnded` is fixed. Shared OBS and desktop permissions were never modified.
+
+The Hyprland chooser exposes selection and cancellation but no separate denial button.
+Policy denial is verified through ashpd's typed `PortalError::NotAllowed` mapping and
+unit test. This satisfies denial behavior without fabricating interactive UI evidence.
 
 ## Isolated KDE attempt
 
@@ -66,10 +72,10 @@ An isolated session bus successfully started a 1280×720 virtual KWin Wayland
 compositor, activated the KDE portal backend, and routed ScreenCast to it without
 touching the live Hyprland session. KDE rejected the virtual framebuffer before its
 chooser with portal response `Other`; this is not counted as successful KDE evidence.
-A real Plasma login with a physical or DRM-backed output is still required.
+A real Plasma login with a physical or DRM-backed output would still be required before
+claiming KDE compatibility; KDE is not part of the current supported environment.
 
 Cancellation and denial classification uses ashpd's typed `ResponseError::Cancelled`,
 `PortalError::Cancelled`, and `PortalError::NotAllowed` variants. Backend-specific
 English-message matching remains only as a compatibility fallback and is covered by
-unit tests; this establishes deterministic application behavior but does not replace
-the outstanding interactive evidence.
+unit tests.

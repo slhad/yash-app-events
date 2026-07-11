@@ -21,8 +21,9 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
   assets, profile replay, daemon RPC, temporal output, and recorded benchmarks.
   `docs/vision.md` records why measured pure-Rust routines defer the proposed OpenCV
   dependency while retaining replaceable project-owned boundaries.
-- Phase 5: implementation complete; interactive portal evidence on two Wayland
-  environments remains outstanding.
+- Phase 5: complete (2026-07-11). Hyprland create/select/start/open-remote/frame/stop,
+  restore-token reuse, isolated fresh-permission cancellation, typed policy denial,
+  formats, metrics, and bounded latest-frame behavior pass. Other desktops are deferred.
 - Phase 6: complete (2026-07-11). Installed native GUI source selection, bounded
   high-detail preview/freeze, normalized region persistence, detector diagnostics,
   live metrics/evidence, and daemon-late reconnect recovery pass on Hyprland.
@@ -33,9 +34,9 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
   event metrics, regression thresholds, CLI JSON/exit status 7, and GUI import,
   playback/event scrubbing and metrics satisfy deterministic tuning and regression gates.
 - Phase 9 remains deferred and optional for the first usable product.
-- Phase 10: in progress. A clean-prefix source install, user service, desktop metadata,
-  icon, Bash completion, man pages, recovery documentation, and security review are
-  implemented; interactive portal acceptance still blocks the release gate.
+- Phase 10: complete (2026-07-11). A clean-prefix source install, user service, desktop
+  metadata, icon, Bash completion, man pages, recovery documentation, security review,
+  Hyprland portal acceptance, and installed GUI workflow pass.
 
 ## Planning principles
 

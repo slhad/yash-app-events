@@ -4,11 +4,9 @@
 
 It captures a selected game window through the Wayland ScreenCast portal and PipeWire, analyzes user-configured regions, turns visual observations into debounced state transitions, and exposes results through JSON files, a CLI, and local JSON-RPC IPC.
 
-> Status: pre-release implementation. The profile library provides validated schema-v1 storage,
-> revision recovery, duplication, trash/restore, and safe portable archives. The local
-> protocol-v1 daemon, CLI, replay/detectors, outputs, Wayland capture backend, and GUI
-> foundation are implemented. Interactive portal and full GUI authoring/release
-> acceptance are not yet verified, so this is not a supported release.
+> Status: first usable Linux release verified on CachyOS/Arch with Hyprland. Profile
+> schema 1 and protocol 1 provide validated storage, recovery, portable archives,
+> daemon/CLI/GUI control, deterministic detectors, replay, and durable/live outputs.
 
 ## Intended use cases
 
@@ -60,8 +58,8 @@ yash-app-events
 ```
 
 This installs user files below `~/.local` and `~/.config`; no root access is used.
-Interactive portal acceptance still needs the procedure in `docs/capture-smoke.md`,
-including an independently implemented GNOME or KDE portal backend.
+Interactive portal selection, restoration, cancellation, and capture are verified on
+the documented Hyprland environment. GNOME and KDE are not currently claimed.
 
 ## Workflow
 

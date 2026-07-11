@@ -104,7 +104,13 @@ impl PortalCapture {
             ready_sender,
         ));
         let selected = tokio::select! {
-            ready = ready_receiver => ready.map_err(|_| CaptureError::SessionEnded)?,
+            ready = ready_receiver => match ready {
+                Ok(selected) => selected,
+                Err(_) => match task.await.map_err(CaptureError::Join)? {
+                    Ok(()) => return Err(CaptureError::SessionEnded),
+                    Err(error) => return Err(error),
+                },
+            },
             result = &mut task => match result.map_err(CaptureError::Join)? {
                 Ok(()) => return Err(CaptureError::SessionEnded),
                 Err(error) => return Err(error),
@@ -561,6 +567,11 @@ fn classify_portal_message(message: String) -> CaptureError {
     let lower = message.to_ascii_lowercase();
     if lower.contains("cancel") {
         CaptureError::Cancelled(message)
+    } else if lower.contains("invalid session") {
+        // xdg-desktop-portal-hyprland closes the session when its chooser is
+        // dismissed with Escape, then reports InvalidSession instead of the
+        // standard cancelled response.
+        CaptureError::Cancelled(message)
     } else if lower.contains("denied") || lower.contains("permission") {
         CaptureError::Denied(message)
     } else {
@@ -721,11 +732,15 @@ mod tests {
             ashpd::PortalError::NotAllowed("policy rejected capture".into()),
         ));
         let cancelled = classify_portal_message("request cancelled by user".into());
+        let hyprland_cancelled = classify_portal_message(
+            "Portal request failed: org.freedesktop.zbus.Error: Invalid session".into(),
+        );
         let denied = classify_portal_message("permission denied".into());
         let stale = classify_portal_message("restore token is no longer valid".into());
         assert!(matches!(typed_cancelled, CaptureError::Cancelled(_)));
         assert!(matches!(typed_denied, CaptureError::Denied(_)));
         assert!(matches!(cancelled, CaptureError::Cancelled(_)));
+        assert!(matches!(hyprland_cancelled, CaptureError::Cancelled(_)));
         assert!(matches!(denied, CaptureError::Denied(_)));
         assert!(should_retry_without_restore(&stale));
         assert!(!should_retry_without_restore(&cancelled));
