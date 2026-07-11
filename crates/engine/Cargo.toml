@@ -1,0 +1,15 @@
+[package]
+name = "yash-app-events-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+yash-app-events-capture = { path = "../capture" }
+yash-app-events-profile = { path = "../profile" }
+yash-app-events-vision = { path = "../vision" }
+

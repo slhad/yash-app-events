@@ -1,0 +1,15 @@
+[package]
+name = "yash-eventsctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+yash-app-events-profile = { path = "../profile" }
+yash-app-events-protocol = { path = "../protocol" }
+

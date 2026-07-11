@@ -1,0 +1,22 @@
+[package]
+name = "yash-app-eventsd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yash-app-events-capture = { path = "../capture" }
+yash-app-events-capture-pw = { path = "../capture-pw" }
+yash-app-events-engine = { path = "../engine" }
+yash-app-events-output = { path = "../output" }
+yash-app-events-profile = { path = "../profile" }
+yash-app-events-protocol = { path = "../protocol" }
+yash-app-events-vision = { path = "../vision" }
+
