@@ -58,3 +58,18 @@ the approved display, so that run cannot count as cancellation evidence. Shared 
 permissions were not deleted because the permission store also contains OBS and other
 applications. Interactive cancellation/denial and an independent GNOME/KDE portal
 remain required release evidence.
+
+## Isolated KDE attempt
+
+The reference host also has Plasma/KWin 6.6.5 and `xdg-desktop-portal-kde` 6.6.5.
+An isolated session bus successfully started a 1280×720 virtual KWin Wayland
+compositor, activated the KDE portal backend, and routed ScreenCast to it without
+touching the live Hyprland session. KDE rejected the virtual framebuffer before its
+chooser with portal response `Other`; this is not counted as successful KDE evidence.
+A real Plasma login with a physical or DRM-backed output is still required.
+
+Cancellation and denial classification uses ashpd's typed `ResponseError::Cancelled`,
+`PortalError::Cancelled`, and `PortalError::NotAllowed` variants. Backend-specific
+English-message matching remains only as a compatibility fallback and is covered by
+unit tests; this establishes deterministic application behavior but does not replace
+the outstanding interactive evidence.

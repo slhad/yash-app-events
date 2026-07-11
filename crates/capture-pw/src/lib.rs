@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType},
-    PersistMode,
+    PersistMode, ResponseError,
 };
 use futures_util::StreamExt as _;
 use pipewire as pw;
@@ -545,9 +545,16 @@ fn set_metric_error(metrics: &Mutex<MetricState>, error: String) {
 }
 
 fn classify_portal_error(error: ashpd::Error) -> CaptureError {
-    let message = error.to_string();
-    drop(error);
-    classify_portal_message(message)
+    match error {
+        ashpd::Error::Response(ResponseError::Cancelled)
+        | ashpd::Error::Portal(ashpd::PortalError::Cancelled(_)) => {
+            CaptureError::Cancelled("portal request cancelled".into())
+        }
+        ashpd::Error::Portal(ashpd::PortalError::NotAllowed(message)) => {
+            CaptureError::Denied(message)
+        }
+        other => classify_portal_message(other.to_string()),
+    }
 }
 
 fn classify_portal_message(message: String) -> CaptureError {
@@ -707,9 +714,17 @@ mod tests {
 
     #[test]
     fn portal_errors_distinguish_user_action_and_restore_fallback() {
+        let typed_cancelled = classify_portal_error(ashpd::Error::Response(
+            ashpd::desktop::ResponseError::Cancelled,
+        ));
+        let typed_denied = classify_portal_error(ashpd::Error::Portal(
+            ashpd::PortalError::NotAllowed("policy rejected capture".into()),
+        ));
         let cancelled = classify_portal_message("request cancelled by user".into());
         let denied = classify_portal_message("permission denied".into());
         let stale = classify_portal_message("restore token is no longer valid".into());
+        assert!(matches!(typed_cancelled, CaptureError::Cancelled(_)));
+        assert!(matches!(typed_denied, CaptureError::Denied(_)));
         assert!(matches!(cancelled, CaptureError::Cancelled(_)));
         assert!(matches!(denied, CaptureError::Denied(_)));
         assert!(should_retry_without_restore(&stale));
