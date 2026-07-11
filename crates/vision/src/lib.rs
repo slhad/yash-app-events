@@ -3,6 +3,13 @@
 use yash_app_events_capture::{Frame, PixelFormat};
 use yash_app_events_profile::{BarDirection, NormalizedRegion};
 
+mod preprocess;
+mod region_change;
+mod template;
+pub use preprocess::{GrayImage, PreprocessOperation, PreprocessPipeline};
+pub use region_change::{RegionChangeConfig, RegionChangeDetector};
+pub use template::{Template, TemplateConfig, TemplateDetector};
+
 /// Detector output before the engine attaches stable detector/element identities.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Detection {
@@ -185,6 +192,20 @@ struct Crop<'a> {
     y: usize,
     width: usize,
     height: usize,
+}
+
+fn crop_gray(frame: &Frame, region: NormalizedRegion) -> Result<GrayImage, &'static str> {
+    let crop = Crop::new(frame, region).ok_or("invalid or empty crop")?;
+    let mut pixels = Vec::with_capacity(crop.width * crop.height);
+    for y in 0..crop.height {
+        for x in 0..crop.width {
+            let [red, green, blue] = crop.rgb(x, y).ok_or("crop pixel exceeds frame buffer")?;
+            let luminance =
+                (u32::from(red) * 77 + u32::from(green) * 150 + u32::from(blue) * 29) >> 8;
+            pixels.push(u8::try_from(luminance).unwrap_or(u8::MAX));
+        }
+    }
+    GrayImage::new(crop.width, crop.height, pixels)
 }
 
 impl<'a> Crop<'a> {

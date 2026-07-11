@@ -1128,6 +1128,8 @@ dependencies = [
 name = "yash-app-events-vision"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "yash-app-events-capture",
  "yash-app-events-profile",
 ]
