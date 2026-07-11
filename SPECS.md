@@ -532,10 +532,10 @@ SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/b
 SPEC-DET-004 | VERIFIED | normalized change/stability unknown-baseline behavior plus profile replay integration asserts left/entered records identical in JSONL/RPC and final state (2026-07-11)
 SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
 SPEC-PERF-003 | VERIFIED | release-mode three-detector baseline and reference CPU recorded in `docs/performance.md`; results do not justify advanced transfer/GPU optimization (2026-07-11)
-SPEC-PROD-002 | IN_PROGRESS | ashpd portal/direct PipeWire backend builds on live Hyprland/Wayland dependencies; interactive selection/cancel/deny and second-backend evidence pending
-SPEC-CAP-002 | IN_PROGRESS | create/select/start/open-remote/session-close flow implemented with hidden cursor and actionable error categories; interactive smoke evidence pending
+SPEC-PROD-002 | IN_PROGRESS | live Hyprland portal selection delivered 3840×2160 frames through PipeWire 1.6.6 and stopped cleanly; cancel/deny and second independent backend evidence remain (2026-07-11)
+SPEC-CAP-002 | IN_PROGRESS | live Hyprland create/select/start/open-remote/frame/session-close succeeded with hidden cursor; cancellation/denial interaction evidence remains (2026-07-11)
 SPEC-CAP-003 | IN_PROGRESS | machine-local token persistence, portal ExplicitlyRevoked mode, reuse, and stale-token explicit fallback implemented; interactive restoration evidence pending
-SPEC-CAP-004 | VERIFIED | negotiation requests RGB/RGBA/RGBx only; tests verify padded copies, RGBx alpha normalization, and actionable short/unsupported diagnostics (2026-07-11)
+SPEC-CAP-004 | VERIFIED | live Hyprland exposed the need for BGR-family negotiation; RGB/RGBA/RGBx/BGR/BGRA/BGRx are supported with padded copies, channel/alpha normalization tests, and actionable short/unsupported diagnostics (2026-07-11)
 SPEC-CAP-006 | VERIFIED | callback format/stride tests and daemon live-worker integration verify input/analysis rates, replacements, frame age, resolution, format/error and detector latency/error counters through status RPC/CLI/GUI (2026-07-11)
 SPEC-SEC-003 | VERIFIED | shared system/capture status and CLI expose active flag and selected portal node label (2026-07-11)
 SPEC-SEC-004 | VERIFIED | capture callback has no persistence path; snapshot/template RPCs require explicit actions/destinations and padded-frame PNG/atomic tests pass; security review enumerates all image persistence paths (2026-07-11)
@@ -543,7 +543,7 @@ SPEC-PERF-001 | VERIFIED | reference Ryzen 7 5800X3D release benchmarks keep det
 SPEC-PERF-002 | VERIFIED | release daemon with stopped capture/no preview measured 0 CPU scheduler ticks over two seconds at CLK_TCK=100; image task lifecycle and prompt stop are tested/documented in `docs/performance.md` (2026-07-11)
 SPEC-UI-001 | VERIFIED | `yash-app-events` uses eframe/egui 0.32 and completed a five-second native Wayland startup smoke with daemon connection (2026-07-11)
 SPEC-UI-002 | VERIFIED | GUI exposes list/create/rename-by-commit/duplicate/import/export/trash/restore/activate over the same revision-aware protocol methods tested by CLI/daemon integration; native Wayland startup smoke passes (2026-07-11)
-SPEC-UI-003 | IN_PROGRESS | GUI exposes portal select/stop, permission errors, metrics, preview/freeze; interactive portal acceptance pending
+SPEC-UI-003 | IN_PROGRESS | GUI exposes portal select/stop, permission errors, metrics, preview/freeze; daemon-owned Hyprland source/metrics/snapshot pass, but GUI interaction and cancel/deny acceptance remain (2026-07-11)
 SPEC-UI-004 | VERIFIED | normalized canvas supports draw/select/move/resize/duplicate/enable, aspect-preserving zoom/pan, labels/reference pixels, original and processed crop panels, and observation diagnostics (2026-07-11)
 SPEC-UI-008 | VERIFIED | GUI render thread only mutates widget/texture state; dedicated worker owns RPC, reconnect/timeouts and PNG decode; daemon owns all capture/detection/I/O (2026-07-11)
 SPEC-CAP-005 | VERIFIED | per-connection opt-in lease, <=320x180 PNG downscale, frozen exact-frame testing, disconnect cleanup and no-detector-input path pass daemon/live-worker tests (2026-07-11)

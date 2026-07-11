@@ -34,3 +34,18 @@ Required release evidence is one successful window selection on the documented
 Hyprland backend and one on an independently implemented backend such as GNOME or
 KDE. CI runs the noninteractive format/stride/error/metrics tests only; it must not
 claim portal permission evidence.
+
+## Recorded Hyprland evidence
+
+On 2026-07-11, CachyOS/Hyprland with PipeWire 1.6.6 selected a monitor through the
+ScreenCast portal and delivered a 3840×2160 packed frame with 15,360-byte stride.
+The backend normalized the negotiated BGRx-family source to `Rgba8`; after one second
+the smoke reported two input frames, one latest-frame replacement, no error, and then
+released the stream/session promptly. The daemon-owned path subsequently reported 31
+frames, 30 replacements, 93 ms frame age, and no error, and an explicitly requested
+4K PNG snapshot completed atomically with a 30-second debug-build CLI timeout. That
+temporary snapshot was inspected for normalized HUD regions and deleted after use.
+
+Selection and successful frame flow are therefore verified on Hyprland. Cancellation,
+denial, restore-token behavior (this backend returned no token), and an independent
+GNOME/KDE portal remain required release evidence.

@@ -328,6 +328,9 @@ fn parse_video_format(user: &mut UserData, id: u32, param: Option<&spa::pod::Pod
         spa::param::video::VideoFormat::RGB
             | spa::param::video::VideoFormat::RGBA
             | spa::param::video::VideoFormat::RGBx
+            | spa::param::video::VideoFormat::BGR
+            | spa::param::video::VideoFormat::BGRA
+            | spa::param::video::VideoFormat::BGRx
     );
     if !supported {
         set_metric_error(
@@ -387,10 +390,15 @@ fn frame_from_buffer(
     chunk_size: usize,
     bytes: &[u8],
 ) -> Result<(Arc<Frame>, &'static str), String> {
-    let (pixel_format, bytes_per_pixel, label, force_opaque_alpha) = match format {
-        spa::param::video::VideoFormat::RGB => (PixelFormat::Rgb8, 3_usize, "rgb8", false),
-        spa::param::video::VideoFormat::RGBA => (PixelFormat::Rgba8, 4_usize, "rgba8", false),
-        spa::param::video::VideoFormat::RGBx => (PixelFormat::Rgba8, 4_usize, "rgba8", true),
+    let (pixel_format, bytes_per_pixel, label, force_opaque_alpha, swap_red_blue) = match format {
+        spa::param::video::VideoFormat::RGB => (PixelFormat::Rgb8, 3_usize, "rgb8", false, false),
+        spa::param::video::VideoFormat::RGBA => {
+            (PixelFormat::Rgba8, 4_usize, "rgba8", false, false)
+        }
+        spa::param::video::VideoFormat::RGBx => (PixelFormat::Rgba8, 4_usize, "rgba8", true, false),
+        spa::param::video::VideoFormat::BGR => (PixelFormat::Rgb8, 3_usize, "rgb8", false, true),
+        spa::param::video::VideoFormat::BGRA => (PixelFormat::Rgba8, 4_usize, "rgba8", false, true),
+        spa::param::video::VideoFormat::BGRx => (PixelFormat::Rgba8, 4_usize, "rgba8", true, true),
         other => return Err(format!("unsupported negotiated pixel format: {other:?}")),
     };
     let packed = usize::try_from(width)
@@ -405,13 +413,18 @@ fn frame_from_buffer(
         ));
     }
     let mut frame_bytes = bytes[offset..offset + required].to_vec();
-    if force_opaque_alpha {
+    if force_opaque_alpha || swap_red_blue {
         for row in 0..usize::try_from(height).unwrap_or(0) {
             let row_start = row.saturating_mul(stride);
-            for pixel in
-                frame_bytes[row_start..row_start.saturating_add(packed)].chunks_exact_mut(4)
+            for pixel in frame_bytes[row_start..row_start.saturating_add(packed)]
+                .chunks_exact_mut(bytes_per_pixel)
             {
-                pixel[3] = 255;
+                if swap_red_blue {
+                    pixel.swap(0, 2);
+                }
+                if force_opaque_alpha {
+                    pixel[3] = 255;
+                }
             }
         }
     }
@@ -453,7 +466,10 @@ fn video_format_parameters() -> Result<Vec<u8>, CaptureError> {
             spa::param::video::VideoFormat::RGB,
             spa::param::video::VideoFormat::RGB,
             spa::param::video::VideoFormat::RGBA,
-            spa::param::video::VideoFormat::RGBx
+            spa::param::video::VideoFormat::RGBx,
+            spa::param::video::VideoFormat::BGR,
+            spa::param::video::VideoFormat::BGRA,
+            spa::param::video::VideoFormat::BGRx
         ),
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoSize,
@@ -619,7 +635,7 @@ mod tests {
             Duration::ZERO,
             1,
             1,
-            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::YUY2,
             4,
             0,
             4,
@@ -654,6 +670,23 @@ mod tests {
             0,
             8,
             &[1, 2, 3, 0, 4, 5, 6, 17],
+        )
+        .unwrap();
+        assert_eq!(&*frame.data, &[1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn bgrx_is_converted_to_opaque_rgba() {
+        let (frame, _) = frame_from_buffer(
+            0,
+            Duration::ZERO,
+            2,
+            1,
+            spa::param::video::VideoFormat::BGRx,
+            8,
+            0,
+            8,
+            &[3, 2, 1, 0, 6, 5, 4, 17],
         )
         .unwrap();
         assert_eq!(&*frame.data, &[1, 2, 3, 255, 4, 5, 6, 255]);

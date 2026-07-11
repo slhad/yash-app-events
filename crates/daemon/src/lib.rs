@@ -1171,8 +1171,10 @@ fn detector_test_response(
     original: &GrayImage,
     processed: &GrayImage,
 ) -> Result<Value, RpcError> {
-    let original_png = encode_preview_png(original)?;
-    let processed_png = encode_preview_png(processed)?;
+    let original = bounded_gray_preview(original, 512)?;
+    let processed = bounded_gray_preview(processed, 512)?;
+    let original_png = encode_preview_png(&original)?;
+    let processed_png = encode_preview_png(&processed)?;
     Ok(
         json!({"detector_id": detector_id(&element.detector), "element_id": element.id, "observations": detections, "diagnostic": {"original_preview":{"mime":"image/png","width":original.width,"height":original.height,"bytes":original_png},"processed_preview":{"mime":"image/png","width":processed.width,"height":processed.height,"bytes":processed_png},"persistent_capture":false}}),
     )
@@ -1252,6 +1254,25 @@ fn encode_preview_png(image: &GrayImage) -> Result<Vec<u8>, RpcError> {
             .map_err(internal_error)?;
     }
     Ok(bytes)
+}
+
+fn bounded_gray_preview(image: &GrayImage, maximum: usize) -> Result<GrayImage, RpcError> {
+    if image.width <= maximum && image.height <= maximum {
+        return Ok(image.clone());
+    }
+    let scale = (image.width.div_ceil(maximum)).max(image.height.div_ceil(maximum));
+    let width = image.width.div_ceil(scale);
+    let height = image.height.div_ceil(scale);
+    let pixels = (0..height)
+        .flat_map(|y| {
+            (0..width).map(move |x| {
+                let source_x = (x * scale).min(image.width - 1);
+                let source_y = (y * scale).min(image.height - 1);
+                image.pixels[source_y * image.width + source_x]
+            })
+        })
+        .collect();
+    GrayImage::new(width, height, pixels).map_err(internal_error)
 }
 
 fn detector_id(detector: &ProfileDetector) -> DetectorId {
@@ -2362,6 +2383,14 @@ mod tests {
         .unwrap();
         let encoded = encode_frame_png(&frame).unwrap();
         assert_eq!(&encoded[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[test]
+    fn diagnostic_preview_downscales_without_changing_aspect_ratio() {
+        let image = GrayImage::new(1_440, 45, vec![127; 1_440 * 45]).unwrap();
+        let preview = bounded_gray_preview(&image, 512).unwrap();
+        assert_eq!((preview.width, preview.height), (480, 15));
+        assert_eq!(preview.pixels.len(), 480 * 15);
     }
 
     #[tokio::test]
