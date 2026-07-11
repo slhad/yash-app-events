@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+eframe.workspace = true
+png.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 yash-app-events-profile = { path = "../profile" }
 yash-app-events-protocol = { path = "../protocol" }
-

@@ -38,6 +38,7 @@ png = "0.18.1"
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
 pipewire = { version = "0.10.0", features = ["v1_2_0"] }
 futures-util = "0.3.31"
+eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "wayland"] }
 
 [workspace.dependencies.tempfile]
 version = "3.15.0"

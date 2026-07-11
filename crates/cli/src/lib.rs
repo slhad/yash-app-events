@@ -1,17 +1,13 @@
 //! Scriptable CLI and timeout-aware protocol-v1 client.
 
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, ReadHalf, WriteHalf};
-use tokio::net::UnixStream;
-use tokio::time::timeout;
 use yash_app_events_profile::{load_profile, Profile};
-use yash_app_events_protocol::{method, Request, RequestId, Response, RpcError, PROTOCOL_VERSION};
+use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
 /// `yash-eventsctl` command line.
 #[derive(Debug, Parser)]
@@ -143,7 +139,13 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         return Err(CliError::FollowRequiresStream);
     }
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
-    let mut client = Client::connect(&socket, Duration::from_millis(cli.timeout_ms)).await?;
+    let mut client = UnixRpcClient::connect(
+        &socket,
+        Duration::from_millis(cli.timeout_ms),
+        "yash-eventsctl",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
     let value = match &cli.command {
         Command::Version => client.call(method::VERSION, Value::Null).await?,
         Command::Status => client.call(method::STATUS, Value::Null).await?,
@@ -211,8 +213,11 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     Ok(value)
 }
 
-async fn execute_capture(client: &mut Client, command: &CaptureCommand) -> Result<Value, CliError> {
-    match command {
+async fn execute_capture(
+    client: &mut UnixRpcClient,
+    command: &CaptureCommand,
+) -> Result<Value, CliError> {
+    let result = match command {
         CaptureCommand::Select { source, profile_id } => {
             client
                 .call(
@@ -229,7 +234,8 @@ async fn execute_capture(client: &mut Client, command: &CaptureCommand) -> Resul
                 .call(method::CAPTURE_SNAPSHOT, json!({"path":path}))
                 .await
         }
-    }
+    };
+    result.map_err(Into::into)
 }
 
 /// Opens an event subscription after handshake.
@@ -237,9 +243,15 @@ async fn execute_capture(client: &mut Client, command: &CaptureCommand) -> Resul
 /// # Errors
 ///
 /// Returns connection, timeout, handshake, or subscription errors.
-pub async fn event_stream(cli: &Cli) -> Result<Client, CliError> {
+pub async fn event_stream(cli: &Cli) -> Result<UnixRpcClient, CliError> {
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
-    let mut client = Client::connect(&socket, Duration::from_millis(cli.timeout_ms)).await?;
+    let mut client = UnixRpcClient::connect(
+        &socket,
+        Duration::from_millis(cli.timeout_ms),
+        "yash-eventsctl",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
     client.call(method::EVENTS_SUBSCRIBE, Value::Null).await?;
     Ok(client)
 }
@@ -316,90 +328,11 @@ fn unsafe_current_uid() -> String {
     std::env::var("UID").unwrap_or_else(|_| "unknown".into())
 }
 
-/// One negotiated RPC client connection.
-#[derive(Debug)]
-pub struct Client {
-    reader: BufReader<ReadHalf<UnixStream>>,
-    writer: WriteHalf<UnixStream>,
-    timeout: Duration,
-    next_id: i64,
-}
-
-impl Client {
-    async fn connect(path: &Path, duration: Duration) -> Result<Self, CliError> {
-        let stream = timeout(duration, UnixStream::connect(path))
-            .await
-            .map_err(|_| CliError::Timeout)??;
-        let (reader, writer) = tokio::io::split(stream);
-        let mut client = Self {
-            reader: BufReader::new(reader),
-            writer,
-            timeout: duration,
-            next_id: 1,
-        };
-        client.call(method::HANDSHAKE, json!({"protocol": PROTOCOL_VERSION, "client_name": "yash-eventsctl", "client_version": env!("CARGO_PKG_VERSION")})).await?;
-        Ok(client)
-    }
-
-    async fn call(&mut self, method_name: &str, params: Value) -> Result<Value, CliError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = Request {
-            jsonrpc: "2.0".into(),
-            id: RequestId::Number(id),
-            method: method_name.into(),
-            params,
-        };
-        let mut bytes = serde_json::to_vec(&request)?;
-        bytes.push(b'\n');
-        timeout(self.timeout, self.writer.write_all(&bytes))
-            .await
-            .map_err(|_| CliError::Timeout)??;
-        let mut line = String::new();
-        timeout(self.timeout, self.reader.read_line(&mut line))
-            .await
-            .map_err(|_| CliError::Timeout)??;
-        if line.is_empty() {
-            return Err(CliError::Disconnected);
-        }
-        let response: Response = serde_json::from_str(&line)?;
-        response.result.ok_or_else(|| {
-            CliError::Rpc(
-                response
-                    .error
-                    .unwrap_or_else(|| RpcError::new(-32603, "response omitted result and error")),
-            )
-        })
-    }
-
-    /// Reads the next newline-framed subscription notification without a response timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns disconnect, I/O, or malformed JSON errors.
-    pub async fn next_notification(&mut self) -> Result<Value, CliError> {
-        let mut line = String::new();
-        self.reader.read_line(&mut line).await?;
-        if line.is_empty() {
-            return Err(CliError::Disconnected);
-        }
-        Ok(serde_json::from_str(&line)?)
-    }
-}
-
 /// Stable CLI failure categories used for process exit codes.
 #[derive(Debug, Error)]
 pub enum CliError {
-    #[error("cannot connect to daemon: {0}")]
-    Io(#[from] io::Error),
-    #[error("daemon request timed out")]
-    Timeout,
-    #[error("daemon disconnected")]
-    Disconnected,
-    #[error("protocol JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("daemon RPC error {}: {}", .0.code, .0.message)]
-    Rpc(RpcError),
+    #[error(transparent)]
+    Client(#[from] ClientError),
     #[error("profile validation failed: {0}")]
     Validation(String),
     #[error("event follow requires streaming execution")]
@@ -410,16 +343,19 @@ impl CliError {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Io(_) | Self::Disconnected => 3,
-            Self::Timeout => 6,
+            Self::Client(ClientError::Io(_) | ClientError::Disconnected) => 3,
+            Self::Client(ClientError::Timeout) => 6,
             Self::Validation(_) => 5,
-            Self::Json(_) | Self::Rpc(_) | Self::FollowRequiresStream => 4,
+            Self::Client(ClientError::Json(_) | ClientError::Rpc(_))
+            | Self::FollowRequiresStream => 4,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use yash_app_eventsd::{run, ServerConfig};
 
@@ -557,8 +493,8 @@ mod tests {
 
     #[test]
     fn exit_codes_are_stable_by_failure_category() {
-        assert_eq!(CliError::Timeout.exit_code(), 6);
-        assert_eq!(CliError::Disconnected.exit_code(), 3);
+        assert_eq!(CliError::Client(ClientError::Timeout).exit_code(), 6);
+        assert_eq!(CliError::Client(ClientError::Disconnected).exit_code(), 3);
         assert_eq!(CliError::Validation("bad".into()).exit_code(), 5);
         assert_eq!(CliError::FollowRequiresStream.exit_code(), 4);
     }

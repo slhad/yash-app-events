@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+mod client;
+pub use client::{ClientError, UnixRpcClient};
+
 /// The only control protocol version supported by this release.
 pub const PROTOCOL_VERSION: u16 = 1;
 /// Maximum compact JSON request size, including its newline delimiter.
@@ -157,6 +160,7 @@ pub mod method {
     pub const PROFILE_TRASH: &str = "profile.trash";
     pub const PROFILE_RESTORE: &str = "profile.restore";
     pub const PROFILE_ACTIVATE: &str = "profile.activate";
+    pub const PROFILE_DRAFT: &str = "profile.draft";
     pub const STATE_GET: &str = "state.get";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
@@ -168,6 +172,9 @@ pub mod method {
     pub const CAPTURE_STOP: &str = "capture.stop";
     pub const CAPTURE_STATUS: &str = "capture.status";
     pub const CAPTURE_SNAPSHOT: &str = "capture.snapshot";
+    pub const PREVIEW_START: &str = "preview.start";
+    pub const PREVIEW_STOP: &str = "preview.stop";
+    pub const PREVIEW_FRAME: &str = "preview.frame";
 }
 
 pub mod error_code {

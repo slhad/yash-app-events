@@ -7,8 +7,9 @@ It will capture a selected game window through the Wayland ScreenCast portal and
 > Status: engineering baseline implemented. The workspace builds and its placeholder
 > binaries run. The internal profile library now provides validated schema-v1 storage,
 > revision recovery, duplication, trash/restore, and safe portable archives. The local
-> protocol-v1 daemon and CLI profile/status operations work; capture, detection, event
-> output, and the GUI workflow are not implemented yet.
+> protocol-v1 daemon, CLI, replay/detectors, outputs, Wayland capture backend, and GUI
+> foundation are implemented. Interactive portal and full GUI authoring/release
+> acceptance are not yet verified, so this is not a supported release.
 
 ## Intended use cases
 

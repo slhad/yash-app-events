@@ -33,9 +33,17 @@ async fn follow(cli: &Cli) -> Result<(), yash_eventsctl::CliError> {
     loop {
         let notification = client.next_notification().await?;
         if cli.json {
-            println!("{}", serde_json::to_string(&notification)?);
+            println!(
+                "{}",
+                serde_json::to_string(&notification)
+                    .map_err(yash_app_events_protocol::ClientError::from)?
+            );
         } else {
-            println!("{}", serde_json::to_string_pretty(&notification)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&notification)
+                    .map_err(yash_app_events_protocol::ClientError::from)?
+            );
         }
     }
 }

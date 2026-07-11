@@ -70,6 +70,7 @@ struct State {
     capture: Mutex<Option<PortalCapture>>,
     analysis: Mutex<Option<LiveAnalysis>>,
     analysis_metrics: Mutex<AnalysisMetrics>,
+    preview_clients: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -83,6 +84,39 @@ struct AnalysisMetrics {
     frames: u64,
     first: Option<Instant>,
     last: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct PreviewLease {
+    state: Arc<State>,
+    active: bool,
+}
+
+impl PreviewLease {
+    fn new(state: Arc<State>) -> Self {
+        Self {
+            state,
+            active: false,
+        }
+    }
+    fn start(&mut self) {
+        if !self.active {
+            self.state.preview_clients.fetch_add(1, Ordering::Relaxed);
+            self.active = true;
+        }
+    }
+    fn stop(&mut self) {
+        if self.active {
+            self.state.preview_clients.fetch_sub(1, Ordering::Relaxed);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for PreviewLease {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Runs the daemon until a graceful-shutdown RPC or process cancellation.
@@ -123,6 +157,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         capture: Mutex::new(None),
         analysis: Mutex::new(None),
         analysis_metrics: Mutex::new(AnalysisMetrics::default()),
+        preview_clients: AtomicUsize::new(0),
     });
     loop {
         tokio::select! {
@@ -174,6 +209,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     let mut negotiated = false;
+    let mut preview = PreviewLease::new(Arc::clone(&state));
     loop {
         buffer.clear();
         let bytes = reader.read_until(b'\n', &mut buffer).await?;
@@ -267,6 +303,12 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
             .await?;
             continue;
         }
+        if request.method == method::PREVIEW_START {
+            preview.start();
+        }
+        if request.method == method::PREVIEW_STOP {
+            preview.stop();
+        }
         if request.method == method::STATUS_SUBSCRIBE || request.method == method::EVENTS_SUBSCRIBE
         {
             let receiver = state.notifications.subscribe();
@@ -292,9 +334,9 @@ async fn dispatch(request: Request, state: &Arc<State>) -> Response {
         method::VERSION => {
             Ok(json!({"version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
         }
-        method::CAPABILITIES => {
-            Ok(json!({"profiles": true, "subscriptions": true, "capture": false, "preview": false}))
-        }
+        method::CAPABILITIES => Ok(
+            json!({"profiles":true,"subscriptions":true,"capture":true,"preview":true,"detectors":["color_bar","template","region_change"]}),
+        ),
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
             let stopped = stop_capture(state).await;
@@ -328,6 +370,13 @@ async fn dispatch(request: Request, state: &Arc<State>) -> Response {
                     .map_err(store_error)
             })
             .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
+        method::PROFILE_DRAFT => parse::<ProfileParam>(request.params).and_then(|params| {
+            state
+                .profiles
+                .save_draft(&params.profile)
+                .map(|()| json!({"saved":true,"revision":params.profile.revision}))
+                .map_err(store_error)
+        }),
         method::PROFILE_DUPLICATE => parse::<DuplicateParams>(request.params)
             .and_then(|params| {
                 state
@@ -411,6 +460,13 @@ async fn dispatch(request: Request, state: &Arc<State>) -> Response {
         method::CAPTURE_STATUS => Ok(capture_status(state)),
         method::CAPTURE_SNAPSHOT => parse::<PathParam>(request.params)
             .and_then(|params| snapshot_capture(state, &params.path)),
+        method::PREVIEW_START => {
+            Ok(json!({"enabled":true,"clients":state.preview_clients.load(Ordering::Relaxed)}))
+        }
+        method::PREVIEW_STOP => {
+            Ok(json!({"enabled":false,"clients":state.preview_clients.load(Ordering::Relaxed)}))
+        }
+        method::PREVIEW_FRAME => preview_frame(state),
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -1299,6 +1355,99 @@ fn snapshot_capture(state: &State, path: &Path) -> Result<Value, RpcError> {
     Ok(json!({"saved":true,"path":path,"width":frame.width,"height":frame.height,"explicit":true}))
 }
 
+fn preview_frame(state: &State) -> Result<Value, RpcError> {
+    if state.preview_clients.load(Ordering::Relaxed) == 0 {
+        return Err(RpcError::new(
+            error_code::INVALID_REQUEST,
+            "preview.start is required",
+        ));
+    }
+    let frame = state.latest_frame.latest().ok_or_else(|| {
+        RpcError::new(
+            error_code::INVALID_REQUEST,
+            "no captured frame is available",
+        )
+    })?;
+    let preview = downscale_frame(&frame, 320, 180)?;
+    let bytes = encode_frame_png(&preview)?;
+    Ok(
+        json!({"sequence":frame.sequence,"timestamp_ms":u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX),"width":preview.width,"height":preview.height,"mime":"image/png","bytes":bytes}),
+    )
+}
+
+fn downscale_frame(
+    frame: &Frame,
+    maximum_width: u32,
+    maximum_height: u32,
+) -> Result<Frame, RpcError> {
+    let (width, height) = if frame.width <= maximum_width && frame.height <= maximum_height {
+        (frame.width, frame.height)
+    } else if u64::from(frame.width) * u64::from(maximum_height)
+        >= u64::from(frame.height) * u64::from(maximum_width)
+    {
+        (
+            maximum_width,
+            u32::try_from(
+                (u64::from(frame.height) * u64::from(maximum_width) / u64::from(frame.width))
+                    .max(1),
+            )
+            .map_err(internal_error)?,
+        )
+    } else {
+        (
+            u32::try_from(
+                (u64::from(frame.width) * u64::from(maximum_height) / u64::from(frame.height))
+                    .max(1),
+            )
+            .map_err(internal_error)?,
+            maximum_height,
+        )
+    };
+    let bytes_per_pixel = frame.format.bytes_per_pixel();
+    let width_usize = usize::try_from(width).map_err(internal_error)?;
+    let height_usize = usize::try_from(height).map_err(internal_error)?;
+    let row_stride = width_usize
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| internal_error("preview size overflow"))?;
+    let mut pixels = vec![
+        0_u8;
+        row_stride
+            .checked_mul(height_usize)
+            .ok_or_else(|| internal_error("preview size overflow"))?
+    ];
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let source_x = x * usize::try_from(frame.width).map_err(internal_error)? / width_usize;
+            let source_y =
+                y * usize::try_from(frame.height).map_err(internal_error)? / height_usize;
+            let source = source_y
+                .checked_mul(frame.row_stride)
+                .and_then(|offset| offset.checked_add(source_x * bytes_per_pixel))
+                .ok_or_else(|| internal_error("preview source overflow"))?;
+            let destination = y * row_stride + x * bytes_per_pixel;
+            pixels[destination..destination + bytes_per_pixel].copy_from_slice(
+                frame
+                    .data
+                    .get(source..source + bytes_per_pixel)
+                    .ok_or_else(|| internal_error("preview source truncated"))?,
+            );
+        }
+    }
+    Frame::new(
+        frame.sequence,
+        frame.timestamp,
+        FrameLayout {
+            width,
+            height,
+            row_stride,
+            format: frame.format,
+        },
+        frame.source_id.clone(),
+        Arc::from(pixels),
+    )
+    .map_err(internal_error)
+}
+
 fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, RpcError> {
     let bytes_per_pixel = frame.format.bytes_per_pixel();
     let packed_stride = usize::try_from(frame.width)
@@ -1987,6 +2136,7 @@ mod tests {
             capture: Mutex::new(None),
             analysis: Mutex::new(None),
             analysis_metrics: Mutex::new(AnalysisMetrics::default()),
+            preview_clients: AtomicUsize::new(0),
         });
         state
             .local_config
@@ -2067,5 +2217,14 @@ mod tests {
             1
         );
         assert_eq!(state.latest_snapshot.lock().unwrap()["sequence"], 1);
+        {
+            let mut lease = PreviewLease::new(Arc::clone(&state));
+            lease.start();
+            let preview = preview_frame(&state).unwrap();
+            assert!(preview["width"].as_u64().unwrap() <= 320);
+            assert_eq!(preview["bytes"][0], 137);
+            assert_eq!(state.preview_clients.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(state.preview_clients.load(Ordering::Relaxed), 0);
     }
 }
