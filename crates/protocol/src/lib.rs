@@ -166,6 +166,7 @@ pub mod method {
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
     pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
     pub const DETECTOR_TEST: &str = "detector.test";
+    pub const DETECTOR_CAPTURE_TEMPLATE: &str = "detector.capture_template";
     pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
     pub const CAPTURE_SELECT: &str = "capture.select";
     pub const CAPTURE_START: &str = "capture.start";
@@ -175,6 +176,8 @@ pub mod method {
     pub const PREVIEW_START: &str = "preview.start";
     pub const PREVIEW_STOP: &str = "preview.stop";
     pub const PREVIEW_FRAME: &str = "preview.frame";
+    pub const PREVIEW_FREEZE: &str = "preview.freeze";
+    pub const PREVIEW_UNFREEZE: &str = "preview.unfreeze";
 }
 
 pub mod error_code {

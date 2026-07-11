@@ -35,9 +35,9 @@ use yash_app_events_protocol::{
     PROTOCOL_VERSION,
 };
 use yash_app_events_vision::{
-    ColorBarConfig, ColorBarDetector, Detection, Detector as VisionDetector, GrayImage,
-    PreprocessPipeline, RegionChangeConfig, RegionChangeDetector, Template, TemplateConfig,
-    TemplateDetector,
+    grayscale_crop, ColorBarConfig, ColorBarDetector, Detection, Detector as VisionDetector,
+    GrayImage, PreprocessPipeline, RegionChangeConfig, RegionChangeDetector, Template,
+    TemplateConfig, TemplateDetector,
 };
 
 const SUBSCRIPTION_CAPACITY: usize = 64;
@@ -90,6 +90,7 @@ struct AnalysisMetrics {
 struct PreviewLease {
     state: Arc<State>,
     active: bool,
+    frozen: Option<Arc<Frame>>,
 }
 
 impl PreviewLease {
@@ -97,6 +98,7 @@ impl PreviewLease {
         Self {
             state,
             active: false,
+            frozen: None,
         }
     }
     fn start(&mut self) {
@@ -109,7 +111,18 @@ impl PreviewLease {
         if self.active {
             self.state.preview_clients.fetch_sub(1, Ordering::Relaxed);
             self.active = false;
+            self.frozen = None;
         }
+    }
+    fn freeze(&mut self) -> bool {
+        self.frozen = self.state.latest_frame.latest();
+        self.frozen.is_some()
+    }
+    fn unfreeze(&mut self) {
+        self.frozen = None;
+    }
+    fn frozen(&self) -> Option<Arc<Frame>> {
+        self.frozen.clone()
     }
 }
 
@@ -309,6 +322,12 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
         if request.method == method::PREVIEW_STOP {
             preview.stop();
         }
+        if request.method == method::PREVIEW_FREEZE {
+            preview.freeze();
+        }
+        if request.method == method::PREVIEW_UNFREEZE {
+            preview.unfreeze();
+        }
         if request.method == method::STATUS_SUBSCRIBE || request.method == method::EVENTS_SUBSCRIBE
         {
             let receiver = state.notifications.subscribe();
@@ -322,13 +341,17 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
             .await?;
             return serve_subscription(&mut writer, receiver).await;
         }
-        let response = dispatch(request, &state).await;
+        let response = dispatch(request, &state, preview.frozen()).await;
         write_response(&mut writer, &response).await?;
     }
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch(request: Request, state: &Arc<State>) -> Response {
+async fn dispatch(
+    request: Request,
+    state: &Arc<State>,
+    frozen_frame: Option<Arc<Frame>>,
+) -> Response {
     let id = request.id;
     let result: Result<Value, RpcError> = match request.method.as_str() {
         method::VERSION => {
@@ -444,7 +467,9 @@ async fn dispatch(request: Request, state: &Arc<State>) -> Response {
         method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(request.params)
             .and_then(|params| run_synthetic_health(state, params)),
         method::DETECTOR_TEST => parse::<DetectorTestParams>(request.params)
-            .and_then(|params| test_detector(state, params)),
+            .and_then(|params| test_detector(state, params, frozen_frame)),
+        method::DETECTOR_CAPTURE_TEMPLATE => parse::<CaptureTemplateParams>(request.params)
+            .and_then(|params| capture_template(state, &params)),
         method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
             .and_then(|params| run_profile_replay(state, &params)),
         method::CAPTURE_SELECT => match parse::<CaptureSelectParams>(request.params) {
@@ -467,6 +492,10 @@ async fn dispatch(request: Request, state: &Arc<State>) -> Response {
             Ok(json!({"enabled":false,"clients":state.preview_clients.load(Ordering::Relaxed)}))
         }
         method::PREVIEW_FRAME => preview_frame(state),
+        method::PREVIEW_FREEZE => Ok(
+            json!({"frozen":frozen_frame.is_some(),"sequence":frozen_frame.as_ref().map(|frame|frame.sequence)}),
+        ),
+        method::PREVIEW_UNFREEZE => Ok(json!({"frozen":false})),
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -922,7 +951,11 @@ fn replay_fixture_frames(
 }
 
 #[allow(clippy::too_many_lines)]
-fn test_detector(state: &State, params: DetectorTestParams) -> Result<Value, RpcError> {
+fn test_detector(
+    state: &State,
+    params: DetectorTestParams,
+    frozen_frame: Option<Arc<Frame>>,
+) -> Result<Value, RpcError> {
     let profile = state
         .profiles
         .load(params.profile_id)
@@ -939,7 +972,28 @@ fn test_detector(state: &State, params: DetectorTestParams) -> Result<Value, Rpc
         width: 1.0,
         height: 1.0,
     };
-    let (detections, preview) = match &element.detector {
+    if params.use_frozen {
+        let frame = frozen_frame.ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_REQUEST,
+                "freeze a preview frame before testing it",
+            )
+        })?;
+        let mut detector = configured_detector(&element.detector, &directory)?;
+        let detection = detector.detect(&frame, element.region);
+        let original = grayscale_crop(&frame, element.region).map_err(internal_error)?;
+        let processed = match &element.detector {
+            ProfileDetector::ColorBar { .. } => original.clone(),
+            ProfileDetector::Template { preprocessing, .. }
+            | ProfileDetector::RegionChange { preprocessing, .. } => PreprocessPipeline {
+                operations: preprocessing.clone(),
+            }
+            .apply(&original)
+            .map_err(internal_error)?,
+        };
+        return detector_test_response(element, &[detection], &original, &processed);
+    }
+    let (detections, original, processed_preview) = match &element.detector {
         ProfileDetector::ColorBar {
             direction,
             minimum_rgb,
@@ -969,7 +1023,11 @@ fn test_detector(state: &State, params: DetectorTestParams) -> Result<Value, Rpc
                     .collect(),
             )
             .map_err(internal_error)?;
-            (vec![detector.detect(&frame, full_region)], preview)
+            (
+                vec![detector.detect(&frame, full_region)],
+                preview.clone(),
+                preview,
+            )
         }
         ProfileDetector::Template {
             templates,
@@ -1014,7 +1072,7 @@ fn test_detector(state: &State, params: DetectorTestParams) -> Result<Value, Rpc
             }
             .apply(&fixture)
             .map_err(internal_error)?;
-            (vec![detector.detect(&frame, full_region)], preview)
+            (vec![detector.detect(&frame, full_region)], fixture, preview)
         }
         ProfileDetector::RegionChange {
             threshold,
@@ -1033,18 +1091,88 @@ fn test_detector(state: &State, params: DetectorTestParams) -> Result<Value, Rpc
                 GrayImage::new(2, 2, vec![params.change_value; 4]).map_err(internal_error)?;
             let first_frame = gray_frame(0, &first).map_err(internal_error)?;
             let second_frame = gray_frame(1, &second).map_err(internal_error)?;
+            let processed = PreprocessPipeline {
+                operations: preprocessing.clone(),
+            }
+            .apply(&second)
+            .map_err(internal_error)?;
             (
                 vec![
                     detector.detect(&first_frame, full_region),
                     detector.detect(&second_frame, full_region),
                 ],
                 second,
+                processed,
             )
         }
     };
-    let preview_png = encode_preview_png(&preview)?;
+    detector_test_response(element, &detections, &original, &processed_preview)
+}
+
+fn detector_test_response(
+    element: &yash_app_events_profile::Element,
+    detections: &[Detection],
+    original: &GrayImage,
+    processed: &GrayImage,
+) -> Result<Value, RpcError> {
+    let original_png = encode_preview_png(original)?;
+    let processed_png = encode_preview_png(processed)?;
     Ok(
-        json!({"detector_id": detector_id(&element.detector), "element_id": element.id, "observations": detections, "diagnostic": {"preview":{"mime":"image/png","width":preview.width,"height":preview.height,"bytes":preview_png},"persistent_capture":false}}),
+        json!({"detector_id": detector_id(&element.detector), "element_id": element.id, "observations": detections, "diagnostic": {"original_preview":{"mime":"image/png","width":original.width,"height":original.height,"bytes":original_png},"processed_preview":{"mime":"image/png","width":processed.width,"height":processed.height,"bytes":processed_png},"persistent_capture":false}}),
+    )
+}
+
+fn capture_template(state: &State, params: &CaptureTemplateParams) -> Result<Value, RpcError> {
+    if params.name.is_empty()
+        || params.name.len() > 64
+        || !params
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "template name must use lowercase letters, digits, and underscores",
+        ));
+    }
+    let profile = state
+        .profiles
+        .load(params.profile_id)
+        .map_err(store_error)?;
+    if profile.revision != params.expected_revision {
+        return Err(RpcError {
+            code: error_code::REVISION_CONFLICT,
+            message: "profile revision conflict".into(),
+            data: Some(json!({"expected":params.expected_revision,"current":profile.revision})),
+        });
+    }
+    let element = profile
+        .elements
+        .iter()
+        .find(|element| element.id == params.element_id)
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
+    let frame = state.latest_frame.latest().ok_or_else(|| {
+        RpcError::new(
+            error_code::INVALID_REQUEST,
+            "no captured frame is available",
+        )
+    })?;
+    let image = grayscale_crop(&frame, element.region).map_err(internal_error)?;
+    if image.width * image.height > 16_777_216 {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "template crop exceeds 16 megapixels",
+        ));
+    }
+    let relative = PathBuf::from(format!("templates/{}.json", params.name));
+    let destination = state.profiles.profile_directory(profile.id).join(&relative);
+    yash_app_events_profile::atomic_write(
+        &destination,
+        &serde_json::to_vec_pretty(&image).map_err(internal_error)?,
+    )
+    .map_err(internal_error)?;
+    Ok(
+        json!({"captured":true,"path":relative,"width":image.width,"height":image.height,"explicit":true}),
     )
 }
 
@@ -1596,6 +1724,15 @@ struct DetectorTestParams {
     fill: u8,
     #[serde(default = "default_change_value")]
     change_value: u8,
+    #[serde(default)]
+    use_frozen: bool,
+}
+#[derive(Deserialize)]
+struct CaptureTemplateParams {
+    profile_id: ProfileId,
+    element_id: ElementId,
+    expected_revision: u64,
+    name: String,
 }
 #[derive(Deserialize)]
 struct ProfileReplayParams {
@@ -1985,10 +2122,13 @@ mod tests {
         assert_eq!(change["result"]["observations"][1]["value"], 1.0);
         assert_eq!(change["result"]["diagnostic"]["persistent_capture"], false);
         assert_eq!(
-            change["result"]["diagnostic"]["preview"]["mime"],
+            change["result"]["diagnostic"]["processed_preview"]["mime"],
             "image/png"
         );
-        assert_eq!(change["result"]["diagnostic"]["preview"]["bytes"][0], 137);
+        assert_eq!(
+            change["result"]["diagnostic"]["processed_preview"]["bytes"][0],
+            137
+        );
         let mut subscriber = BufReader::new(UnixStream::connect(&socket).await.unwrap());
         handshake(&mut subscriber).await;
         call(&mut subscriber, 8, method::EVENTS_SUBSCRIBE, Value::Null).await;
@@ -2226,5 +2366,23 @@ mod tests {
             assert_eq!(state.preview_clients.load(Ordering::Relaxed), 1);
         }
         assert_eq!(state.preview_clients.load(Ordering::Relaxed), 0);
+        let captured = capture_template(
+            &state,
+            &CaptureTemplateParams {
+                profile_id: profile.id,
+                element_id,
+                expected_revision: 0,
+                name: "health_crop".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(captured["explicit"], true);
+        let asset = directory
+            .path()
+            .join("data/profiles")
+            .join(profile.id.to_string())
+            .join("templates/health_crop.json");
+        let image: GrayImage = serde_json::from_slice(&fs::read(asset).unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (10, 2));
     }
 }

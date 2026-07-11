@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use yash_app_events_capture::Frame;
 use yash_app_events_profile::NormalizedRegion;
 
-use crate::{crop_gray, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
+use crate::{grayscale_crop, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
 
 /// One named grayscale template and optional row-major mask.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,7 +56,7 @@ impl TemplateDetector {
 
 impl Detector for TemplateDetector {
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
-        let crop = match crop_gray(frame, region)
+        let crop = match grayscale_crop(frame, region)
             .and_then(|image| self.config.preprocessing.apply(&image))
         {
             Ok(crop) => crop,

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use yash_app_events_capture::Frame;
 use yash_app_events_profile::NormalizedRegion;
 
-use crate::{crop_gray, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
+use crate::{grayscale_crop, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RegionChangeConfig {
@@ -37,7 +37,7 @@ impl RegionChangeDetector {
 impl Detector for RegionChangeDetector {
     #[allow(clippy::cast_precision_loss)]
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
-        let current = match crop_gray(frame, region)
+        let current = match grayscale_crop(frame, region)
             .and_then(|image| self.config.preprocessing.apply(&image))
         {
             Ok(image) => image,

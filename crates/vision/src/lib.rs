@@ -196,7 +196,12 @@ struct Crop<'a> {
     height: usize,
 }
 
-fn crop_gray(frame: &Frame, region: NormalizedRegion) -> Result<GrayImage, &'static str> {
+/// Converts a validated frame region into a tightly packed grayscale crop.
+///
+/// # Errors
+///
+/// Rejects invalid/empty regions and truncated frame storage.
+pub fn grayscale_crop(frame: &Frame, region: NormalizedRegion) -> Result<GrayImage, &'static str> {
     let crop = Crop::new(frame, region).ok_or("invalid or empty crop")?;
     let mut pixels = Vec::with_capacity(crop.width * crop.height);
     for y in 0..crop.height {

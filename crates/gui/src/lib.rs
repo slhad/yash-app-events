@@ -1,5 +1,6 @@
 //! Responsive egui protocol client and visual normalized-region editor.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -10,7 +11,8 @@ use eframe::egui;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
-    BarDirection, Detector, DetectorId, Element, ElementId, NormalizedRegion, Profile, ProfileStore,
+    BarDirection, Detector, DetectorId, Element, ElementId, EventRule, NormalizedRegion,
+    PreprocessOperation, Profile, ProfileStore, RuleId,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -27,6 +29,8 @@ enum RequestKind {
     PreviewStart,
     PreviewStop,
     PreviewFrame,
+    DetectorTest,
+    TemplateCapture,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,11 @@ struct Request {
 enum Payload {
     Json(Value),
     Preview(PreviewImage),
+    DetectorInspection {
+        value: Value,
+        original: PreviewImage,
+        processed: PreviewImage,
+    },
     Error(String),
 }
 
@@ -113,6 +122,19 @@ impl Worker {
                                     Err(error) => Payload::Error(error),
                                 }
                             }
+                            Ok(value) if request.kind == RequestKind::DetectorTest => {
+                                match (
+                                    decode_preview(&value["diagnostic"]["original_preview"]),
+                                    decode_preview(&value["diagnostic"]["processed_preview"]),
+                                ) {
+                                    (Ok(original), Ok(processed)) => Payload::DetectorInspection {
+                                        value,
+                                        original,
+                                        processed,
+                                    },
+                                    (Err(error), _) | (_, Err(error)) => Payload::Error(error),
+                                }
+                            }
                             Ok(value) => Payload::Json(value),
                             Err(error) => {
                                 if !matches!(error, ClientError::Rpc(_)) {
@@ -175,6 +197,14 @@ pub struct App {
     draw_start: Option<egui::Pos2>,
     drag_origin: Option<NormalizedRegion>,
     resizing: bool,
+    continuous_test: bool,
+    test_pending: bool,
+    last_test: Instant,
+    detector_result: Value,
+    original_texture: Option<egui::TextureHandle>,
+    processed_texture: Option<egui::TextureHandle>,
+    timeline: VecDeque<String>,
+    last_state_sequence: u64,
 }
 
 impl fmt::Debug for App {
@@ -226,6 +256,14 @@ impl App {
             draw_start: None,
             drag_origin: None,
             resizing: false,
+            continuous_test: false,
+            test_pending: false,
+            last_test: Instant::now(),
+            detector_result: json!({}),
+            original_texture: None,
+            processed_texture: None,
+            timeline: VecDeque::with_capacity(100),
+            last_state_sequence: 0,
         }
     }
 
@@ -248,10 +286,49 @@ impl App {
                     ));
                     self.preview_pending = false;
                 }
+                Payload::DetectorInspection {
+                    value,
+                    original,
+                    processed,
+                } => {
+                    self.detector_result = value;
+                    self.original_texture = Some(load_preview_texture(
+                        context,
+                        "detector-original",
+                        &original,
+                    ));
+                    self.processed_texture = Some(load_preview_texture(
+                        context,
+                        "detector-processed",
+                        &processed,
+                    ));
+                    self.test_pending = false;
+                    if let Some(observation) = self.detector_result["observations"]
+                        .as_array()
+                        .and_then(|items| items.last())
+                    {
+                        self.push_timeline(format!(
+                            "test · {} · value={} confidence={}",
+                            observation["status"].as_str().unwrap_or("?"),
+                            observation["value"],
+                            observation["confidence"]
+                        ));
+                    }
+                }
                 Payload::Json(value) => match response.kind {
                     RequestKind::Profiles => self.apply_profiles(value),
                     RequestKind::Status => self.status = value,
-                    RequestKind::State => self.state = value,
+                    RequestKind::State => {
+                        let sequence = value["sequence"].as_u64().unwrap_or(0);
+                        if sequence > self.last_state_sequence {
+                            self.push_timeline(format!(
+                                "transition seq {sequence} · {}",
+                                value["events"]
+                            ));
+                            self.last_state_sequence = sequence;
+                        }
+                        self.state = value;
+                    }
                     RequestKind::Commit => {
                         self.error = None;
                         self.dirty_since = None;
@@ -273,6 +350,15 @@ impl App {
                         self.preview_pending = false;
                     }
                     RequestKind::PreviewFrame => {}
+                    RequestKind::DetectorTest => {
+                        self.detector_result = value;
+                        self.test_pending = false;
+                    }
+                    RequestKind::TemplateCapture => {
+                        if let Some(path) = value["path"].as_str() {
+                            self.add_template_path(path.into());
+                        }
+                    }
                 },
             }
         }
@@ -297,6 +383,13 @@ impl App {
     fn mark_dirty(&mut self) {
         self.dirty_since = Some(Instant::now());
         self.draft_saved = false;
+    }
+
+    fn push_timeline(&mut self, entry: String) {
+        if self.timeline.len() == 100 {
+            self.timeline.pop_front();
+        }
+        self.timeline.push_back(entry);
     }
 
     fn schedule(&mut self) {
@@ -335,6 +428,39 @@ impl App {
                 );
             }
             self.draft_saved = true;
+        }
+        if self.continuous_test
+            && !self.test_pending
+            && self.last_test.elapsed() >= Duration::from_millis(500)
+        {
+            self.request_detector_test();
+        }
+    }
+
+    fn request_detector_test(&mut self) {
+        if let (Some(profile), Some(index)) = (&self.draft, self.selected_region) {
+            if let Some(element) = profile.elements.get(index) {
+                self.worker.send(
+                    RequestKind::DetectorTest,
+                    method::DETECTOR_TEST,
+                    json!({"profile_id":profile.id,"element_id":element.id,"use_frozen":self.frozen}),
+                );
+                self.test_pending = true;
+                self.last_test = Instant::now();
+            }
+        }
+    }
+
+    fn add_template_path(&mut self, path: PathBuf) {
+        if let (Some(profile), Some(index)) = (&mut self.draft, self.selected_region) {
+            if let Some(Element {
+                detector: Detector::Template { templates, .. },
+                ..
+            }) = profile.elements.get_mut(index)
+            {
+                templates.push(path);
+                self.mark_dirty();
+            }
         }
     }
 
@@ -394,7 +520,17 @@ impl App {
                         Value::Null,
                     );
                 }
-                ui.checkbox(&mut self.frozen, "Freeze");
+                if ui.checkbox(&mut self.frozen, "Freeze").changed() {
+                    self.worker.send(
+                        RequestKind::Capture,
+                        if self.frozen {
+                            method::PREVIEW_FREEZE
+                        } else {
+                            method::PREVIEW_UNFREEZE
+                        },
+                        Value::Null,
+                    );
+                }
                 ui.label(format!(
                     "input {:.1} FPS · analysis {:.1} FPS · replaced {}",
                     self.capture_status["metrics"]["input_fps"]
@@ -498,6 +634,7 @@ impl App {
                         ));
                     });
                 }
+                self.detector_editor(ui, &mut profile, index);
             }
             let size = ui.available_size().max(egui::vec2(200.0, 150.0));
             let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
@@ -520,6 +657,257 @@ impl App {
             }
             self.region_interaction(&response, &painter, base_canvas, &mut profile);
             self.draft = Some(profile);
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn detector_editor(&mut self, ui: &mut egui::Ui, profile: &mut Profile, index: usize) {
+        ui.separator();
+        ui.heading("Detector and event");
+        let current = match &profile.elements[index].detector {
+            Detector::ColorBar { .. } => "Color bar",
+            Detector::Template { .. } => "Template",
+            Detector::RegionChange { .. } => "Region change",
+        };
+        let mut chosen = current;
+        egui::ComboBox::from_label("Detector type")
+            .selected_text(chosen)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, "Color bar", "Color bar");
+                ui.selectable_value(&mut chosen, "Template", "Template");
+                ui.selectable_value(&mut chosen, "Region change", "Region change");
+            });
+        if chosen != current {
+            profile.elements[index].detector = match chosen {
+                "Template" => Detector::Template {
+                    id: DetectorId::new(),
+                    templates: Vec::new(),
+                    masks: Vec::new(),
+                    threshold: 0.85,
+                    preprocessing: Vec::new(),
+                },
+                "Region change" => Detector::RegionChange {
+                    id: DetectorId::new(),
+                    threshold: 0.1,
+                    preprocessing: Vec::new(),
+                },
+                _ => Detector::ColorBar {
+                    id: DetectorId::new(),
+                    direction: BarDirection::LeftToRight,
+                    minimum_rgb: [128, 0, 0],
+                    maximum_rgb: [255, 128, 128],
+                    mask: None,
+                },
+            };
+            self.mark_dirty();
+        }
+        let selected_element_id = profile.elements[index].id;
+        let mut changed = false;
+        match &mut profile.elements[index].detector {
+            Detector::ColorBar {
+                direction,
+                minimum_rgb,
+                maximum_rgb,
+                ..
+            } => {
+                egui::ComboBox::from_label("Fill direction")
+                    .selected_text(format!("{direction:?}"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(direction, BarDirection::LeftToRight, "Left to right");
+                        ui.selectable_value(direction, BarDirection::RightToLeft, "Right to left");
+                        ui.selectable_value(direction, BarDirection::TopToBottom, "Top to bottom");
+                        ui.selectable_value(direction, BarDirection::BottomToTop, "Bottom to top");
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("RGB minimum");
+                    for value in minimum_rgb {
+                        changed |= ui.add(egui::DragValue::new(value)).changed();
+                    }
+                    ui.label("maximum");
+                    for value in maximum_rgb {
+                        changed |= ui.add(egui::DragValue::new(value)).changed();
+                    }
+                });
+            }
+            Detector::Template {
+                templates,
+                threshold,
+                preprocessing,
+                ..
+            } => {
+                changed |= ui
+                    .add(egui::Slider::new(threshold, 0.0..=1.0).text("Match threshold"))
+                    .changed();
+                let mut remove = None;
+                for (template_index, path) in templates.iter_mut().enumerate() {
+                    let mut text = path.to_string_lossy().into_owned();
+                    ui.horizontal(|ui| {
+                        if ui.text_edit_singleline(&mut text).changed() {
+                            *path = PathBuf::from(&text);
+                            changed = true;
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(template_index);
+                        }
+                    });
+                }
+                if let Some(remove) = remove {
+                    templates.remove(remove);
+                    changed = true;
+                }
+                if ui.button("Add template path").clicked() {
+                    templates.push(PathBuf::from("templates/template.json"));
+                    changed = true;
+                }
+                if ui.button("Capture template from latest frame").clicked() {
+                    let name = format!("template_{}", templates.len() + 1);
+                    self.worker.send(RequestKind::TemplateCapture,method::DETECTOR_CAPTURE_TEMPLATE,json!({"profile_id":profile.id,"element_id":selected_element_id,"expected_revision":profile.revision,"name":name}));
+                }
+                preprocessing_editor(ui, preprocessing, &mut changed);
+            }
+            Detector::RegionChange {
+                threshold,
+                preprocessing,
+                ..
+            } => {
+                changed |= ui
+                    .add(egui::Slider::new(threshold, 0.0..=1.0).text("Change threshold"))
+                    .changed();
+                preprocessing_editor(ui, preprocessing, &mut changed);
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Test detector").clicked() {
+                self.request_detector_test();
+            }
+            ui.checkbox(&mut self.continuous_test, "Continuous test");
+            if self.test_pending {
+                ui.spinner();
+            }
+        });
+        if let Some(observation) = self.detector_result["observations"]
+            .as_array()
+            .and_then(|items| items.last())
+        {
+            ui.label(format!(
+                "{} · value={} · confidence={} · {}",
+                observation["status"].as_str().unwrap_or("?"),
+                observation["value"],
+                observation["confidence"],
+                observation["diagnostic"].as_str().unwrap_or("")
+            ));
+        }
+        ui.horizontal(|ui| {
+            if let Some(texture) = &self.original_texture {
+                ui.vertical(|ui| {
+                    ui.label("Original crop");
+                    ui.image((
+                        texture.id(),
+                        fit_size(texture.size_vec2(), egui::vec2(180.0, 100.0)),
+                    ));
+                });
+            }
+            if let Some(texture) = &self.processed_texture {
+                ui.vertical(|ui| {
+                    ui.label("Processed crop");
+                    ui.image((
+                        texture.id(),
+                        fit_size(texture.size_vec2(), egui::vec2(180.0, 100.0)),
+                    ));
+                });
+            }
+        });
+        let element_id = selected_element_id;
+        let rule_index = profile
+            .rules
+            .iter()
+            .position(|rule| rule.element_id == element_id);
+        if rule_index.is_none() && ui.button("Add numeric event rule").clicked() {
+            profile.rules.push(EventRule {
+                id: RuleId::new(),
+                element_id,
+                event: "region_event".into(),
+                enter_below: 0.2,
+                leave_above: 0.3,
+                minimum_confidence: 0.8,
+                required_samples: 2,
+                sample_window: 3,
+                cooldown_ms: 500,
+            });
+            self.mark_dirty();
+        }
+        if let Some(rule_index) = rule_index {
+            let rule = &mut profile.rules[rule_index];
+            let mut rule_changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Event name");
+                rule_changed |= ui.text_edit_singleline(&mut rule.event).changed();
+            });
+            ui.horizontal(|ui| {
+                rule_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut rule.enter_below)
+                            .speed(0.01)
+                            .prefix("enter < "),
+                    )
+                    .changed();
+                rule_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut rule.leave_above)
+                            .speed(0.01)
+                            .prefix("leave > "),
+                    )
+                    .changed();
+                rule_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut rule.minimum_confidence, 0.0..=1.0)
+                            .text("confidence"),
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                rule_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut rule.required_samples)
+                            .range(1..=100)
+                            .prefix("N "),
+                    )
+                    .changed();
+                rule_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut rule.sample_window)
+                            .range(1..=100)
+                            .prefix("of M "),
+                    )
+                    .changed();
+                rule_changed |= ui
+                    .add(egui::DragValue::new(&mut rule.cooldown_ms).prefix("cooldown ms "))
+                    .changed();
+            });
+            rule.sample_window = rule.sample_window.max(rule.required_samples);
+            ui.label(format!(
+                "state={} · hysteresis {:.3} · evidence {} of {} · cooldown {} ms",
+                self.state["events"][&rule.event],
+                rule.leave_above - rule.enter_below,
+                rule.required_samples,
+                rule.sample_window,
+                rule.cooldown_ms
+            ));
+            if rule_changed {
+                self.mark_dirty();
+            }
+        }
+        ui.collapsing("Recent observations and transitions", |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for entry in self.timeline.iter().rev() {
+                        ui.label(entry);
+                    }
+                });
         });
     }
 
@@ -710,6 +1098,57 @@ fn fit_rect(outer: egui::Rect, size: egui::Vec2) -> egui::Rect {
     let scale = (outer.width() / size.x).min(outer.height() / size.y);
     let fitted = size * scale;
     egui::Rect::from_center_size(outer.center(), fitted)
+}
+
+fn fit_size(size: egui::Vec2, maximum: egui::Vec2) -> egui::Vec2 {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return maximum;
+    }
+    size * ((maximum.x / size.x).min(maximum.y / size.y).min(1.0))
+}
+
+fn load_preview_texture(
+    context: &egui::Context,
+    name: &str,
+    image: &PreviewImage,
+) -> egui::TextureHandle {
+    let color = egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba);
+    context.load_texture(name, color, egui::TextureOptions::LINEAR)
+}
+
+fn preprocessing_editor(
+    ui: &mut egui::Ui,
+    operations: &mut Vec<PreprocessOperation>,
+    changed: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("Preprocessing: {} operation(s)", operations.len()));
+        if ui.button("+ threshold").clicked() {
+            operations.push(PreprocessOperation::Threshold {
+                minimum: 64,
+                maximum: 255,
+            });
+            *changed = true;
+        }
+        if ui.button("+ resize").clicked() {
+            operations.push(PreprocessOperation::Resize {
+                width: 128,
+                height: 128,
+            });
+            *changed = true;
+        }
+        if ui.button("+ invert").clicked() {
+            operations.push(PreprocessOperation::Invert);
+            *changed = true;
+        }
+        if ui.button("Clear").clicked() {
+            operations.clear();
+            *changed = true;
+        }
+    });
+    for operation in operations.iter() {
+        ui.small(format!("{operation:?}"));
+    }
 }
 fn normalized_point(
     canvas: egui::Rect,
