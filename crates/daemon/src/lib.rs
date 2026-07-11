@@ -16,7 +16,9 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
+use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
+use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
 use yash_app_events_engine::{
     AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig, TransitionState,
 };
@@ -63,6 +65,8 @@ struct State {
     output: Mutex<OutputWriter>,
     latest_snapshot: Mutex<Value>,
     output_error: Mutex<Option<String>>,
+    latest_frame: LatestFrameSlot,
+    capture: Mutex<Option<PortalCapture>>,
 }
 
 /// Runs the daemon until a graceful-shutdown RPC or process cancellation.
@@ -99,6 +103,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         )),
         latest_snapshot: Mutex::new(initial_state),
         output_error: Mutex::new(None),
+        latest_frame: LatestFrameSlot::default(),
+        capture: Mutex::new(None),
     });
     loop {
         tokio::select! {
@@ -256,13 +262,13 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
             .await?;
             return serve_subscription(&mut writer, receiver).await;
         }
-        let response = dispatch(request, &state);
+        let response = dispatch(request, &state).await;
         write_response(&mut writer, &response).await?;
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn dispatch(request: Request, state: &State) -> Response {
+async fn dispatch(request: Request, state: &State) -> Response {
     let id = request.id;
     let result: Result<Value, RpcError> = match request.method.as_str() {
         method::VERSION => {
@@ -273,8 +279,9 @@ fn dispatch(request: Request, state: &State) -> Response {
         }
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
+            let stopped = stop_capture(state).await;
             state.shutdown.notify_one();
-            Ok(json!({"shutting_down": true}))
+            stopped.map(|_| json!({"shutting_down": true}))
         }
         method::PROFILE_LIST => state
             .profiles
@@ -373,6 +380,19 @@ fn dispatch(request: Request, state: &State) -> Response {
             .and_then(|params| test_detector(state, params)),
         method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
             .and_then(|params| run_profile_replay(state, &params)),
+        method::CAPTURE_SELECT => match parse::<CaptureSelectParams>(request.params) {
+            Ok(params) => select_capture(state, params).await,
+            Err(error) => Err(error),
+        },
+        method::CAPTURE_START => Ok({
+            let mut status = capture_status(state);
+            status["started"] = json!(status["active"].as_bool().unwrap_or(false));
+            status
+        }),
+        method::CAPTURE_STOP => stop_capture(state).await,
+        method::CAPTURE_STATUS => Ok(capture_status(state)),
+        method::CAPTURE_SNAPSHOT => parse::<PathParam>(request.params)
+            .and_then(|params| snapshot_capture(state, &params.path)),
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -997,16 +1017,168 @@ fn gray_frame(
     .map(Arc::new)
 }
 
+async fn select_capture(state: &State, params: CaptureSelectParams) -> Result<Value, RpcError> {
+    if state
+        .capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        return Err(RpcError::new(
+            error_code::INVALID_REQUEST,
+            "capture is already active",
+        ));
+    }
+    let restore_token = params
+        .profile_id
+        .map(|profile_id| state.local_config.capture_binding(profile_id))
+        .transpose()
+        .map_err(internal_error)?
+        .flatten()
+        .map(|binding| binding.restore_token);
+    let sources = match params.source.as_deref().unwrap_or("window_or_monitor") {
+        "monitor" => SourceSelection::Monitor,
+        "window" => SourceSelection::Window,
+        "window_or_monitor" => SourceSelection::MonitorOrWindow,
+        _ => {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "source must be monitor, window, or window_or_monitor",
+            ))
+        }
+    };
+    let capture = PortalCapture::start(
+        PortalOptions {
+            sources,
+            restore_token,
+            persist_restore: true,
+        },
+        state.latest_frame.clone(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let selected = capture.selected_source().clone();
+    if let (Some(profile_id), Some(token)) = (params.profile_id, selected.restore_token.clone()) {
+        state
+            .local_config
+            .set_capture_binding(
+                profile_id,
+                yash_app_events_profile::CaptureBinding {
+                    restore_token: token,
+                    source_label: Some(selected.label.clone()),
+                },
+            )
+            .map_err(internal_error)?;
+    }
+    *state
+        .capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capture);
+    Ok(
+        json!({"active":true,"source":selected.label,"pipewire_node_id":selected.pipewire_node_id,"restore_token_saved":params.profile_id.is_some() && selected.restore_token.is_some()}),
+    )
+}
+
+async fn stop_capture(state: &State) -> Result<Value, RpcError> {
+    let capture = state
+        .capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let stopped = capture.is_some();
+    if let Some(capture) = capture {
+        capture.stop().await;
+    }
+    Ok(json!({"active":false,"stopped":stopped}))
+}
+
+fn capture_status(state: &State) -> Value {
+    let capture = state
+        .capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(capture) = capture.as_ref() else {
+        return json!({"active":false,"source":null,"metrics":{"input_fps":0.0,"analysis_fps":0.0,"replaced_frames":state.latest_frame.replacements()}});
+    };
+    let metrics = capture.metrics();
+    json!({"active":true,"source":capture.selected_source().label,"pipewire_node_id":capture.selected_source().pipewire_node_id,"metrics":{"input_frames":metrics.input_frames,"input_fps":metrics.input_fps,"analysis_fps":0.0,"replaced_frames":metrics.replaced_frames,"last_frame_age_ms":metrics.last_frame_age.and_then(|age|u64::try_from(age.as_millis()).ok()),"width":metrics.width,"height":metrics.height,"pixel_format":metrics.pixel_format,"error":metrics.error}})
+}
+
+fn snapshot_capture(state: &State, path: &Path) -> Result<Value, RpcError> {
+    let frame = state.latest_frame.latest().ok_or_else(|| {
+        RpcError::new(
+            error_code::INVALID_REQUEST,
+            "no captured frame is available",
+        )
+    })?;
+    let bytes = encode_frame_png(&frame)?;
+    yash_app_events_profile::atomic_write(path, &bytes).map_err(internal_error)?;
+    Ok(json!({"saved":true,"path":path,"width":frame.width,"height":frame.height,"explicit":true}))
+}
+
+fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, RpcError> {
+    let bytes_per_pixel = frame.format.bytes_per_pixel();
+    let packed_stride = usize::try_from(frame.width)
+        .map_err(internal_error)?
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| internal_error("snapshot size overflow"))?;
+    let height = usize::try_from(frame.height).map_err(internal_error)?;
+    let mut packed = Vec::with_capacity(
+        packed_stride
+            .checked_mul(height)
+            .ok_or_else(|| internal_error("snapshot size overflow"))?,
+    );
+    for row in 0..height {
+        let offset = row
+            .checked_mul(frame.row_stride)
+            .ok_or_else(|| internal_error("snapshot row overflow"))?;
+        let end = offset
+            .checked_add(packed_stride)
+            .ok_or_else(|| internal_error("snapshot row overflow"))?;
+        packed.extend_from_slice(
+            frame
+                .data
+                .get(offset..end)
+                .ok_or_else(|| internal_error("snapshot frame is truncated"))?,
+        );
+    }
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, frame.width, frame.height);
+        encoder.set_color(match frame.format {
+            PixelFormat::Rgb8 => png::ColorType::Rgb,
+            PixelFormat::Rgba8 => png::ColorType::Rgba,
+        });
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(internal_error)?;
+        writer.write_image_data(&packed).map_err(internal_error)?;
+    }
+    Ok(output)
+}
+
 fn status(state: &State) -> Status {
+    let capture = state
+        .capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let capture_metrics = capture.as_ref().map(PortalCapture::metrics);
+    let settings = state.local_config.load_settings().unwrap_or_default();
     Status {
         daemon_instance: state.instance,
-        capture_active: false,
-        selected_source: None,
+        capture_active: capture.is_some(),
+        selected_source: capture
+            .as_ref()
+            .map(|capture| capture.selected_source().label.clone()),
         connected_clients: state.connected.load(Ordering::Relaxed),
-        active_profile: None,
-        input_fps: 0.0,
+        active_profile: settings.active_profile.map(|profile| profile.to_string()),
+        input_fps: capture_metrics
+            .as_ref()
+            .map_or(0.0, |metrics| metrics.input_fps),
         analysis_fps: 0.0,
-        replaced_frames: 0,
+        replaced_frames: capture_metrics.as_ref().map_or_else(
+            || state.latest_frame.replacements(),
+            |metrics| metrics.replaced_frames,
+        ),
         output_error: state
             .output_error
             .lock()
@@ -1098,6 +1270,13 @@ struct ProfileReplayParams {
     profile_id: ProfileId,
     element_id: ElementId,
     values: Vec<u8>,
+}
+#[derive(Deserialize)]
+struct CaptureSelectParams {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    profile_id: Option<ProfileId>,
 }
 const fn default_fill() -> u8 {
     5

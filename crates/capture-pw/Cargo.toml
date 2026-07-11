@@ -9,5 +9,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+ashpd.workspace = true
+futures-util.workspace = true
+pipewire.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 yash-app-events-capture = { path = "../capture" }
-

@@ -50,6 +50,11 @@ pub enum Command {
         #[command(subcommand)]
         command: EventsCommand,
     },
+    /// Select, inspect, and stop the daemon-owned portal capture session.
+    Capture {
+        #[command(subcommand)]
+        command: CaptureCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -95,6 +100,22 @@ pub enum ProfileCommand {
 #[derive(Debug, Subcommand)]
 pub enum EventsCommand {
     Follow,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CaptureCommand {
+    Select {
+        #[arg(long, default_value = "window_or_monitor")]
+        source: String,
+        #[arg(long)]
+        profile_id: Option<String>,
+    },
+    Start,
+    Stop,
+    Status,
+    Snapshot {
+        path: PathBuf,
+    },
 }
 
 /// Executes one finite command and returns its protocol-shaped value.
@@ -184,9 +205,31 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
             }
             ProfileCommand::Validate { .. } => unreachable!(),
         },
+        Command::Capture { command } => execute_capture(&mut client, command).await?,
         Command::Events { .. } => unreachable!(),
     };
     Ok(value)
+}
+
+async fn execute_capture(client: &mut Client, command: &CaptureCommand) -> Result<Value, CliError> {
+    match command {
+        CaptureCommand::Select { source, profile_id } => {
+            client
+                .call(
+                    method::CAPTURE_SELECT,
+                    json!({"source":source,"profile_id":profile_id}),
+                )
+                .await
+        }
+        CaptureCommand::Start => client.call(method::CAPTURE_START, Value::Null).await,
+        CaptureCommand::Stop => client.call(method::CAPTURE_STOP, Value::Null).await,
+        CaptureCommand::Status => client.call(method::CAPTURE_STATUS, Value::Null).await,
+        CaptureCommand::Snapshot { path } => {
+            client
+                .call(method::CAPTURE_SNAPSHOT, json!({"path":path}))
+                .await
+        }
+    }
 }
 
 /// Opens an event subscription after handshake.
@@ -444,6 +487,10 @@ mod tests {
         let (mut cli, task) = daemon_cli(directory.path(), Command::Status).await;
         let status = execute(&cli).await.unwrap();
         assert_eq!(status["capture_active"], false);
+        cli.command = Command::Capture {
+            command: CaptureCommand::Status,
+        };
+        assert_eq!(execute(&cli).await.unwrap()["active"], false);
         cli.command = Command::Profile {
             command: ProfileCommand::Create {
                 name: "Demo".into(),

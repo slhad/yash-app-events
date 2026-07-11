@@ -19,6 +19,8 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
   never persists its test frame)
 - `replay.profile_detector` (CI-safe profile detector/rule replay through durable and
   live outputs)
+- `capture.select`, `capture.start`, `capture.stop`, `capture.status`, and
+  `capture.snapshot` (daemon-owned local portal lifecycle; snapshots are explicit)
 
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.

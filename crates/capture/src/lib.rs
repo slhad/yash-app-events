@@ -143,6 +143,16 @@ impl LatestFrameSlot {
             .take()
     }
 
+    /// Clones a reference to the newest frame without consuming it (for explicit preview/snapshot).
+    #[must_use]
+    pub fn latest(&self) -> Option<Arc<Frame>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame
+            .clone()
+    }
+
     /// Number of unconsumed frames replaced since creation.
     #[must_use]
     pub fn replacements(&self) -> u64 {

@@ -510,7 +510,7 @@ SPEC-IPC-003 | VERIFIED | transport test rejects pre-handshake methods and accep
 SPEC-IPC-004 | IN_PROGRESS | version/capabilities/status/shutdown, core profile operations, state, and subscriptions implemented; capture, full profile lifecycle, detector, and preview methods pending
 SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subscription.lagged`; bounded-channel test proves overwrite/lag behavior (2026-07-11)
 SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with global compact `--json`, stable exit categories, timeouts, live event follow, profile lifecycle commands, and shared-library offline validation; golden and daemon-backed tests (2026-07-11)
-SPEC-CAP-001 | IN_PROGRESS | validated backend-neutral CPU frame carries monotonic timestamp, dimensions, stride, RGB/RGBA format, and source identity; non-CPU representations pending
+SPEC-CAP-001 | VERIFIED | backend-neutral validated CPU frame carries monotonic timestamp, dimensions, padded stride, RGB/RGBA format, memory bytes, and source identity; portal callback tests (2026-07-11)
 SPEC-ARCH-003 | VERIFIED | `LatestFrameSlot` owns at most one frame; 10,000-frame test proves 9,999 replacements and next analysis receives sequence 9,999 (2026-07-11)
 SPEC-PROD-004 | IN_PROGRESS | scheduler validates 1–10 FPS and test proves 60 timestamped FPS yields exactly 10 analyses; daemon configuration integration pending
 SPEC-DET-001 | VERIFIED | `FrameProcessor` attaches stable detector/element IDs to typed value/status/confidence/diagnostic results; errors retain no fabricated value; replay integration evidence (2026-07-11)
@@ -531,3 +531,10 @@ SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/b
 SPEC-DET-004 | VERIFIED | normalized change/stability unknown-baseline behavior plus profile replay integration asserts left/entered records identical in JSONL/RPC and final state (2026-07-11)
 SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
 SPEC-PERF-003 | VERIFIED | release-mode three-detector baseline and reference CPU recorded in `docs/performance.md`; results do not justify advanced transfer/GPU optimization (2026-07-11)
+SPEC-PROD-002 | IN_PROGRESS | ashpd portal/direct PipeWire backend builds on live Hyprland/Wayland dependencies; interactive selection/cancel/deny and second-backend evidence pending
+SPEC-CAP-002 | IN_PROGRESS | create/select/start/open-remote/session-close flow implemented with hidden cursor and actionable error categories; interactive smoke evidence pending
+SPEC-CAP-003 | IN_PROGRESS | machine-local token persistence, portal ExplicitlyRevoked mode, reuse, and stale-token explicit fallback implemented; interactive restoration evidence pending
+SPEC-CAP-004 | VERIFIED | negotiation requests RGB/RGBA/RGBx only; tests verify padded copies, RGBx alpha normalization, and actionable short/unsupported diagnostics (2026-07-11)
+SPEC-CAP-006 | IN_PROGRESS | callback and daemon/CLI expose input frames/FPS, replacements, frame age, resolution, format/error; live analysis FPS integration pending
+SPEC-SEC-003 | VERIFIED | shared system/capture status and CLI expose active flag and selected portal node label (2026-07-11)
+SPEC-SEC-004 | IN_PROGRESS | backend persists nothing and snapshot RPC requires explicit destination; live snapshot/manual filesystem smoke pending

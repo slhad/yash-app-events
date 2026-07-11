@@ -163,6 +163,11 @@ pub mod method {
     pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
     pub const DETECTOR_TEST: &str = "detector.test";
     pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
+    pub const CAPTURE_SELECT: &str = "capture.select";
+    pub const CAPTURE_START: &str = "capture.start";
+    pub const CAPTURE_STOP: &str = "capture.stop";
+    pub const CAPTURE_STATUS: &str = "capture.status";
+    pub const CAPTURE_SNAPSHOT: &str = "capture.snapshot";
 }
 
 pub mod error_code {
