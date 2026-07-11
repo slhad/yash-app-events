@@ -161,6 +161,7 @@ pub mod method {
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
     pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
+    pub const DETECTOR_TEST: &str = "detector.test";
 }
 
 pub mod error_code {

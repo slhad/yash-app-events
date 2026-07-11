@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use yash_app_events_profile::PreprocessOperation;
 
 /// Project-owned deterministic grayscale image used for previews and detectors.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -32,17 +33,6 @@ impl GrayImage {
     pub fn pixel(&self, x: usize, y: usize) -> u8 {
         self.pixels[y * self.width + x]
     }
-}
-
-/// Explicit serializable preprocessing operation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PreprocessOperation {
-    Resize { width: usize, height: usize },
-    Threshold { minimum: u8, maximum: u8 },
-    Erode { radius: u8 },
-    Dilate { radius: u8 },
-    Invert,
 }
 
 /// Ordered deterministic operations usable by runtime and GUI preview.

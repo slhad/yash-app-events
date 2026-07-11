@@ -265,11 +265,18 @@ fn collect_portable_files(
 
 fn validate_declared_assets(profile: &Profile, root: &Path) -> Result<(), ArchiveError> {
     for element in &profile.elements {
-        if let crate::Detector::Template { templates, .. } = &element.detector {
-            for template in templates {
-                if !root.join(template).is_file() {
-                    return Err(ArchiveError::MissingAsset(template.clone()));
-                }
+        let assets: Vec<&PathBuf> = match &element.detector {
+            crate::Detector::Template {
+                templates, masks, ..
+            } => templates.iter().chain(masks.iter().flatten()).collect(),
+            crate::Detector::ColorBar {
+                mask: Some(mask), ..
+            } => vec![mask],
+            _ => Vec::new(),
+        };
+        for asset in assets {
+            if !root.join(asset).is_file() {
+                return Err(ArchiveError::MissingAsset(asset.clone()));
             }
         }
     }

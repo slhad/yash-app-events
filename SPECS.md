@@ -527,6 +527,7 @@ SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run t
 SPEC-REPLAY-003 | IN_PROGRESS | redistributable in-memory synthetic health fixtures cover bounded frames and transitions; repository manifest/fixture format pending
 SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
 SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)
-SPEC-DET-003 | IN_PROGRESS | multi-template sliding normalized matching supports per-template masks, thresholds, best name/location/score diagnostics, brightness-shift test; profile assets/RPC/output integration pending
-SPEC-DET-004 | IN_PROGRESS | stateful normalized mean-absolute region change returns unknown on baseline/resize and valid stability diagnostic thereafter; RPC/output integration pending
-SPEC-DET-007 | IN_PROGRESS | serializable deterministic grayscale, nearest resize, range threshold, erode/dilate, and invert pipeline round-trips and reproduces preview pixels; profile schema/RPC preview pending
+SPEC-DET-003 | IN_PROGRESS | multi-template normalized matching, portable assets/masks, profile validation, best diagnostics, brightness-shift unit test, and daemon RPC integration pass; event/output replay integration pending
+SPEC-DET-004 | IN_PROGRESS | stateful normalized change/stability with serialized preprocessing and daemon RPC baseline/change integration pass; event/output replay integration pending
+SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
+SPEC-PERF-003 | VERIFIED | release-mode three-detector baseline and reference CPU recorded in `docs/performance.md`; results do not justify advanced transfer/GPU optimization (2026-07-11)

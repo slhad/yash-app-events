@@ -214,16 +214,35 @@ pub enum Detector {
         direction: BarDirection,
         minimum_rgb: [u8; 3],
         maximum_rgb: [u8; 3],
+        #[serde(default)]
+        mask: Option<PathBuf>,
     },
     Template {
         id: DetectorId,
         templates: Vec<PathBuf>,
+        #[serde(default)]
+        masks: Vec<Option<PathBuf>>,
         threshold: f32,
+        #[serde(default)]
+        preprocessing: Vec<PreprocessOperation>,
     },
     RegionChange {
         id: DetectorId,
         threshold: f32,
+        #[serde(default)]
+        preprocessing: Vec<PreprocessOperation>,
     },
+}
+
+/// Explicit deterministic detector preprocessing stored in portable profiles.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PreprocessOperation {
+    Resize { width: usize, height: usize },
+    Threshold { minimum: u8, maximum: u8 },
+    Erode { radius: u8 },
+    Dilate { radius: u8 },
+    Invert,
 }
 
 impl Detector {
@@ -242,6 +261,7 @@ impl Detector {
             Self::ColorBar {
                 minimum_rgb,
                 maximum_rgb,
+                mask,
                 ..
             } => {
                 if minimum_rgb
@@ -254,10 +274,15 @@ impl Detector {
                         "minimum RGB channels must not exceed maximum channels",
                     ));
                 }
+                if let Some(mask) = mask {
+                    validate_asset_path(&format!("{path}.mask"), mask, errors);
+                }
             }
             Self::Template {
                 templates,
+                masks,
                 threshold,
+                preprocessing,
                 ..
             } => {
                 if templates.is_empty() {
@@ -267,22 +292,72 @@ impl Detector {
                     ));
                 }
                 for (index, template) in templates.iter().enumerate() {
-                    if template.is_absolute()
-                        || template
-                            .components()
-                            .any(|part| matches!(part, std::path::Component::ParentDir))
-                    {
-                        errors.push(ValidationError::new(
-                            format!("{path}.templates[{index}]"),
-                            "must be a relative path without parent traversal",
-                        ));
+                    validate_asset_path(&format!("{path}.templates[{index}]"), template, errors);
+                }
+                if !masks.is_empty() && masks.len() != templates.len() {
+                    errors.push(ValidationError::new(
+                        format!("{path}.masks"),
+                        "must be empty or align one-for-one with templates",
+                    ));
+                }
+                for (index, mask) in masks.iter().enumerate() {
+                    if let Some(mask) = mask {
+                        validate_asset_path(&format!("{path}.masks[{index}]"), mask, errors);
                     }
                 }
                 validate_unit_interval(&format!("{path}.threshold"), *threshold, errors);
+                validate_preprocessing(path, preprocessing, errors);
             }
-            Self::RegionChange { threshold, .. } => {
+            Self::RegionChange {
+                threshold,
+                preprocessing,
+                ..
+            } => {
                 validate_unit_interval(&format!("{path}.threshold"), *threshold, errors);
+                validate_preprocessing(path, preprocessing, errors);
             }
+        }
+    }
+}
+
+fn validate_asset_path(path: &str, asset: &Path, errors: &mut Vec<ValidationError>) {
+    if asset.is_absolute()
+        || asset
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        errors.push(ValidationError::new(
+            path,
+            "must be a relative path without parent traversal",
+        ));
+    }
+}
+
+fn validate_preprocessing(
+    path: &str,
+    operations: &[PreprocessOperation],
+    errors: &mut Vec<ValidationError>,
+) {
+    for (index, operation) in operations.iter().enumerate() {
+        let invalid = match operation {
+            PreprocessOperation::Resize { width, height } => {
+                *width == 0
+                    || *height == 0
+                    || width
+                        .checked_mul(*height)
+                        .is_none_or(|pixels| pixels > 16_777_216)
+            }
+            PreprocessOperation::Threshold { minimum, maximum } => minimum > maximum,
+            PreprocessOperation::Erode { radius } | PreprocessOperation::Dilate { radius } => {
+                *radius > 8
+            }
+            PreprocessOperation::Invert => false,
+        };
+        if invalid {
+            errors.push(ValidationError::new(
+                format!("{path}.preprocessing[{index}]"),
+                "operation parameters are invalid",
+            ));
         }
     }
 }
@@ -609,6 +684,7 @@ mod tests {
             detector: Detector::RegionChange {
                 id: DetectorId::new(),
                 threshold: 0.2,
+                preprocessing: Vec::new(),
             },
         });
         let errors = profile.validate().unwrap_err();

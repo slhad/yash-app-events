@@ -6,12 +6,13 @@ use yash_app_events_profile::{BarDirection, NormalizedRegion};
 mod preprocess;
 mod region_change;
 mod template;
-pub use preprocess::{GrayImage, PreprocessOperation, PreprocessPipeline};
+pub use preprocess::{GrayImage, PreprocessPipeline};
 pub use region_change::{RegionChangeConfig, RegionChangeDetector};
 pub use template::{Template, TemplateConfig, TemplateDetector};
+pub use yash_app_events_profile::PreprocessOperation;
 
 /// Detector output before the engine attaches stable detector/element identities.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
 pub struct Detection {
     pub value: Option<f64>,
     pub confidence: Option<f32>,
@@ -42,7 +43,8 @@ impl Detection {
 }
 
 /// Detector failures never imply a negative observation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DetectionStatus {
     Valid,
     Unknown,

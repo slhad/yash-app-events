@@ -328,6 +328,7 @@ mod tests {
                 direction: BarDirection::LeftToRight,
                 minimum_rgb: [120, 0, 0],
                 maximum_rgb: [255, 80, 80],
+                mask: None,
             },
         });
         profile.rules.push(EventRule {
