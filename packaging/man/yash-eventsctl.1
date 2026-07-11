@@ -1,0 +1,12 @@
+.TH YASH-EVENTSCTL 1 "July 2026" "yash-app-events 0.1.0"
+.SH NAME
+yash-eventsctl \- inspect and control yash-app-eventsd
+.SH SYNOPSIS
+.B yash-eventsctl
+[--json] [--socket PATH] [--timeout-ms MS] COMMAND
+.SH COMMANDS
+version, status, state, shutdown, profile, events follow, capture, and replay MANIFEST.
+.SH EXIT STATUS
+0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay regression.
+.SH SEE ALSO
+yash-app-eventsd(1)

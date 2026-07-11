@@ -4110,6 +4110,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "yash-app-events-engine",
  "yash-app-events-profile",
  "yash-app-events-protocol",
  "yash-app-eventsd",

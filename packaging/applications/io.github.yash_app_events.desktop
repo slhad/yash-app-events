@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=yash-app-events
+Comment=Configure visual HUD observations and events
+Exec=yash-app-events
+Icon=io.github.yash_app_events
+Terminal=false
+Categories=Utility;Game;
+StartupNotify=true

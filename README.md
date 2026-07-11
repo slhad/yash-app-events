@@ -1,11 +1,10 @@
 # yash-app-events
 
-`yash-app-events` is a planned Linux-first HUD observation and event service for games that do not expose native telemetry APIs.
+`yash-app-events` is a Linux-first HUD observation and event service for games that do not expose native telemetry APIs.
 
-It will capture a selected game window through the Wayland ScreenCast portal and PipeWire, analyze user-configured regions, turn visual observations into debounced state transitions, and expose results through JSON files, a CLI, and local JSON-RPC IPC.
+It captures a selected game window through the Wayland ScreenCast portal and PipeWire, analyzes user-configured regions, turns visual observations into debounced state transitions, and exposes results through JSON files, a CLI, and local JSON-RPC IPC.
 
-> Status: engineering baseline implemented. The workspace builds and its placeholder
-> binaries run. The internal profile library now provides validated schema-v1 storage,
+> Status: pre-release implementation. The profile library provides validated schema-v1 storage,
 > revision recovery, duplication, trash/restore, and safe portable archives. The local
 > protocol-v1 daemon, CLI, replay/detectors, outputs, Wayland capture backend, and GUI
 > foundation are implemented. Interactive portal and full GUI authoring/release
@@ -21,7 +20,7 @@ It will capture a selected game window through the Wayland ScreenCast portal and
 
 This is a visual observation tool. It does not read game memory, inject into the game, or generate game input.
 
-## Planned components
+## Components
 
 ```text
 Wayland portal + PipeWire
@@ -41,18 +40,30 @@ Wayland portal + PipeWire
 - `yash-app-events`: egui-based visual profile and region editor.
 - `yash-eventsctl`: scriptable command-line client.
 
-Names are provisional until the first CLI milestone; once published, command names become compatibility-sensitive.
+The binary names and protocol-v1 command names are compatibility-sensitive.
 
-## Planned Linux requirements
+## Linux requirements and source installation
 
 - A Wayland desktop with a working `xdg-desktop-portal` ScreenCast backend.
 - PipeWire.
-- A Rust toolchain for source builds.
-- Native development dependencies required by the selected PipeWire, GUI, and OpenCV bindings.
+- Rust 1.85 or newer for source builds.
+- PipeWire, Wayland, D-Bus, and a working desktop portal development stack.
 
-Exact distribution-specific packages and build commands will be added after the workspace compiles in CI and on at least one supported Linux distribution.
+The current reference build is x86-64 CachyOS/Arch Linux with Hyprland,
+PipeWire 1.6.6, Wayland client 1.25.0, and Rust 1.95. Install from a checkout:
 
-## Planned workflow
+```bash
+./scripts/install-user.sh
+systemctl --user enable --now yash-app-eventsd
+yash-eventsctl status
+yash-app-events
+```
+
+This installs user files below `~/.local` and `~/.config`; no root access is used.
+Interactive portal acceptance still needs the procedure in `docs/capture-smoke.md`,
+including an independently implemented GNOME or KDE portal backend.
+
+## Workflow
 
 1. Start the daemon or let socket activation start it.
 2. Open the GUI.
@@ -75,6 +86,7 @@ yash-eventsctl profile validate ./profile.json
 yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
+yash-eventsctl --json replay ./manifest.json
 ```
 
 The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation does
@@ -92,6 +104,21 @@ Runtime output will provide:
 - JSON-RPC subscriptions: live events for connected clients.
 
 See `SPECS.md` for normative schemas and behavior.
+
+## Backup, recovery, upgrade, and uninstall
+
+Stop the daemon before a filesystem backup. Portable profiles are below
+`${XDG_DATA_HOME:-~/.local/share}/yash-app-events/profiles`; machine-local capture
+bindings are below `${XDG_CONFIG_HOME:-~/.config}/yash-app-events`; events and state
+are below `${XDG_STATE_HOME:-~/.local/state}/yash-app-events`. Prefer `profile export`
+for portable backups. Trashed profiles can be restored through the GUI or CLI, and
+bounded revision history protects earlier committed documents.
+
+To upgrade, pull the desired revision and rerun `scripts/install-user.sh`, then restart
+the user service. To uninstall, disable the service and remove the three installed
+binaries, desktop/service/icon/completion/man files listed in the install script.
+Data is deliberately retained; remove the three `yash-app-events` XDG directories
+only after exporting anything you need.
 
 ## Development
 

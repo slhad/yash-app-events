@@ -31,6 +31,7 @@ enum RequestKind {
     PreviewFrame,
     DetectorTest,
     TemplateCapture,
+    Replay,
 }
 
 #[derive(Debug)]
@@ -72,6 +73,7 @@ struct Worker {
 }
 
 impl Worker {
+    #[allow(clippy::too_many_lines)]
     fn spawn(socket: PathBuf) -> Self {
         let (requests, mut request_receiver) = tokio_mpsc::unbounded_channel::<Request>();
         let (response_sender, responses) = mpsc::channel();
@@ -110,11 +112,36 @@ impl Worker {
                                 }
                             }
                         }
-                        let result = client
-                            .as_mut()
-                            .expect("client was initialized")
-                            .call(request.method, request.params)
-                            .await;
+                        let params = if request.kind == RequestKind::Replay {
+                            request.params["path"].as_str().map_or_else(
+                                || Err("replay path is required".into()),
+                                |path| {
+                                    std::fs::read(path)
+                                        .map_err(|error| format!("read replay: {error}"))
+                                        .and_then(|bytes| {
+                                            serde_json::from_slice(&bytes)
+                                                .map_err(|error| format!("parse replay: {error}"))
+                                        })
+                                },
+                            )
+                        } else {
+                            Ok(request.params)
+                        };
+                        let result = match params {
+                            Ok(params) => {
+                                client
+                                    .as_mut()
+                                    .expect("client was initialized")
+                                    .call(request.method, params)
+                                    .await
+                            }
+                            Err(error) => {
+                                Err(ClientError::Rpc(yash_app_events_protocol::RpcError::new(
+                                    yash_app_events_protocol::error_code::INVALID_PARAMS,
+                                    error,
+                                )))
+                            }
+                        };
                         let payload = match result {
                             Ok(value) if request.kind == RequestKind::PreviewFrame => {
                                 match decode_preview(&value) {
@@ -205,6 +232,11 @@ pub struct App {
     processed_texture: Option<egui::TextureHandle>,
     timeline: VecDeque<String>,
     last_state_sequence: u64,
+    replay_path: String,
+    replay_result: Value,
+    replay_frame: usize,
+    replay_playing: bool,
+    replay_last_step: Instant,
 }
 
 impl fmt::Debug for App {
@@ -264,6 +296,11 @@ impl App {
             processed_texture: None,
             timeline: VecDeque::with_capacity(100),
             last_state_sequence: 0,
+            replay_path: String::new(),
+            replay_result: json!({}),
+            replay_frame: 0,
+            replay_playing: false,
+            replay_last_step: Instant::now(),
         }
     }
 
@@ -359,6 +396,10 @@ impl App {
                             self.add_template_path(path.into());
                         }
                     }
+                    RequestKind::Replay => {
+                        self.replay_result = value;
+                        self.replay_frame = 0;
+                    }
                 },
             }
         }
@@ -434,6 +475,12 @@ impl App {
             && self.last_test.elapsed() >= Duration::from_millis(500)
         {
             self.request_detector_test();
+        }
+        if self.replay_playing && self.replay_last_step.elapsed() >= Duration::from_millis(100) {
+            let maximum = self.replay_result["events"].as_array().map_or(0, Vec::len);
+            self.replay_frame = self.replay_frame.saturating_add(1).min(maximum);
+            self.replay_playing = self.replay_frame < maximum;
+            self.replay_last_step = Instant::now();
         }
     }
 
@@ -545,6 +592,42 @@ impl App {
                 ));
             });
         });
+    }
+
+    fn replay_panel(&mut self, context: &egui::Context) {
+        egui::TopBottomPanel::bottom("replay")
+            .resizable(true)
+            .default_height(95.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Replay manifest");
+                    ui.text_edit_singleline(&mut self.replay_path);
+                    if ui.button("Evaluate").clicked() {
+                        self.worker.send(
+                            RequestKind::Replay,
+                            method::REPLAY_EVALUATE,
+                            json!({"path":self.replay_path}),
+                        );
+                    }
+                    if ui.button(if self.replay_playing { "Pause" } else { "Play" }).clicked() {
+                        self.replay_playing = !self.replay_playing;
+                        self.replay_last_step = Instant::now();
+                    }
+                });
+                let maximum = self.replay_result["events"]
+                    .as_array()
+                    .map_or(0, Vec::len);
+                ui.add(egui::Slider::new(&mut self.replay_frame, 0..=maximum).text("event cursor"));
+                ui.label(format!(
+                    "precision {:.3} · recall {:.3} · duplicates {} · misses {} · latency {} ms · {}",
+                    self.replay_result["metrics"]["precision"].as_f64().unwrap_or(0.0),
+                    self.replay_result["metrics"]["recall"].as_f64().unwrap_or(0.0),
+                    self.replay_result["metrics"]["duplicates"].as_u64().unwrap_or(0),
+                    self.replay_result["metrics"]["misses"].as_u64().unwrap_or(0),
+                    self.replay_result["metrics"]["mean_latency_ms"],
+                    if self.replay_result["metrics"]["passed"].as_bool().unwrap_or(false) { "PASS" } else { "NOT PASSED" }
+                ));
+            });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1022,6 +1105,7 @@ impl eframe::App for App {
         self.drain(context);
         self.schedule();
         self.topbar(context);
+        self.replay_panel(context);
         self.sidebar(context);
         self.editor(context);
         context.request_repaint_after(Duration::from_millis(50));

@@ -1,0 +1,13 @@
+[Unit]
+Description=yash-app-events HUD observation daemon
+Documentation=man:yash-app-eventsd(1)
+After=graphical-session.target pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/yash-app-eventsd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

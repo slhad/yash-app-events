@@ -1,0 +1,9 @@
+.TH YASH-APP-EVENTSD 1 "July 2026" "yash-app-events 0.1.0"
+.SH NAME
+yash-app-eventsd \- local HUD observation daemon
+.SH SYNOPSIS
+.B yash-app-eventsd
+.SH DESCRIPTION
+Owns portal/PipeWire capture, profiles, detection, event rules, durable output, and the protocol-v1 Unix socket. XDG_RUNTIME_DIR is required. Set RUST_LOG to configure structured log verbosity.
+.SH FILES
+$XDG_RUNTIME_DIR/yash-app-events/control.sock; $XDG_DATA_HOME/yash-app-events; $XDG_CONFIG_HOME/yash-app-events; $XDG_STATE_HOME/yash-app-events.

@@ -27,9 +27,13 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 7: in progress. Detector/rule forms, frozen and continuous testing, diagnostic
   previews, template capture, and a recent timeline are implemented.
 - Phase 8: in progress. Versioned synthetic manifests, common-path daemon evaluation,
-  event metrics, regression thresholds, CLI JSON, and exit status 7 are implemented;
-  GUI replay controls remain outstanding.
-- Phases 9–10: not yet complete. Phase 9 remains optional for the first usable product.
+  event metrics, regression thresholds, CLI JSON/exit status 7, and GUI import,
+  playback/event scrubbing and metrics are implemented; full frame/region overlay
+  acceptance remains outstanding.
+- Phase 9 remains deferred and optional for the first usable product.
+- Phase 10: in progress. A clean-prefix source install, user service, desktop metadata,
+  icon, Bash completion, man pages, recovery documentation, and security review are
+  implemented; interactive portal acceptance still blocks the release gate.
 
 ## Planning principles
 

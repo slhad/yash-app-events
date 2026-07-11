@@ -544,6 +544,6 @@ SPEC-PERF-002 | IN_PROGRESS | daemon has no image timer until a profile-backed c
 SPEC-UI-001 | VERIFIED | `yash-app-events` uses eframe/egui 0.32 and completed a five-second native Wayland startup smoke with daemon connection (2026-07-11)
 SPEC-UI-002 | IN_PROGRESS | GUI exposes create/rename/duplicate/import/export/trash/restore/activate over shared RPC; interaction acceptance smoke pending
 SPEC-UI-003 | IN_PROGRESS | GUI exposes portal select/stop, permission errors, metrics, preview/freeze; interactive portal acceptance pending
-SPEC-UI-004 | IN_PROGRESS | normalized canvas supports draw/select/move/resize/duplicate/enable, aspect-preserving zoom/pan, labels and reference pixels; crop/processed/observation panels pending Phase 7
+SPEC-UI-004 | VERIFIED | normalized canvas supports draw/select/move/resize/duplicate/enable, aspect-preserving zoom/pan, labels/reference pixels, original and processed crop panels, and observation diagnostics (2026-07-11)
 SPEC-UI-008 | VERIFIED | GUI render thread only mutates widget/texture state; dedicated worker owns RPC, reconnect/timeouts and PNG decode; daemon owns all capture/detection/I/O (2026-07-11)
 SPEC-CAP-005 | IN_PROGRESS | per-connection opt-in lease, 320x180 PNG downscale, disconnect cleanup and no-detector-input path pass tests; interactive preview smoke pending
