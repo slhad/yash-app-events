@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use yash_app_events_capture::Frame;
 use yash_app_events_profile::NormalizedRegion;
 
-use crate::{grayscale_crop, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
+use crate::{
+    grayscale_crop, Detection, DetectionStatus, DetectionValue, Detector, GrayImage,
+    PreprocessPipeline,
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RegionChangeConfig {
@@ -58,7 +61,7 @@ impl Detector for RegionChangeDetector {
             / current.pixels.len() as f64
             / 255.0;
         Detection {
-            value: Some(difference),
+            value: Some(DetectionValue::Number(difference)),
             confidence: Some(1.0),
             status: DetectionStatus::Valid,
             diagnostic: format!(
@@ -111,6 +114,6 @@ mod tests {
         );
         let changed = detector.detect(&frame(255), region);
         assert_eq!(changed.status, DetectionStatus::Valid);
-        assert_eq!(changed.value, Some(1.0));
+        assert_eq!(changed.value, Some(DetectionValue::Number(1.0)));
     }
 }

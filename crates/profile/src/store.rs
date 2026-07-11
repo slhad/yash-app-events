@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::{save_profile, ElementId, Profile, ProfileId, RuleId, StorageError};
+use crate::{save_profile, ElementId, Profile, ProfileId, RuleId, RulePredicate, StorageError};
 
 const PROFILE_FILE: &str = "profile.json";
 const DRAFT_FILE: &str = "draft.json";
@@ -149,6 +149,7 @@ impl ProfileStore {
             if let Some(id) = element_ids.get(&rule.element_id) {
                 rule.element_id = *id;
             }
+            remap_composition_elements(rule, |id| element_ids.get(&id).copied());
         }
         let source_directory = self.profile_directory(source_id);
         let destination = self.profile_directory(duplicate.id);
@@ -195,6 +196,9 @@ impl ProfileStore {
                 .map(|mut rule| {
                     rule.id = RuleId::new();
                     rule.element_id = new_id;
+                    remap_composition_elements(&mut rule, |id| {
+                        (id == element_id).then_some(new_id)
+                    });
                     rule
                 })
                 .collect();
@@ -269,6 +273,24 @@ impl ProfileStore {
     }
 }
 
+fn remap_composition_elements(
+    rule: &mut crate::EventRule,
+    mut replacement: impl FnMut(ElementId) -> Option<ElementId>,
+) {
+    let conditions = match &mut rule.predicate {
+        RulePredicate::All { conditions } | RulePredicate::Any { conditions } => conditions,
+        RulePredicate::NumericBelow
+        | RulePredicate::Boolean { .. }
+        | RulePredicate::TextEquals { .. }
+        | RulePredicate::TextContains { .. } => return,
+    };
+    for condition in conditions {
+        if let Some(id) = replacement(condition.element_id) {
+            condition.element_id = id;
+        }
+    }
+}
+
 fn copy_portable_tree(source: &Path, destination: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     let excluded = HashSet::from([PROFILE_FILE, DRAFT_FILE, "revisions"]);
@@ -305,7 +327,10 @@ pub enum StoreError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{BarDirection, Detector, DetectorId, Element, EventRule, NormalizedRegion};
+    use crate::{
+        AtomicRulePredicate, BarDirection, Detector, DetectorId, Element, EventRule,
+        NormalizedRegion, ObservationCondition, RulePredicate,
+    };
 
     use super::*;
 
@@ -341,6 +366,10 @@ mod tests {
             required_samples: 2,
             sample_window: 3,
             cooldown_ms: 500,
+            predicate: RulePredicate::default(),
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
         });
         profile
     }
@@ -367,7 +396,13 @@ mod tests {
     fn deep_duplicate_rekeys_objects_copies_assets_and_resets_history() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 20);
-        let profile = populated_profile();
+        let mut profile = populated_profile();
+        profile.rules[0].predicate = RulePredicate::All {
+            conditions: vec![ObservationCondition {
+                element_id: profile.elements[0].id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+            }],
+        };
         store.create(&profile).unwrap();
         let source = store.profile_directory(profile.id);
         fs::create_dir_all(source.join("templates")).unwrap();
@@ -376,6 +411,10 @@ mod tests {
         assert_ne!(duplicate.id, profile.id);
         assert_ne!(duplicate.elements[0].id, profile.elements[0].id);
         assert_eq!(duplicate.rules[0].element_id, duplicate.elements[0].id);
+        let RulePredicate::All { conditions } = &duplicate.rules[0].predicate else {
+            panic!("composition was not preserved");
+        };
+        assert_eq!(conditions[0].element_id, duplicate.elements[0].id);
         assert_eq!(duplicate.revision, 0);
         assert_eq!(
             fs::read(

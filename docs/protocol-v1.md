@@ -29,6 +29,8 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
 - `preview.start`, `preview.frame`, `preview.freeze`, `preview.unfreeze`, and
   `preview.stop` (per-connection lease, bounded compressed PNG, and exact frozen-frame
   detector testing)
+- `diagnostic.plan` (exact redacted entries, sizes, selected-image flags, and privacy
+  warning) and `diagnostic.export` (reviewed total confirmation plus atomic ZIP output)
 
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.

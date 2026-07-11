@@ -272,6 +272,7 @@ fn validate_declared_assets(profile: &Profile, root: &Path) -> Result<(), Archiv
             crate::Detector::ColorBar {
                 mask: Some(mask), ..
             } => vec![mask],
+            crate::Detector::Classifier { model, .. } => vec![model],
             _ => Vec::new(),
         };
         for asset in assets {
@@ -385,6 +386,44 @@ mod tests {
             )
             .unwrap(),
             b"portable asset"
+        );
+    }
+
+    #[test]
+    fn classifier_model_is_a_required_portable_asset() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let mut profile = Profile::new("Classifier", "demo_game", 8, 8);
+        profile.elements.push(crate::Element {
+            id: crate::ElementId::new(),
+            name: "Icon".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: crate::NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: crate::Detector::Classifier {
+                id: crate::DetectorId::new(),
+                model: "models/icon.onnx".into(),
+                model_sha256: "0".repeat(64),
+                labels: vec!["absent".into(), "present".into()],
+                input_width: 8,
+                input_height: 8,
+                preprocessing: Vec::new(),
+                change_trigger_threshold: 0.02,
+                maximum_interval_ms: 1_000,
+            },
+        });
+        fs::create_dir_all(&source).unwrap();
+        crate::save_profile(&source.join(PROFILE_FILE), &profile).unwrap();
+        let error =
+            export_profile(&source, &directory.path().join("profile.hudprofile")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "portable asset is missing: models/icon.onnx"
         );
     }
 

@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "iterations": 3,
+  "fixtures": "crates/vision/tests/fixtures/ocr",
+  "notes": [
+    "Tesseract is measured as a fresh CLI process per crop.",
+    "RapidOCR uses ONNX Runtime and its full detection/classification/recognition pipeline.",
+    "RSS measurements are high-water diagnostics, not isolated allocator totals."
+  ],
+  "results": [
+    {
+      "backend": "tesseract-5",
+      "cases": [
+        {
+          "fixture": "victory.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.9269110899999999,
+          "mean_latency_ms": 96.8910523224622,
+          "mean_cpu_ms": 124.16465000000005
+        },
+        {
+          "fixture": "localized.png",
+          "expected": "NIVEAU ÉTÉ",
+          "observed": "NIVEAU ETE",
+          "exact": false,
+          "mean_confidence": 0.9153336699999999,
+          "mean_latency_ms": 97.03335200902075,
+          "mean_cpu_ms": 124.52928999999995
+        },
+        {
+          "fixture": "scaled.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.90563293,
+          "mean_latency_ms": 91.3610573625192,
+          "mean_cpu_ms": 112.86553666666673
+        },
+        {
+          "fixture": "animated.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.9193255600000002,
+          "mean_latency_ms": 96.39611836367597,
+          "mean_cpu_ms": 120.2686696666666
+        },
+        {
+          "fixture": "glow.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.8942590300000001,
+          "mean_latency_ms": 94.49506097007543,
+          "mean_cpu_ms": 117.04327333333339
+        }
+      ],
+      "exact_accuracy": 0.8,
+      "mean_confidence": 0.912292456,
+      "mean_latency_ms": 95.2353282055507,
+      "mean_cpu_ms": 119.77428393333335,
+      "process_rss_bytes": 170893312,
+      "child_peak_rss_kib": 172264
+    },
+    {
+      "backend": "rapidocr-onnxruntime",
+      "cases": [
+        {
+          "fixture": "victory.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.99995,
+          "mean_latency_ms": 461.6553473363941,
+          "mean_cpu_ms": 3794.377625333334
+        },
+        {
+          "fixture": "localized.png",
+          "expected": "NIVEAU ÉTÉ",
+          "observed": "ÉTÉ NIVEAU",
+          "exact": false,
+          "mean_confidence": 0.9980249999999998,
+          "mean_latency_ms": 413.9245196711272,
+          "mean_cpu_ms": 3392.514461
+        },
+        {
+          "fixture": "scaled.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.99995,
+          "mean_latency_ms": 407.8132630093023,
+          "mean_cpu_ms": 3417.5101533333363
+        },
+        {
+          "fixture": "animated.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.99995,
+          "mean_latency_ms": 394.53005165948224,
+          "mean_cpu_ms": 3273.0430466666694
+        },
+        {
+          "fixture": "glow.png",
+          "expected": "VICTORY",
+          "observed": "VICTORY",
+          "exact": true,
+          "mean_confidence": 0.99993,
+          "mean_latency_ms": 434.6558766361947,
+          "mean_cpu_ms": 3535.120945666662
+        }
+      ],
+      "exact_accuracy": 0.8,
+      "mean_confidence": 0.9995609999999999,
+      "mean_latency_ms": 422.5158116625001,
+      "mean_cpu_ms": 3482.5132464000003,
+      "process_rss_bytes": 420114432,
+      "child_peak_rss_kib": 172264
+    }
+  ]
+}

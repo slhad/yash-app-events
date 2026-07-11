@@ -3,9 +3,13 @@
 use yash_app_events_capture::{Frame, PixelFormat};
 use yash_app_events_profile::{BarDirection, NormalizedRegion};
 
+mod classifier;
+mod ocr;
 mod preprocess;
 mod region_change;
 mod template;
+pub use classifier::{ClassifierConfig, OnnxClassifierDetector};
+pub use ocr::{OcrConfig, OcrDetector};
 pub use preprocess::{GrayImage, PreprocessPipeline};
 pub use region_change::{RegionChangeConfig, RegionChangeDetector};
 pub use template::{Template, TemplateConfig, TemplateDetector};
@@ -14,10 +18,18 @@ pub use yash_app_events_profile::PreprocessOperation;
 /// Detector output before the engine attaches stable detector/element identities.
 #[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
 pub struct Detection {
-    pub value: Option<f64>,
+    pub value: Option<DetectionValue>,
     pub confidence: Option<f32>,
     pub status: DetectionStatus,
     pub diagnostic: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum DetectionValue {
+    Number(f64),
+    Boolean(bool),
+    Text(String),
 }
 
 impl Detection {
@@ -177,7 +189,7 @@ impl Detector for ColorBarDetector {
                 / lines as f32
         };
         Detection {
-            value: Some(fill),
+            value: Some(DetectionValue::Number(fill)),
             confidence: Some(confidence),
             status: DetectionStatus::Valid,
             diagnostic: format!("matched {contiguous}/{lines} fill lines"),
@@ -325,7 +337,10 @@ mod tests {
             },
         );
         assert_eq!(result.status, DetectionStatus::Valid);
-        assert!((result.value.unwrap() - 0.4).abs() < f64::EPSILON);
+        let Some(DetectionValue::Number(value)) = result.value else {
+            panic!("expected numeric fill");
+        };
+        assert!((value - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -339,7 +354,7 @@ mod tests {
                 height: 1.0,
             },
         );
-        assert_eq!(result.value, Some(0.0));
+        assert_eq!(result.value, Some(DetectionValue::Number(0.0)));
     }
 
     #[test]
@@ -402,7 +417,7 @@ mod tests {
             },
         );
         assert_eq!(result.status, DetectionStatus::Valid);
-        assert_eq!(result.value, Some(0.5));
+        assert_eq!(result.value, Some(DetectionValue::Number(0.5)));
     }
 
     #[test]
@@ -425,7 +440,7 @@ mod tests {
                 height: 1.0,
             },
         );
-        assert_eq!(detection.value, Some(0.1));
+        assert_eq!(detection.value, Some(DetectionValue::Number(0.1)));
         assert_eq!(detection.confidence, Some(1.0));
     }
 }

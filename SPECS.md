@@ -292,7 +292,18 @@ OCR is not required for the first vertical slice.
 
 ### SPEC-DET-006 — Classifier
 
-Generic ONNX classification is `DEFERRED` until replay datasets and deterministic baseline metrics exist.
+Generic ONNX classification shall load explicitly declared portable model assets only
+after validating their path, size, SHA-256, input dimensions, ordered labels, and
+resource scheduling. It shall emit typed text-label observations and use the common
+temporal-rule path. Model failures shall produce `unknown` or `error`, never a
+fabricated negative classification.
+
+Acceptance:
+
+- A redistributable dataset and model manifest record expected labels and model hash.
+- CPU, memory, latency, confidence, and exact-accuracy baselines are reproducible.
+- Unchanged crops do not cause unbounded inference; a forced refresh remains configurable.
+- Profile, daemon, GUI, frozen test, image replay, and event integration pass.
 
 ### SPEC-DET-007 — Preprocessing
 
@@ -327,6 +338,28 @@ Events shall be emitted on meaningful transitions such as `entered`, `updated`, 
 ### SPEC-EVENT-004 — Restart behavior
 
 On daemon restart, detector history may reset. Output must identify a new daemon instance so consumers can distinguish restart from a continuous session. Initial state establishment shall not be reported as a transition unless configured.
+
+### SPEC-EVENT-005 — Complete typed rule language
+
+The post-release rule language shall support boolean appearance/disappearance, string
+equality and substring matching, stable-duration evidence, and conjunction/disjunction
+over bounded sets of element observations. Composition shall be non-recursive and
+shall reference stable element IDs so cyclic rule evaluation is impossible.
+
+Initial state emission shall be explicitly configurable. Active-state `updated`
+transitions shall be opt-in and rate-limited. Unknown, erroneous, missing, or
+type-mismatched observations shall not fabricate negative evidence.
+
+Acceptance:
+
+- Schema-v1 numeric profiles retain their existing semantics without migration.
+- Every predicate round-trips through profiles and can be authored in the GUI.
+- Unit and replay tests cover boolean, string, stable-duration, all/any composition,
+  initial establishment, entered, updated, and left behavior.
+- Live and replay paths use the same rule runtime and publish identical transitions
+  through JSONL, state, and IPC.
+- Composition contains at most 16 observation leaves and profile duplication rekeys
+  every referenced element ID.
 
 ## 9. Output contracts
 
@@ -439,7 +472,18 @@ Status shall include capture and analysis rates, processing latency by detector,
 
 ### SPEC-OBS-003 — Diagnostic bundle
 
-A future diagnostic export may include logs, redacted configuration, metrics, and explicitly selected example crops. It must exclude secrets and full screenshots by default.
+A diagnostic export may include bounded logs, redacted configuration, metrics, and
+explicitly selected example crops. It must exclude secrets, machine-local capture
+bindings, portal tokens, and full screenshots by default. The user shall see the exact
+entry list, sizes, and a privacy warning before authorizing export.
+
+Acceptance:
+
+- Recursive adversarial fixtures prove secrets and machine-local bindings are absent.
+- Only explicitly selected frozen-frame element regions become image entries.
+- Per-file, crop-count, log-count, and total uncompressed limits are enforced.
+- Export is atomic and a failed export leaves the previous destination intact.
+- GUI and CLI use the same versioned plan/review/export protocol.
 
 ## 13. Performance targets
 
@@ -528,6 +572,7 @@ SPEC-REPLAY-003 | VERIFIED | schema-v1 bounded synthetic manifest format, detect
 SPEC-REPLAY-004 | VERIFIED | engine evaluator and daemon/CLI report precision, recall, duplicates, misses, mean event latency, pass/fail thresholds, stable JSON, and regression exit status 7; tests cover passing known events and duplicate regression (2026-07-11)
 SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
 SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)
+SPEC-EVENT-005 | VERIFIED | schema-v1-compatible typed predicates and bounded non-recursive composition validate/round-trip/rekey; boolean/text/stable/initial/updated/all/any engine tests, GUI authoring, multi-element live coordinator, and numeric/OCR/classifier image replay event evidence pass (2026-07-11)
 SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/best diagnostics and brightness test; profile replay integration asserts entered/left records identical in JSONL and RPC (2026-07-11)
 SPEC-DET-004 | VERIFIED | normalized change/stability unknown-baseline behavior plus profile replay integration asserts left/entered records identical in JSONL/RPC and final state (2026-07-11)
 SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
@@ -552,9 +597,9 @@ SPEC-PROD-003 | VERIFIED | capture is portal-mediated and the codebase has no pr
 SPEC-UI-005 | VERIFIED | detector-specific color/template/change forms, preprocessing, validation through commit, draft-aware frozen/live tests, template capture, and original/processed diagnostics are implemented through protocol-v1; frozen region-change acceptance returned baseline plus a valid sample (2026-07-11)
 SPEC-UI-006 | VERIFIED | numeric rule editor explicitly presents observation versus event, enter/leave hysteresis, confidence, N-of-M evidence, cooldown, and current state (2026-07-11)
 SPEC-UI-007 | VERIFIED | always-visible live evidence panel and bounded timeline display capture state/metrics, observations, event states, detector value/confidence/diagnostic, and transition sequence/time; image persistence remains explicit (2026-07-11)
-SPEC-DET-005 | DEFERRED | Phase 9 OCR is explicitly optional for the deterministic first usable workflow; no OCR support is claimed
-SPEC-DET-006 | DEFERRED | generic classifier is a Phase 11 post-release candidate and not required by the first usable product
+SPEC-DET-005 | VERIFIED | redistributable English/localized/scale/animation/glow fixtures and reproducible Tesseract 5 versus RapidOCR/ONNX Runtime accuracy/latency/confidence/CPU/memory benchmark select Tesseract; typed native detector, bounded change-triggered refresh, profile validation, daemon/GUI configuration, frozen diagnostics, fixture regression tests, and common-path image replay text event pass (2026-07-11)
+SPEC-DET-006 | VERIFIED | generated eight-case noisy/shifted orb-versus-cross HUD-icon dataset and 765-byte ONNX model with manifest/hash; path/size/SHA/labels/dimensions/output/scheduling validation, bounded change cache, CPU `ort` inference, GUI configuration/diagnostics, daemon image replay and text event pass; 80,000-case release benchmark records 100% fixture accuracy, confidence, 0.00333 ms latency, 26 CPU ticks and 26792 KiB peak RSS; clean-prefix installed-daemon replay returns typed labels and precision/recall 1.0 (2026-07-11)
 SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, and connected clients (2026-07-11)
-SPEC-OBS-003 | DEFERRED | normative text defines diagnostic export as future scope; bounded opt-in detector previews and security review establish the privacy boundary
+SPEC-OBS-003 | VERIFIED | protocol-v1 plan/review/export is shared by CLI and GUI; exact entry/size disclosure, visible privacy confirmation, recursive secret/binding/token redaction, explicit frozen element crops, PNG/name/count/file/total limits, atomic ZIP output, failure cleanup, and daemon/output adversarial tests pass (2026-07-11)
 SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
 SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)

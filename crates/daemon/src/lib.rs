@@ -1,5 +1,6 @@
 //! State-owning daemon and bounded JSON-RPC Unix transport.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -20,14 +21,18 @@ use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
 use yash_app_events_engine::{
-    evaluate_replay, AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig,
-    ProcessedFrame, ReplayManifest, TransitionState,
+    evaluate_replay, AnalysisScheduler, CompositeRule, CompositeRuleConfig, FrameProcessor,
+    NoopRule, NumericRule, NumericRuleConfig, Observation, ObservationRule, ProcessedFrame,
+    ReplayManifest, TemporalRule, TemporalRuleConfig, Transition, TransitionState, ValuePredicate,
 };
-use yash_app_events_output::{EventRecord, EventState, OutputConfig, OutputWriter, StateSnapshot};
+use yash_app_events_output::{
+    export_diagnostic_bundle, plan_diagnostic_bundle, DiagnosticBundle, DiagnosticCrop,
+    DiagnosticLimits, EventRecord, EventState, OutputConfig, OutputWriter, StateSnapshot,
+};
 use yash_app_events_profile::{
     export_profile, import_profile, BarDirection, Detector as ProfileDetector, DetectorId,
     ElementId, ImportLimits, LocalConfig, NormalizedRegion, Profile, ProfileId, ProfileStore,
-    RuleId, StoreError,
+    RuleId, RulePredicate, StoreError,
 };
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
@@ -35,9 +40,10 @@ use yash_app_events_protocol::{
     PROTOCOL_VERSION,
 };
 use yash_app_events_vision::{
-    grayscale_crop, ColorBarConfig, ColorBarDetector, Detection, Detector as VisionDetector,
-    GrayImage, PreprocessPipeline, RegionChangeConfig, RegionChangeDetector, Template,
-    TemplateConfig, TemplateDetector,
+    grayscale_crop, ClassifierConfig, ColorBarConfig, ColorBarDetector, Detection,
+    Detector as VisionDetector, GrayImage, OcrConfig, OcrDetector, OnnxClassifierDetector,
+    PreprocessPipeline, RegionChangeConfig, RegionChangeDetector, Template, TemplateConfig,
+    TemplateDetector,
 };
 
 const SUBSCRIPTION_CAPACITY: usize = 64;
@@ -71,6 +77,7 @@ struct State {
     analysis: Mutex<Option<LiveAnalysis>>,
     analysis_metrics: Mutex<AnalysisMetrics>,
     preview_clients: AtomicUsize,
+    diagnostic_logs: Mutex<VecDeque<Value>>,
 }
 
 #[derive(Debug)]
@@ -173,6 +180,9 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         analysis: Mutex::new(None),
         analysis_metrics: Mutex::new(AnalysisMetrics::default()),
         preview_clients: AtomicUsize::new(0),
+        diagnostic_logs: Mutex::new(VecDeque::from([json!({
+            "level":"info","message":"daemon started","daemon_instance":instance
+        })])),
     });
     loop {
         tokio::select! {
@@ -360,7 +370,7 @@ async fn dispatch(
             Ok(json!({"version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
         }
         method::CAPABILITIES => Ok(
-            json!({"profiles":true,"subscriptions":true,"capture":true,"preview":true,"detectors":["color_bar","template","region_change"]}),
+            json!({"profiles":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"detectors":["color_bar","template","region_change","ocr","classifier"]}),
         ),
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
@@ -501,6 +511,35 @@ async fn dispatch(
             json!({"frozen":frozen_frame.is_some(),"sequence":frozen_frame.as_ref().map(|frame|frame.sequence)}),
         ),
         method::PREVIEW_UNFREEZE => Ok(json!({"frozen":false})),
+        method::DIAGNOSTIC_PLAN => parse::<DiagnosticParams>(request.params)
+            .and_then(|params| build_diagnostic_bundle(state, frozen_frame.as_deref(), &params))
+            .and_then(|bundle| {
+                plan_diagnostic_bundle(&bundle, DiagnosticLimits::default()).map_err(internal_error)
+            })
+            .and_then(|plan| serde_json::to_value(plan).map_err(internal_error)),
+        method::DIAGNOSTIC_EXPORT => {
+            parse::<DiagnosticExportParams>(request.params).and_then(|params| {
+                if !params.privacy_reviewed {
+                    return Err(RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        "privacy_reviewed must be true after reviewing diagnostic.plan",
+                    ));
+                }
+                let bundle =
+                    build_diagnostic_bundle(state, frozen_frame.as_deref(), &params.bundle)?;
+                let plan = plan_diagnostic_bundle(&bundle, DiagnosticLimits::default())
+                    .map_err(internal_error)?;
+                if plan.total_uncompressed_bytes != params.expected_total_uncompressed_bytes {
+                    return Err(RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        "diagnostic contents changed after privacy review; request a new plan",
+                    ));
+                }
+                export_diagnostic_bundle(&params.path, &bundle, DiagnosticLimits::default())
+                    .map_err(internal_error)
+                    .and_then(|plan| serde_json::to_value(plan).map_err(internal_error))
+            })
+        }
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -570,6 +609,9 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
         required_samples: 2,
         sample_window: 3,
         cooldown: Duration::ZERO,
+        stable_for: Duration::ZERO,
+        emit_initial: false,
+        update_interval: None,
     })
     .map_err(internal_error)?;
     let mut processor = FrameProcessor::new(
@@ -666,12 +708,15 @@ fn publish_processed(
             .saturating_add(1);
         let event_state = match transition.state {
             TransitionState::Entered => EventState::Entered,
+            TransitionState::Updated => EventState::Updated,
             TransitionState::Left => EventState::Left,
         };
-        publication.event_states.insert(
-            transition.event.clone(),
-            json!(matches!(event_state, EventState::Entered)),
-        );
+        if event_state != EventState::Updated {
+            publication.event_states.insert(
+                transition.event.clone(),
+                json!(matches!(event_state, EventState::Entered)),
+            );
+        }
         let record = EventRecord {
             schema: 1,
             daemon_instance: state.instance,
@@ -813,6 +858,14 @@ fn set_output_error(state: &State, error: &str) {
         .output_error
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_owned());
+    let mut logs = state
+        .diagnostic_logs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logs.len() == DiagnosticLimits::default().maximum_logs {
+        logs.pop_front();
+    }
+    logs.push_back(json!({"level":"error","message":"output failure","error":error}));
     let _ = state
         .notifications
         .send(json!({"type":"output_error","error":error}));
@@ -823,6 +876,8 @@ enum ConfiguredDetector {
     Color(ColorBarDetector),
     Template(TemplateDetector),
     RegionChange(RegionChangeDetector),
+    Ocr(OcrDetector),
+    Classifier(OnnxClassifierDetector),
 }
 
 impl VisionDetector for ConfiguredDetector {
@@ -831,6 +886,8 @@ impl VisionDetector for ConfiguredDetector {
             Self::Color(detector) => detector.detect(frame, region),
             Self::Template(detector) => detector.detect(frame, region),
             Self::RegionChange(detector) => detector.detect(frame, region),
+            Self::Ocr(detector) => detector.detect(frame, region),
+            Self::Classifier(detector) => detector.detect(frame, region),
         }
     }
 }
@@ -890,6 +947,51 @@ fn configured_detector(
             },
         })
         .map(ConfiguredDetector::RegionChange)
+        .map_err(internal_error),
+        ProfileDetector::Ocr {
+            language,
+            page_segmentation_mode,
+            character_whitelist,
+            change_trigger_threshold,
+            maximum_interval_ms,
+            preprocessing,
+            ..
+        } => OcrDetector::new(OcrConfig {
+            language: language.clone(),
+            data_path: None,
+            page_segmentation_mode: *page_segmentation_mode,
+            character_whitelist: character_whitelist.clone(),
+            change_trigger_threshold: *change_trigger_threshold,
+            maximum_interval_ms: *maximum_interval_ms,
+            preprocessing: PreprocessPipeline {
+                operations: preprocessing.clone(),
+            },
+        })
+        .map(ConfiguredDetector::Ocr)
+        .map_err(internal_error),
+        ProfileDetector::Classifier {
+            model,
+            model_sha256,
+            labels,
+            input_width,
+            input_height,
+            preprocessing,
+            change_trigger_threshold,
+            maximum_interval_ms,
+            ..
+        } => OnnxClassifierDetector::new(ClassifierConfig {
+            model_path: directory.join(model),
+            model_sha256: model_sha256.clone(),
+            labels: labels.clone(),
+            input_width: *input_width,
+            input_height: *input_height,
+            preprocessing: PreprocessPipeline {
+                operations: preprocessing.clone(),
+            },
+            change_trigger_threshold: *change_trigger_threshold,
+            maximum_interval_ms: *maximum_interval_ms,
+        })
+        .map(ConfiguredDetector::Classifier)
         .map_err(internal_error),
     }
 }
@@ -956,6 +1058,9 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
         required_samples: usize::from(rule.required_samples),
         sample_window: usize::from(rule.sample_window),
         cooldown: Duration::from_millis(rule.cooldown_ms),
+        stable_for: Duration::from_millis(rule.stable_for_ms),
+        emit_initial: rule.emit_initial,
+        update_interval: rule.update_interval_ms.map(Duration::from_millis),
     })
     .map_err(internal_error)?;
     let mut processor = FrameProcessor::new(
@@ -976,10 +1081,15 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
 }
 
 fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<Value, RpcError> {
-    if manifest.schema != 1 || manifest.values.is_empty() || manifest.values.len() > 10_000 {
+    let sample_count = manifest.values.len() + manifest.image_frames.len();
+    if manifest.schema != 1
+        || sample_count == 0
+        || sample_count > 10_000
+        || (!manifest.values.is_empty() && !manifest.image_frames.is_empty())
+    {
         return Err(RpcError::new(
             error_code::INVALID_PARAMS,
-            "replay schema must be 1 and values must contain 1..=10000 samples",
+            "replay schema must be 1 and exactly one of values or image_frames must contain 1..=10000 samples",
         ));
     }
     let profile = state
@@ -991,39 +1101,28 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
         .iter()
         .find(|element| element.id == manifest.element_id)
         .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
-    let rule = profile
-        .rules
-        .iter()
-        .find(|rule| rule.element_id == element.id)
-        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element has no event rule"))?;
     let directory = state.profiles.profile_directory(profile.id);
-    let frames = replay_fixture_frames(&element.detector, &directory, &manifest.values)?;
-    let mut processor = FrameProcessor::new(
-        AnalysisScheduler::new(10).map_err(internal_error)?,
-        configured_detector(&element.detector, &directory)?,
-        full_frame_region(),
-        detector_id(&element.detector),
-        element.id,
-        NumericRule::new(NumericRuleConfig {
-            id: rule.id,
-            event: rule.event.clone(),
-            enter_below: rule.enter_below,
-            leave_above: rule.leave_above,
-            minimum_confidence: rule.minimum_confidence,
-            required_samples: usize::from(rule.required_samples),
-            sample_window: usize::from(rule.sample_window),
-            cooldown: Duration::from_millis(rule.cooldown_ms),
-        })
-        .map_err(internal_error)?,
-    );
+    let frames = if manifest.image_frames.is_empty() {
+        replay_fixture_frames(&element.detector, &directory, &manifest.values)?
+    } else {
+        replay_png_frames(&directory, &manifest.image_frames)?
+    };
+    let mut pipeline = build_live_pipeline(state, profile.id)?;
     let mut observations = Vec::new();
     let mut transitions = Vec::new();
     for frame in ReplaySource::new(frames) {
-        let Some(processed) = processor.process(&frame) else {
-            continue;
-        };
-        observations.push(processed.observation);
-        transitions.extend(processed.transition);
+        for processor in &mut pipeline.processors {
+            let Some(processed) = processor.process(&frame) else {
+                continue;
+            };
+            transitions.extend(
+                pipeline
+                    .rules
+                    .iter_mut()
+                    .filter_map(|rule| rule.observe(&processed.observation)),
+            );
+            observations.push(processed.observation);
+        }
     }
     let metrics = evaluate_replay(
         &manifest.expected_events,
@@ -1031,6 +1130,90 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
         &manifest.regression,
     );
     Ok(json!({"metrics":metrics,"observations":observations,"events":transitions}))
+}
+
+fn replay_png_frames(directory: &Path, paths: &[PathBuf]) -> Result<Vec<Arc<Frame>>, RpcError> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "replay image path must be profile-relative without parent traversal",
+                ));
+            }
+            let path = directory.join(path);
+            let metadata = fs::metadata(&path).map_err(internal_error)?;
+            if metadata.len() > 16 * 1024 * 1024 {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "replay PNG exceeds 16 MiB",
+                ));
+            }
+            let decoder = png::Decoder::new(std::io::BufReader::new(
+                fs::File::open(path).map_err(internal_error)?,
+            ));
+            let mut reader = decoder.read_info().map_err(internal_error)?;
+            let mut output = vec![
+                0;
+                reader.output_buffer_size().ok_or_else(|| RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "replay PNG exceeds decoder limits",
+                ))?
+            ];
+            let info = reader.next_frame(&mut output).map_err(internal_error)?;
+            if info.width == 0
+                || info.height == 0
+                || info.width > 4_096
+                || info.height > 4_096
+                || info.bit_depth != png::BitDepth::Eight
+            {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "replay PNG must be 8-bit and no larger than 4096x4096",
+                ));
+            }
+            let data = &output[..info.buffer_size()];
+            let (format, pixels): (PixelFormat, Vec<u8>) = match info.color_type {
+                png::ColorType::Rgb => (PixelFormat::Rgb8, data.to_vec()),
+                png::ColorType::Rgba => (PixelFormat::Rgba8, data.to_vec()),
+                png::ColorType::Grayscale => (
+                    PixelFormat::Rgb8,
+                    data.iter()
+                        .flat_map(|value| [*value, *value, *value])
+                        .collect(),
+                ),
+                _ => {
+                    return Err(RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        "replay PNG must use grayscale, RGB, or RGBA pixels",
+                    ))
+                }
+            };
+            let sequence = u64::try_from(index).unwrap_or(u64::MAX);
+            Frame::new(
+                sequence,
+                Duration::from_millis(sequence.saturating_mul(100)),
+                FrameLayout {
+                    width: info.width,
+                    height: info.height,
+                    row_stride: usize::try_from(info.width)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(format.bytes_per_pixel()),
+                    format,
+                },
+                Some("image-replay".into()),
+                Arc::from(pixels),
+            )
+            .map(Arc::new)
+            .map_err(internal_error)
+        })
+        .collect()
 }
 
 fn replay_fixture_frames(
@@ -1073,6 +1256,14 @@ fn replay_fixture_frames(
                 ProfileDetector::RegionChange { .. } => GrayImage::new(2, 2, vec![value; 4])
                     .map_err(internal_error)
                     .and_then(|image| gray_frame(sequence, &image).map_err(internal_error)),
+                ProfileDetector::Ocr { .. } => Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "OCR replay requires an image replay fixture",
+                )),
+                ProfileDetector::Classifier { .. } => Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "classifier replay requires an image replay fixture",
+                )),
             }
         })
         .collect()
@@ -1135,7 +1326,9 @@ fn test_detector(
         let processed = match &element.detector {
             ProfileDetector::ColorBar { .. } => original.clone(),
             ProfileDetector::Template { preprocessing, .. }
-            | ProfileDetector::RegionChange { preprocessing, .. } => PreprocessPipeline {
+            | ProfileDetector::RegionChange { preprocessing, .. }
+            | ProfileDetector::Ocr { preprocessing, .. }
+            | ProfileDetector::Classifier { preprocessing, .. } => PreprocessPipeline {
                 operations: preprocessing.clone(),
             }
             .apply(&original)
@@ -1255,6 +1448,18 @@ fn test_detector(
                 processed,
             )
         }
+        ProfileDetector::Ocr { .. } => {
+            return Err(RpcError::new(
+                error_code::INVALID_REQUEST,
+                "OCR detector tests require a frozen preview or image replay fixture",
+            ));
+        }
+        ProfileDetector::Classifier { .. } => {
+            return Err(RpcError::new(
+                error_code::INVALID_REQUEST,
+                "classifier detector tests require a frozen preview or image replay fixture",
+            ));
+        }
     };
     detector_test_response(element, &detections, &original, &processed_preview)
 }
@@ -1350,6 +1555,84 @@ fn encode_preview_png(image: &GrayImage) -> Result<Vec<u8>, RpcError> {
     Ok(bytes)
 }
 
+fn build_diagnostic_bundle(
+    state: &State,
+    frozen_frame: Option<&Frame>,
+    params: &DiagnosticParams,
+) -> Result<DiagnosticBundle, RpcError> {
+    if params.selected_element_ids.len() > DiagnosticLimits::default().maximum_crops {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "too many selected diagnostic crops",
+        ));
+    }
+    let settings = state.local_config.load_settings().map_err(internal_error)?;
+    let profile_id = params.profile_id.or(settings.active_profile);
+    let profile = profile_id
+        .map(|profile_id| state.profiles.load(profile_id).map_err(store_error))
+        .transpose()?;
+    let mut selected_crops = Vec::new();
+    if !params.selected_element_ids.is_empty() {
+        let frame = frozen_frame.ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_REQUEST,
+                "freeze a preview before selecting diagnostic crops",
+            )
+        })?;
+        let profile = profile.as_ref().ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_PARAMS,
+                "selected diagnostic crops require a profile",
+            )
+        })?;
+        for element_id in &params.selected_element_ids {
+            let element = profile
+                .elements
+                .iter()
+                .find(|element| element.id == *element_id)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        "selected diagnostic element was not found",
+                    )
+                })?;
+            let crop = grayscale_crop(frame, element.region).map_err(internal_error)?;
+            let crop = bounded_gray_preview(&crop, 512)?;
+            selected_crops.push(DiagnosticCrop {
+                name: format!("element_{}", element.id),
+                png: encode_preview_png(&crop)?,
+            });
+        }
+    }
+    let logs = state
+        .diagnostic_logs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    let configuration = json!({"settings":settings,"profile":profile});
+    let analysis = state
+        .analysis_metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let metrics = json!({
+        "status":status(state),
+        "capture":capture_status(state),
+        "analysis":{
+            "frames":analysis.frames,
+            "last_processing_latency_ms":analysis.last_processing_latency.map(|value|value.as_secs_f64()*1000.0),
+            "detector_errors":analysis.detector_errors,
+        },
+    });
+    Ok(DiagnosticBundle {
+        logs,
+        configuration,
+        metrics,
+        selected_crops,
+    })
+}
+
 fn bounded_gray_preview(image: &GrayImage, maximum: usize) -> Result<GrayImage, RpcError> {
     if image.width <= maximum && image.height <= maximum {
         return Ok(image.clone());
@@ -1373,7 +1656,9 @@ fn detector_id(detector: &ProfileDetector) -> DetectorId {
     match detector {
         ProfileDetector::ColorBar { id, .. }
         | ProfileDetector::Template { id, .. }
-        | ProfileDetector::RegionChange { id, .. } => *id,
+        | ProfileDetector::RegionChange { id, .. }
+        | ProfileDetector::Ocr { id, .. }
+        | ProfileDetector::Classifier { id, .. } => *id,
     }
 }
 
@@ -1514,60 +1799,161 @@ async fn stop_capture(state: &State) -> Result<Value, RpcError> {
 
 #[derive(Debug)]
 struct LivePipeline {
-    processor: FrameProcessor<ConfiguredDetector>,
+    processors: Vec<FrameProcessor<ConfiguredDetector, NoopRule>>,
+    rules: Vec<CoordinatedRule>,
     profile_id: String,
     game: String,
 }
 
+#[derive(Debug)]
+struct CoordinatedRule {
+    element_id: Option<ElementId>,
+    runtime: Box<dyn ObservationRule + Send>,
+}
+
+impl CoordinatedRule {
+    fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        if self
+            .element_id
+            .is_some_and(|element_id| element_id != observation.element_id)
+        {
+            return None;
+        }
+        self.runtime.observe(observation)
+    }
+}
+
 fn build_live_pipeline(state: &State, profile_id: ProfileId) -> Result<LivePipeline, RpcError> {
     let profile = state.profiles.load(profile_id).map_err(store_error)?;
-    let element = profile
+    let settings = state.local_config.load_settings().map_err(internal_error)?;
+    let directory = state.profiles.profile_directory(profile.id);
+    let processors = profile
         .elements
         .iter()
-        .find(|element| element.enabled)
-        .ok_or_else(|| {
-            RpcError::new(
-                error_code::INVALID_PARAMS,
-                "active profile has no enabled element",
-            )
-        })?;
-    let rule = profile
+        .filter(|element| element.enabled)
+        .map(|element| {
+            Ok(FrameProcessor::new(
+                AnalysisScheduler::new(settings.analysis_fps).map_err(internal_error)?,
+                configured_detector(&element.detector, &directory)?,
+                element.region,
+                detector_id(&element.detector),
+                element.id,
+                NoopRule,
+            ))
+        })
+        .collect::<Result<Vec<_>, RpcError>>()?;
+    if processors.is_empty() {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "active profile has no enabled element",
+        ));
+    }
+    let rules = profile
         .rules
         .iter()
-        .find(|rule| rule.element_id == element.id)
-        .ok_or_else(|| {
-            RpcError::new(
-                error_code::INVALID_PARAMS,
-                "enabled element has no event rule",
-            )
-        })?;
-    let detector = configured_detector(
-        &element.detector,
-        &state.profiles.profile_directory(profile.id),
-    )?;
-    let settings = state.local_config.load_settings().map_err(internal_error)?;
-    let numeric_rule = NumericRule::new(NumericRuleConfig {
+        .map(build_coordinated_rule)
+        .collect::<Result<Vec<_>, RpcError>>()?;
+    if rules.is_empty() {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "active profile has no event rule",
+        ));
+    }
+    Ok(LivePipeline {
+        processors,
+        rules,
+        profile_id: profile.id.to_string(),
+        game: profile.game,
+    })
+}
+
+fn build_coordinated_rule(
+    rule: &yash_app_events_profile::EventRule,
+) -> Result<CoordinatedRule, RpcError> {
+    let common = || TemporalRuleConfig {
         id: rule.id,
         event: rule.event.clone(),
-        enter_below: rule.enter_below,
-        leave_above: rule.leave_above,
+        predicate: ValuePredicate::Boolean { expected: true },
         minimum_confidence: rule.minimum_confidence,
         required_samples: usize::from(rule.required_samples),
         sample_window: usize::from(rule.sample_window),
+        stable_for: Duration::from_millis(rule.stable_for_ms),
         cooldown: Duration::from_millis(rule.cooldown_ms),
-    })
-    .map_err(internal_error)?;
-    Ok(LivePipeline {
-        processor: FrameProcessor::new(
-            AnalysisScheduler::new(settings.analysis_fps).map_err(internal_error)?,
-            detector,
-            element.region,
-            detector_id(&element.detector),
-            element.id,
-            numeric_rule,
+        emit_initial: rule.emit_initial,
+        update_interval: rule.update_interval_ms.map(Duration::from_millis),
+    };
+    let (element_id, runtime): (_, Box<dyn ObservationRule + Send>) = match &rule.predicate {
+        RulePredicate::NumericBelow => (
+            Some(rule.element_id),
+            Box::new(
+                NumericRule::new(NumericRuleConfig {
+                    id: rule.id,
+                    event: rule.event.clone(),
+                    enter_below: rule.enter_below,
+                    leave_above: rule.leave_above,
+                    minimum_confidence: rule.minimum_confidence,
+                    required_samples: usize::from(rule.required_samples),
+                    sample_window: usize::from(rule.sample_window),
+                    cooldown: Duration::from_millis(rule.cooldown_ms),
+                    stable_for: Duration::from_millis(rule.stable_for_ms),
+                    emit_initial: rule.emit_initial,
+                    update_interval: rule.update_interval_ms.map(Duration::from_millis),
+                })
+                .map_err(internal_error)?,
+            ),
         ),
-        profile_id: profile.id.to_string(),
-        game: profile.game,
+        RulePredicate::Boolean { expected } => {
+            let mut config = common();
+            config.predicate = ValuePredicate::Boolean {
+                expected: *expected,
+            };
+            (
+                Some(rule.element_id),
+                Box::new(TemporalRule::new(config).map_err(internal_error)?),
+            )
+        }
+        RulePredicate::TextEquals { expected } => {
+            let mut config = common();
+            config.predicate = ValuePredicate::TextEquals {
+                expected: expected.clone(),
+            };
+            (
+                Some(rule.element_id),
+                Box::new(TemporalRule::new(config).map_err(internal_error)?),
+            )
+        }
+        RulePredicate::TextContains { needle } => {
+            let mut config = common();
+            config.predicate = ValuePredicate::TextContains {
+                needle: needle.clone(),
+            };
+            (
+                Some(rule.element_id),
+                Box::new(TemporalRule::new(config).map_err(internal_error)?),
+            )
+        }
+        predicate @ (RulePredicate::All { .. } | RulePredicate::Any { .. }) => (
+            None,
+            Box::new(
+                CompositeRule::new(CompositeRuleConfig {
+                    id: rule.id,
+                    event: rule.event.clone(),
+                    predicate: predicate.clone(),
+                    minimum_confidence: rule.minimum_confidence,
+                    required_samples: usize::from(rule.required_samples),
+                    sample_window: usize::from(rule.sample_window),
+                    stable_for: Duration::from_millis(rule.stable_for_ms),
+                    cooldown: Duration::from_millis(rule.cooldown_ms),
+                    emit_initial: rule.emit_initial,
+                    update_interval: rule.update_interval_ms.map(Duration::from_millis),
+                })
+                .map_err(internal_error)?,
+            ),
+        ),
+    };
+    Ok(CoordinatedRule {
+        element_id,
+        runtime,
     })
 }
 
@@ -1589,10 +1975,20 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
                     if last_sequence == Some(frame.sequence) { continue; }
                     last_sequence = Some(frame.sequence);
                     let started = Instant::now();
-                    let Some(processed) = pipeline.processor.process(&frame) else { continue; };
-                    update_analysis_metrics(&task_state.analysis_metrics, started.elapsed(), processed.observation.status == yash_app_events_engine::ObservationStatus::Error);
                     let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
-                    if let Err(error) = publish_processed(&task_state,processed,&pipeline.profile_id,&pipeline.game,Utc::now(),capture,&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
+                    for processor in &mut pipeline.processors {
+                        let Some(processed) = processor.process(&frame) else { continue; };
+                        update_analysis_metrics(&task_state.analysis_metrics, started.elapsed(), processed.observation.status == yash_app_events_engine::ObservationStatus::Error);
+                        let transitions: Vec<_> = pipeline.rules.iter_mut().filter_map(|rule| rule.observe(&processed.observation)).collect();
+                        if transitions.is_empty() {
+                            if let Err(error) = publish_processed(&task_state,processed,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
+                        } else {
+                            for transition in transitions {
+                                let publication_item = ProcessedFrame { observation: processed.observation.clone(), transition: Some(transition) };
+                                if let Err(error) = publish_processed(&task_state,publication_item,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1960,6 +2356,22 @@ struct CaptureSelectParams {
     #[serde(default)]
     profile_id: Option<ProfileId>,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct DiagnosticParams {
+    #[serde(default)]
+    profile_id: Option<ProfileId>,
+    #[serde(default)]
+    selected_element_ids: Vec<ElementId>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DiagnosticExportParams {
+    path: PathBuf,
+    bundle: DiagnosticParams,
+    privacy_reviewed: bool,
+    expected_total_uncompressed_bytes: usize,
+}
 const fn default_fill() -> u8 {
     5
 }
@@ -2213,6 +2625,10 @@ mod tests {
                 required_samples: 2,
                 sample_window: 3,
                 cooldown_ms: 0,
+                predicate: RulePredicate::default(),
+                stable_for_ms: 0,
+                emit_initial: false,
+                update_interval_ms: None,
             });
         call(
             &mut client,
@@ -2285,6 +2701,10 @@ mod tests {
                 required_samples: 2,
                 sample_window: 2,
                 cooldown_ms: 0,
+                predicate: RulePredicate::Boolean { expected: false },
+                stable_for_ms: 0,
+                emit_initial: false,
+                update_interval_ms: None,
             });
         call(
             &mut client,
@@ -2349,6 +2769,10 @@ mod tests {
                 required_samples: 1,
                 sample_window: 1,
                 cooldown_ms: 0,
+                predicate: yash_app_events_profile::RulePredicate::default(),
+                stable_for_ms: 0,
+                emit_initial: false,
+                update_interval_ms: None,
             });
         call(
             &mut client,
@@ -2525,11 +2949,237 @@ mod tests {
         })
         .unwrap();
         let detection = detector.detect(&frame, full_frame_region());
-        assert_eq!(detection.value, Some(0.8));
+        assert_eq!(
+            detection.value,
+            Some(yash_app_events_vision::DetectionValue::Number(0.8))
+        );
         assert_eq!(
             detection.status,
             yash_app_events_vision::DetectionStatus::Valid
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ocr_image_replay_reaches_text_rule_through_common_coordinator() {
+        let directory = tempfile::tempdir().unwrap();
+        let (notifications, _) = broadcast::channel(8);
+        let state = State {
+            instance: Uuid::new_v4(),
+            profiles: ProfileStore::new(directory.path().join("data"), 20),
+            local_config: LocalConfig::new(directory.path().join("config")),
+            connected: AtomicUsize::new(0),
+            maximum_connections: 8,
+            shutdown: Notify::new(),
+            notifications,
+            sequence: AtomicU64::new(0),
+            output: Mutex::new(OutputWriter::new(
+                directory.path().join("state"),
+                OutputConfig::default(),
+            )),
+            latest_snapshot: Mutex::new(json!({})),
+            output_error: Mutex::new(None),
+            latest_frame: LatestFrameSlot::default(),
+            capture: Mutex::new(None),
+            analysis: Mutex::new(None),
+            analysis_metrics: Mutex::new(AnalysisMetrics::default()),
+            preview_clients: AtomicUsize::new(0),
+            diagnostic_logs: Mutex::new(VecDeque::new()),
+        };
+        state
+            .local_config
+            .save_settings(&yash_app_events_profile::Settings::default())
+            .unwrap();
+        let mut profile = Profile::new("OCR", "synthetic_game", 640, 120);
+        let element_id = ElementId::new();
+        profile.elements.push(yash_app_events_profile::Element {
+            id: element_id,
+            name: "Result text".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::Ocr {
+                id: DetectorId::new(),
+                language: "eng".into(),
+                page_segmentation_mode: 7,
+                character_whitelist: Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ ".into()),
+                change_trigger_threshold: 0.01,
+                maximum_interval_ms: 1_000,
+                preprocessing: Vec::new(),
+            },
+        });
+        profile.rules.push(yash_app_events_profile::EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "victory".into(),
+            enter_below: 0.0,
+            leave_above: 0.0,
+            minimum_confidence: 0.5,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+            predicate: RulePredicate::TextEquals {
+                expected: "VICTORY".into(),
+            },
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
+        });
+        state.profiles.create(&profile).unwrap();
+        let profile_directory = state.profiles.profile_directory(profile.id);
+        fs::copy(
+            "../vision/tests/fixtures/ocr/localized.png",
+            profile_directory.join("localized.png"),
+        )
+        .unwrap();
+        fs::copy(
+            "../vision/tests/fixtures/ocr/victory.png",
+            profile_directory.join("victory.png"),
+        )
+        .unwrap();
+        let diagnostic_frame =
+            replay_png_frames(&profile_directory, &[PathBuf::from("localized.png")])
+                .unwrap()
+                .remove(0);
+        let diagnostic = build_diagnostic_bundle(
+            &state,
+            Some(&diagnostic_frame),
+            &DiagnosticParams {
+                profile_id: Some(profile.id),
+                selected_element_ids: vec![element_id],
+            },
+        )
+        .unwrap();
+        let diagnostic_plan =
+            plan_diagnostic_bundle(&diagnostic, DiagnosticLimits::default()).unwrap();
+        assert_eq!(diagnostic_plan.entries.len(), 4);
+        assert!(diagnostic_plan.entries[3].user_selected_image);
+        let result = evaluate_profile_replay(
+            &state,
+            &ReplayManifest {
+                schema: 1,
+                profile_id: profile.id,
+                element_id,
+                values: Vec::new(),
+                image_frames: vec!["localized.png".into(), "victory.png".into()],
+                expected_events: vec![yash_app_events_engine::ExpectedEvent {
+                    event: "victory".into(),
+                    state: TransitionState::Entered,
+                    timestamp_ms: 100,
+                    tolerance_ms: 0,
+                }],
+                regression: yash_app_events_engine::ReplayRegression::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["metrics"]["passed"], true);
+        assert_eq!(result["events"][0]["event"], "victory");
+        assert_eq!(result["observations"][1]["value"]["type"], "text");
+        assert_eq!(result["observations"][1]["value"]["value"], "VICTORY");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classifier_image_replay_validates_model_and_emits_label_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let (notifications, _) = broadcast::channel(8);
+        let state = State {
+            instance: Uuid::new_v4(),
+            profiles: ProfileStore::new(directory.path().join("data"), 20),
+            local_config: LocalConfig::new(directory.path().join("config")),
+            connected: AtomicUsize::new(0),
+            maximum_connections: 8,
+            shutdown: Notify::new(),
+            notifications,
+            sequence: AtomicU64::new(0),
+            output: Mutex::new(OutputWriter::new(
+                directory.path().join("state"),
+                OutputConfig::default(),
+            )),
+            latest_snapshot: Mutex::new(json!({})),
+            output_error: Mutex::new(None),
+            latest_frame: LatestFrameSlot::default(),
+            capture: Mutex::new(None),
+            analysis: Mutex::new(None),
+            analysis_metrics: Mutex::new(AnalysisMetrics::default()),
+            preview_clients: AtomicUsize::new(0),
+            diagnostic_logs: Mutex::new(VecDeque::new()),
+        };
+        state
+            .local_config
+            .save_settings(&yash_app_events_profile::Settings::default())
+            .unwrap();
+        let mut profile = Profile::new("Classifier", "synthetic_game", 8, 8);
+        let element_id = ElementId::new();
+        profile.elements.push(yash_app_events_profile::Element {
+            id: element_id,
+            name: "HUD icon class".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::Classifier {
+                id: DetectorId::new(),
+                model: "hud_icon.onnx".into(),
+                model_sha256: "12ac2f734bbe111526ef82db676086b75a30635a28c2ab8a032a1b1f10759fc6"
+                    .into(),
+                labels: vec!["orb".into(), "cross".into()],
+                input_width: 8,
+                input_height: 8,
+                preprocessing: vec![yash_app_events_profile::PreprocessOperation::Resize {
+                    width: 8,
+                    height: 8,
+                }],
+                change_trigger_threshold: 0.01,
+                maximum_interval_ms: 1_000,
+            },
+        });
+        profile.rules.push(yash_app_events_profile::EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "cross_icon".into(),
+            enter_below: 0.0,
+            leave_above: 0.0,
+            minimum_confidence: 0.5,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+            predicate: RulePredicate::TextEquals {
+                expected: "cross".into(),
+            },
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
+        });
+        state.profiles.create(&profile).unwrap();
+        let profile_directory = state.profiles.profile_directory(profile.id);
+        for name in ["hud_icon.onnx", "orb_0.png", "cross_0.png"] {
+            fs::copy(
+                Path::new("../vision/tests/fixtures/classifier").join(name),
+                profile_directory.join(name),
+            )
+            .unwrap();
+        }
+        let result = evaluate_profile_replay(
+            &state,
+            &ReplayManifest {
+                schema: 1,
+                profile_id: profile.id,
+                element_id,
+                values: Vec::new(),
+                image_frames: vec!["orb_0.png".into(), "cross_0.png".into()],
+                expected_events: vec![yash_app_events_engine::ExpectedEvent {
+                    event: "cross_icon".into(),
+                    state: TransitionState::Entered,
+                    timestamp_ms: 100,
+                    tolerance_ms: 0,
+                }],
+                regression: yash_app_events_engine::ReplayRegression::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["metrics"]["passed"], true);
+        assert_eq!(result["events"][0]["event"], "cross_icon");
+        assert_eq!(result["observations"][1]["value"]["value"], "cross");
     }
 
     #[tokio::test]
@@ -2557,6 +3207,7 @@ mod tests {
             analysis: Mutex::new(None),
             analysis_metrics: Mutex::new(AnalysisMetrics::default()),
             preview_clients: AtomicUsize::new(0),
+            diagnostic_logs: Mutex::new(VecDeque::new()),
         });
         state
             .local_config
@@ -2583,6 +3234,26 @@ mod tests {
                 mask: None,
             },
         });
+        let second_element_id = ElementId::new();
+        profile.elements.push(yash_app_events_profile::Element {
+            id: second_element_id,
+            name: "Shield".into(),
+            enabled: true,
+            color: "#00f".into(),
+            region: NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: ProfileDetector::ColorBar {
+                id: DetectorId::new(),
+                direction: BarDirection::LeftToRight,
+                minimum_rgb: [180, 0, 0],
+                maximum_rgb: [255, 60, 60],
+                mask: None,
+            },
+        });
         profile.rules.push(yash_app_events_profile::EventRule {
             id: RuleId::new(),
             element_id,
@@ -2593,8 +3264,70 @@ mod tests {
             required_samples: 1,
             sample_window: 1,
             cooldown_ms: 0,
+            predicate: yash_app_events_profile::RulePredicate::default(),
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
+        });
+        profile.rules.push(yash_app_events_profile::EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "both_critical".into(),
+            enter_below: 0.2,
+            leave_above: 0.3,
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+            predicate: RulePredicate::All {
+                conditions: vec![
+                    yash_app_events_profile::ObservationCondition {
+                        element_id,
+                        predicate: yash_app_events_profile::AtomicRulePredicate::NumericBelow {
+                            threshold_micros: 200_000,
+                        },
+                    },
+                    yash_app_events_profile::ObservationCondition {
+                        element_id: second_element_id,
+                        predicate: yash_app_events_profile::AtomicRulePredicate::NumericBelow {
+                            threshold_micros: 200_000,
+                        },
+                    },
+                ],
+            },
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
         });
         state.profiles.create(&profile).unwrap();
+        let replay = evaluate_profile_replay(
+            &state,
+            &ReplayManifest {
+                schema: 1,
+                profile_id: profile.id,
+                element_id,
+                values: vec![8, 1],
+                image_frames: Vec::new(),
+                expected_events: vec![
+                    yash_app_events_engine::ExpectedEvent {
+                        event: "critical_health".into(),
+                        state: TransitionState::Entered,
+                        timestamp_ms: 100,
+                        tolerance_ms: 0,
+                    },
+                    yash_app_events_engine::ExpectedEvent {
+                        event: "both_critical".into(),
+                        state: TransitionState::Entered,
+                        timestamp_ms: 100,
+                        tolerance_ms: 0,
+                    },
+                ],
+                regression: yash_app_events_engine::ReplayRegression::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(replay["events"].as_array().unwrap().len(), 2);
+        assert_eq!(replay["metrics"]["passed"], true);
         let pipeline = build_live_pipeline(&state, profile.id).unwrap();
         let mut receiver = state.notifications.subscribe();
         start_live_analysis(&state, pipeline);
@@ -2617,26 +3350,32 @@ mod tests {
             state.latest_frame.publish(Arc::new(frame));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(event["event"], "critical_health");
-        assert_eq!(event["state"], "entered");
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            events.push(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(events[0]["event"], "critical_health");
+        assert_eq!(events[1]["event"], "both_critical");
+        assert!(events.iter().all(|event| event["state"] == "entered"));
         let analysis = state.analysis.lock().unwrap().take().unwrap();
         let _ = analysis.stop.send(());
         analysis.task.await.unwrap();
         let analyzed = state.analysis_metrics.lock().unwrap().frames;
-        assert!((2..=10).contains(&analyzed), "analyzed {analyzed} frames");
+        assert!((4..=20).contains(&analyzed), "analyzed {analyzed} frames");
         assert_eq!(state.latest_frame.replacements(), 59);
         assert_eq!(
             fs::read_to_string(directory.path().join("state/events.jsonl"))
                 .unwrap()
                 .lines()
                 .count(),
-            1
+            2
         );
-        assert_eq!(state.latest_snapshot.lock().unwrap()["sequence"], 1);
+        assert_eq!(state.latest_snapshot.lock().unwrap()["sequence"], 2);
         {
             let mut lease = PreviewLease::new(Arc::clone(&state));
             lease.start();

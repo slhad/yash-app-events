@@ -5,7 +5,11 @@ yash-eventsctl \- inspect and control yash-app-eventsd
 .B yash-eventsctl
 [--json] [--socket PATH] [--timeout-ms MS] COMMAND
 .SH COMMANDS
-version, status, state, shutdown, profile, events follow, capture, and replay MANIFEST.
+version, status, state, shutdown, profile, events follow, capture, replay MANIFEST,
+diagnostic plan, and diagnostic export.
+.PP
+Diagnostic export requires an exact total returned by diagnostic plan plus the
+--privacy-reviewed flag. Selected --element-id crops require a frozen preview.
 .SH EXIT STATUS
 0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay regression.
 .SH SEE ALSO

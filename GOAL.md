@@ -1,5 +1,21 @@
 # Autonomous Implementation Goal
 
+## Completion record
+
+**Status: COMPLETE — 2026-07-11**
+
+The first usable Linux product defined by this goal is implemented and verified on
+CachyOS/Arch with Hyprland. Phases 0 through 8 and Phase 10 satisfy their exit gates;
+Phase 9 OCR remains deferred as this contract permits. Release-scoped requirements
+are recorded as `VERIFIED` with evidence in `SPECS.md`, and the canonical formatting,
+Clippy, test, README-claim, and documentation gates pass from a clean worktree.
+
+This file remains the historical completion contract. New development is governed by
+`ROADMAP.md`; completing or changing post-release work does not rewrite this record.
+
+Post-release addendum: R0 through R4 in `ROADMAP.md` were subsequently completed on
+2026-07-11, including the formerly deferred Phase 9 OCR work.
+
 ## Objective
 
 Implement the Linux-first `yash-app-events` product described in `SPECS.md`, following the sequencing and verification gates in `PLAN.md`, until the definition of the first usable product is genuinely satisfied.
@@ -104,4 +120,3 @@ When complete, provide a concise report containing:
 - remaining deferred items;
 - schema/protocol versions;
 - known limitations and recovery procedures.
-

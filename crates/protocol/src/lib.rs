@@ -181,6 +181,8 @@ pub mod method {
     pub const PREVIEW_FRAME: &str = "preview.frame";
     pub const PREVIEW_FREEZE: &str = "preview.freeze";
     pub const PREVIEW_UNFREEZE: &str = "preview.unfreeze";
+    pub const DIAGNOSTIC_PLAN: &str = "diagnostic.plan";
+    pub const DIAGNOSTIC_EXPORT: &str = "diagnostic.export";
 }
 
 pub mod error_code {

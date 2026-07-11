@@ -126,7 +126,7 @@ impl Profile {
         );
         let element_ids: HashSet<_> = self.elements.iter().map(|element| element.id).collect();
         for (index, rule) in self.rules.iter().enumerate() {
-            rule.validate(index, &mut errors);
+            rule.validate(index, &element_ids, &mut errors);
             if !element_ids.contains(&rule.element_id) {
                 errors.push(ValidationError::new(
                     format!("rules[{index}].element_id"),
@@ -232,6 +232,45 @@ pub enum Detector {
         #[serde(default)]
         preprocessing: Vec<PreprocessOperation>,
     },
+    Ocr {
+        id: DetectorId,
+        language: String,
+        page_segmentation_mode: u8,
+        #[serde(default)]
+        character_whitelist: Option<String>,
+        #[serde(default = "default_ocr_change_threshold")]
+        change_trigger_threshold: f32,
+        #[serde(default = "default_ocr_maximum_interval_ms")]
+        maximum_interval_ms: u64,
+        #[serde(default)]
+        preprocessing: Vec<PreprocessOperation>,
+    },
+    Classifier {
+        id: DetectorId,
+        model: PathBuf,
+        model_sha256: String,
+        labels: Vec<String>,
+        input_width: usize,
+        input_height: usize,
+        #[serde(default)]
+        preprocessing: Vec<PreprocessOperation>,
+        #[serde(default = "default_classifier_change_threshold")]
+        change_trigger_threshold: f32,
+        #[serde(default = "default_ocr_maximum_interval_ms")]
+        maximum_interval_ms: u64,
+    },
+}
+
+const fn default_ocr_change_threshold() -> f32 {
+    0.02
+}
+
+const fn default_ocr_maximum_interval_ms() -> u64 {
+    1_000
+}
+
+const fn default_classifier_change_threshold() -> f32 {
+    0.02
 }
 
 /// Explicit deterministic detector preprocessing stored in portable profiles.
@@ -250,12 +289,15 @@ impl Detector {
         match self {
             Self::ColorBar { id, .. }
             | Self::Template { id, .. }
-            | Self::RegionChange { id, .. } => {
+            | Self::RegionChange { id, .. }
+            | Self::Ocr { id, .. }
+            | Self::Classifier { id, .. } => {
                 *id = DetectorId::new();
             }
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self, path: &str, errors: &mut Vec<ValidationError>) {
         match self {
             Self::ColorBar {
@@ -316,7 +358,152 @@ impl Detector {
                 validate_unit_interval(&format!("{path}.threshold"), *threshold, errors);
                 validate_preprocessing(path, preprocessing, errors);
             }
+            Self::Ocr {
+                language,
+                page_segmentation_mode,
+                character_whitelist,
+                change_trigger_threshold,
+                maximum_interval_ms,
+                preprocessing,
+                ..
+            } => {
+                validate_ocr(
+                    path,
+                    language,
+                    *page_segmentation_mode,
+                    character_whitelist.as_deref(),
+                    *change_trigger_threshold,
+                    *maximum_interval_ms,
+                    errors,
+                );
+                validate_preprocessing(path, preprocessing, errors);
+            }
+            Self::Classifier {
+                model,
+                model_sha256,
+                labels,
+                input_width,
+                input_height,
+                preprocessing,
+                change_trigger_threshold,
+                maximum_interval_ms,
+                ..
+            } => {
+                validate_classifier(
+                    path,
+                    model,
+                    model_sha256,
+                    labels,
+                    *input_width,
+                    *input_height,
+                    *change_trigger_threshold,
+                    *maximum_interval_ms,
+                    errors,
+                );
+                validate_preprocessing(path, preprocessing, errors);
+            }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_classifier(
+    path: &str,
+    model: &Path,
+    model_sha256: &str,
+    labels: &[String],
+    input_width: usize,
+    input_height: usize,
+    change_trigger_threshold: f32,
+    maximum_interval_ms: u64,
+    errors: &mut Vec<ValidationError>,
+) {
+    validate_asset_path(&format!("{path}.model"), model, errors);
+    if model_sha256.len() != 64 || !model_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        errors.push(ValidationError::new(
+            format!("{path}.model_sha256"),
+            "must be a 64-character hexadecimal SHA-256",
+        ));
+    }
+    let unique: HashSet<_> = labels.iter().collect();
+    if labels.len() < 2
+        || labels.len() > 256
+        || unique.len() != labels.len()
+        || labels
+            .iter()
+            .any(|label| label.is_empty() || label.len() > 64)
+    {
+        errors.push(ValidationError::new(
+            format!("{path}.labels"),
+            "must contain 2 through 256 unique labels of 1 through 64 bytes",
+        ));
+    }
+    if input_width == 0
+        || input_height == 0
+        || input_width
+            .checked_mul(input_height)
+            .is_none_or(|pixels| pixels > 16_777_216)
+    {
+        errors.push(ValidationError::new(
+            format!("{path}.input_width"),
+            "input dimensions must contain 1 through 16777216 pixels",
+        ));
+    }
+    validate_unit_interval(
+        &format!("{path}.change_trigger_threshold"),
+        change_trigger_threshold,
+        errors,
+    );
+    if !(100..=60_000).contains(&maximum_interval_ms) {
+        errors.push(ValidationError::new(
+            format!("{path}.maximum_interval_ms"),
+            "must be within 100 through 60000",
+        ));
+    }
+}
+
+fn validate_ocr(
+    path: &str,
+    language: &str,
+    page_segmentation_mode: u8,
+    character_whitelist: Option<&str>,
+    change_trigger_threshold: f32,
+    maximum_interval_ms: u64,
+    errors: &mut Vec<ValidationError>,
+) {
+    if language.is_empty()
+        || language.len() > 32
+        || !language
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+'))
+    {
+        errors.push(ValidationError::new(
+            format!("{path}.language"),
+            "must be a 1 through 32 byte Tesseract language identifier",
+        ));
+    }
+    if page_segmentation_mode > 13 {
+        errors.push(ValidationError::new(
+            format!("{path}.page_segmentation_mode"),
+            "must be within 0 through 13",
+        ));
+    }
+    if character_whitelist.is_some_and(|whitelist| whitelist.len() > 256) {
+        errors.push(ValidationError::new(
+            format!("{path}.character_whitelist"),
+            "must not exceed 256 bytes",
+        ));
+    }
+    validate_unit_interval(
+        &format!("{path}.change_trigger_threshold"),
+        change_trigger_threshold,
+        errors,
+    );
+    if !(100..=60_000).contains(&maximum_interval_ms) {
+        errors.push(ValidationError::new(
+            format!("{path}.maximum_interval_ms"),
+            "must be within 100 through 60000",
+        ));
     }
 }
 
@@ -372,7 +559,61 @@ pub enum BarDirection {
     BottomToTop,
 }
 
-/// A first-slice numeric event rule.
+/// Predicate applied to an element observation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RulePredicate {
+    #[default]
+    NumericBelow,
+    Boolean {
+        expected: bool,
+    },
+    TextEquals {
+        expected: String,
+    },
+    TextContains {
+        needle: String,
+    },
+    All {
+        conditions: Vec<ObservationCondition>,
+    },
+    Any {
+        conditions: Vec<ObservationCondition>,
+    },
+}
+
+/// One bounded leaf in an observation composition.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ObservationCondition {
+    pub element_id: ElementId,
+    pub predicate: AtomicRulePredicate,
+}
+
+/// Non-recursive predicate used by composition leaves.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AtomicRulePredicate {
+    Boolean { expected: bool },
+    TextEquals { expected: String },
+    TextContains { needle: String },
+    NumericBelow { threshold_micros: i32 },
+}
+
+fn is_default_rule_predicate(predicate: &RulePredicate) -> bool {
+    *predicate == RulePredicate::NumericBelow
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A version-one-compatible event rule with optional post-release typed behavior.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EventRule {
     pub id: RuleId,
@@ -384,16 +625,32 @@ pub struct EventRule {
     pub required_samples: u16,
     pub sample_window: u16,
     pub cooldown_ms: u64,
+    #[serde(default, skip_serializing_if = "is_default_rule_predicate")]
+    pub predicate: RulePredicate,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stable_for_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub emit_initial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_interval_ms: Option<u64>,
 }
 
 impl EventRule {
-    fn validate(&self, index: usize, errors: &mut Vec<ValidationError>) {
+    fn validate(
+        &self,
+        index: usize,
+        element_ids: &HashSet<ElementId>,
+        errors: &mut Vec<ValidationError>,
+    ) {
         let base = format!("rules[{index}]");
         validate_identifier(&format!("{base}.event"), &self.event, errors);
-        if self.leave_above < self.enter_below {
+        if !self.enter_below.is_finite()
+            || !self.leave_above.is_finite()
+            || self.leave_above < self.enter_below
+        {
             errors.push(ValidationError::new(
                 format!("{base}.leave_above"),
-                "must be greater than or equal to enter_below",
+                "thresholds must be finite and leave_above must be greater than or equal to enter_below",
             ));
         }
         if !(0.0..=1.0).contains(&self.minimum_confidence) {
@@ -408,6 +665,65 @@ impl EventRule {
                 "must be non-zero and no greater than sample_window",
             ));
         }
+        if self.update_interval_ms == Some(0) {
+            errors.push(ValidationError::new(
+                format!("{base}.update_interval_ms"),
+                "must be greater than zero when enabled",
+            ));
+        }
+        match &self.predicate {
+            RulePredicate::NumericBelow | RulePredicate::Boolean { .. } => {}
+            RulePredicate::TextEquals { expected } => {
+                validate_match_text(&format!("{base}.predicate.expected"), expected, errors);
+            }
+            RulePredicate::TextContains { needle } => {
+                validate_match_text(&format!("{base}.predicate.needle"), needle, errors);
+            }
+            RulePredicate::All { conditions } | RulePredicate::Any { conditions } => {
+                if conditions.is_empty() || conditions.len() > 16 {
+                    errors.push(ValidationError::new(
+                        format!("{base}.predicate.conditions"),
+                        "must contain 1 through 16 observation conditions",
+                    ));
+                }
+                for (condition_index, condition) in conditions.iter().enumerate() {
+                    let path = format!("{base}.predicate.conditions[{condition_index}]");
+                    if !element_ids.contains(&condition.element_id) {
+                        errors.push(ValidationError::new(
+                            format!("{path}.element_id"),
+                            "must reference an existing element",
+                        ));
+                    }
+                    match &condition.predicate {
+                        AtomicRulePredicate::TextEquals { expected } => {
+                            validate_match_text(
+                                &format!("{path}.predicate.expected"),
+                                expected,
+                                errors,
+                            );
+                        }
+                        AtomicRulePredicate::TextContains { needle } => {
+                            validate_match_text(
+                                &format!("{path}.predicate.needle"),
+                                needle,
+                                errors,
+                            );
+                        }
+                        AtomicRulePredicate::Boolean { .. }
+                        | AtomicRulePredicate::NumericBelow { .. } => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_match_text(path: &str, value: &str, errors: &mut Vec<ValidationError>) {
+    if value.is_empty() || value.len() > 256 {
+        errors.push(ValidationError::new(
+            path,
+            "must contain 1 through 256 bytes",
+        ));
     }
 }
 
@@ -653,6 +969,64 @@ mod tests {
         );
         assert_eq!(profile.elements.len(), 1);
         assert_eq!(profile.rules[0].event, "critical_health");
+        assert_eq!(profile.rules[0].predicate, RulePredicate::NumericBelow);
+        let serialized = serde_json::to_value(&profile).unwrap();
+        assert!(serialized["rules"][0].get("predicate").is_none());
+        assert!(serialized["rules"][0].get("stable_for_ms").is_none());
+        assert!(serialized["rules"][0].get("emit_initial").is_none());
+        assert!(serialized["rules"][0].get("update_interval_ms").is_none());
+    }
+
+    #[test]
+    fn composed_rules_are_bounded_and_reference_existing_observations() {
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let element_id = ElementId::new();
+        profile.elements.push(Element {
+            id: element_id,
+            name: "Victory".into(),
+            enabled: true,
+            color: "#ffffff".into(),
+            region: NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: Detector::RegionChange {
+                id: DetectorId::new(),
+                threshold: 0.2,
+                preprocessing: Vec::new(),
+            },
+        });
+        profile.rules.push(EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "victory".into(),
+            enter_below: 0.2,
+            leave_above: 0.3,
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+            predicate: RulePredicate::All {
+                conditions: vec![ObservationCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                }],
+            },
+            stable_for_ms: 250,
+            emit_initial: true,
+            update_interval_ms: Some(1_000),
+        });
+        profile.validate().unwrap();
+        if let RulePredicate::All { conditions } = &mut profile.rules[0].predicate {
+            conditions[0].element_id = ElementId::new();
+        }
+        let errors = profile.validate().unwrap_err();
+        assert!(errors
+            .0
+            .iter()
+            .any(|error| { error.path == "rules[0].predicate.conditions[0].element_id" }));
     }
 
     #[test]

@@ -1,13 +1,16 @@
 //! Latest-frame scheduling, typed observations, temporal rules, and transitions.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yash_app_events_capture::Frame;
-use yash_app_events_profile::{DetectorId, ElementId, NormalizedRegion, RuleId};
-use yash_app_events_vision::{DetectionStatus, Detector};
+use yash_app_events_profile::{
+    AtomicRulePredicate, DetectorId, ElementId, NormalizedRegion, ObservationCondition, RuleId,
+    RulePredicate,
+};
+use yash_app_events_vision::{DetectionStatus, DetectionValue, Detector};
 
 /// Default detector analysis rate in frames per second.
 pub const DEFAULT_ANALYSIS_FPS: u8 = 10;
@@ -145,6 +148,352 @@ pub enum ObservationStatus {
     Error,
 }
 
+/// Typed predicate used by the post-release temporal-rule language.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ValuePredicate {
+    Boolean { expected: bool },
+    TextEquals { expected: String },
+    TextContains { needle: String },
+}
+
+/// Shared temporal behavior for typed predicates.
+#[derive(Clone, Debug)]
+pub struct TemporalRuleConfig {
+    pub id: RuleId,
+    pub event: String,
+    pub predicate: ValuePredicate,
+    pub minimum_confidence: f32,
+    pub required_samples: usize,
+    pub sample_window: usize,
+    pub stable_for: Duration,
+    pub cooldown: Duration,
+    pub emit_initial: bool,
+    pub update_interval: Option<Duration>,
+}
+
+/// A typed temporal rule supporting boolean/text matching, stable duration,
+/// N-of-M evidence, cooldown, initial transitions, and bounded updates.
+#[derive(Clone, Debug)]
+pub struct TemporalRule {
+    config: TemporalRuleConfig,
+    state: Option<bool>,
+    evidence: VecDeque<bool>,
+    candidate: Option<(bool, Duration)>,
+    last_transition: Option<Duration>,
+    last_update: Option<Duration>,
+}
+
+/// Bounded conjunction/disjunction over the latest valid element observations.
+#[derive(Clone, Debug)]
+pub struct CompositeRule {
+    conditions: Vec<ObservationCondition>,
+    require_all: bool,
+    latest: HashMap<ElementId, Observation>,
+    temporal: TemporalRule,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompositeRuleConfig {
+    pub id: RuleId,
+    pub event: String,
+    pub predicate: RulePredicate,
+    pub minimum_confidence: f32,
+    pub required_samples: usize,
+    pub sample_window: usize,
+    pub stable_for: Duration,
+    pub cooldown: Duration,
+    pub emit_initial: bool,
+    pub update_interval: Option<Duration>,
+}
+
+impl CompositeRule {
+    /// Constructs a bounded non-recursive composition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-composite predicates and condition counts outside 1 through 16.
+    pub fn new(config: CompositeRuleConfig) -> Result<Self, EngineError> {
+        let CompositeRuleConfig {
+            id,
+            event,
+            predicate,
+            minimum_confidence,
+            required_samples,
+            sample_window,
+            stable_for,
+            cooldown,
+            emit_initial,
+            update_interval,
+        } = config;
+        let (conditions, require_all) = match predicate {
+            RulePredicate::All { conditions } => (conditions, true),
+            RulePredicate::Any { conditions } => (conditions, false),
+            _ => return Err(EngineError::InvalidRule),
+        };
+        if conditions.is_empty() || conditions.len() > 16 {
+            return Err(EngineError::InvalidRule);
+        }
+        let temporal = TemporalRule::new(TemporalRuleConfig {
+            id,
+            event,
+            predicate: ValuePredicate::Boolean { expected: true },
+            minimum_confidence,
+            required_samples,
+            sample_window,
+            stable_for,
+            cooldown,
+            emit_initial,
+            update_interval,
+        })?;
+        Ok(Self {
+            conditions,
+            require_all,
+            latest: HashMap::new(),
+            temporal,
+        })
+    }
+
+    /// Updates one element's latest observation and evaluates once every leaf is known.
+    pub fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        if !self
+            .conditions
+            .iter()
+            .any(|condition| condition.element_id == observation.element_id)
+        {
+            return None;
+        }
+        if observation.status != ObservationStatus::Valid {
+            self.latest.remove(&observation.element_id);
+            return None;
+        }
+        self.latest
+            .insert(observation.element_id, observation.clone());
+        let evaluations = self
+            .conditions
+            .iter()
+            .map(|condition| {
+                let observation = self.latest.get(&condition.element_id)?;
+                atomic_matches(&condition.predicate, &observation.value)
+                    .map(|matched| (matched, observation.confidence.unwrap_or(1.0)))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let matched = if self.require_all {
+            evaluations.iter().all(|(matched, _)| *matched)
+        } else {
+            evaluations.iter().any(|(matched, _)| *matched)
+        };
+        let confidence = evaluations
+            .iter()
+            .map(|(_, confidence)| *confidence)
+            .reduce(f32::min)
+            .unwrap_or(1.0);
+        let synthetic = Observation {
+            detector_id: observation.detector_id,
+            element_id: observation.element_id,
+            timestamp_ms: observation.timestamp_ms,
+            value: ObservationValue::Boolean(matched),
+            confidence: Some(confidence),
+            status: ObservationStatus::Valid,
+            diagnostic: "composed observation evidence".into(),
+        };
+        self.temporal.observe(&synthetic)
+    }
+
+    #[must_use]
+    pub const fn active(&self) -> Option<bool> {
+        self.temporal.active()
+    }
+}
+
+fn atomic_matches(predicate: &AtomicRulePredicate, value: &ObservationValue) -> Option<bool> {
+    match (predicate, value) {
+        (AtomicRulePredicate::Boolean { expected }, ObservationValue::Boolean(value)) => {
+            Some(value == expected)
+        }
+        (AtomicRulePredicate::Boolean { expected }, ObservationValue::Number(value)) => {
+            numeric_boolean(*value).map(|value| value == *expected)
+        }
+        (AtomicRulePredicate::TextEquals { expected }, ObservationValue::Text(value)) => {
+            Some(value == expected)
+        }
+        (AtomicRulePredicate::TextContains { needle }, ObservationValue::Text(value)) => {
+            Some(value.contains(needle))
+        }
+        (
+            AtomicRulePredicate::NumericBelow { threshold_micros },
+            ObservationValue::Number(value),
+        ) => Some(*value < f64::from(*threshold_micros) / 1_000_000.0),
+        _ => None,
+    }
+}
+
+impl TemporalRule {
+    /// Constructs a validated typed temporal rule.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid confidence, sampling, empty text, or a zero update interval.
+    pub fn new(config: TemporalRuleConfig) -> Result<Self, EngineError> {
+        let text_valid = match &config.predicate {
+            ValuePredicate::Boolean { .. } => true,
+            ValuePredicate::TextEquals { expected } => !expected.is_empty(),
+            ValuePredicate::TextContains { needle } => !needle.is_empty(),
+        };
+        if !(0.0..=1.0).contains(&config.minimum_confidence)
+            || config.required_samples == 0
+            || config.required_samples > config.sample_window
+            || config.update_interval == Some(Duration::ZERO)
+            || !text_valid
+        {
+            return Err(EngineError::InvalidRule);
+        }
+        let sample_window = config.sample_window;
+        Ok(Self {
+            config,
+            state: None,
+            evidence: VecDeque::with_capacity(sample_window),
+            candidate: None,
+            last_transition: None,
+            last_update: None,
+        })
+    }
+
+    /// Consumes one typed observation and emits at most one meaningful transition.
+    pub fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        if observation.status != ObservationStatus::Valid {
+            return None;
+        }
+        let confidence = observation.confidence.unwrap_or(1.0);
+        if confidence < self.config.minimum_confidence {
+            return None;
+        }
+        let matched = match (&self.config.predicate, &observation.value) {
+            (ValuePredicate::Boolean { expected }, ObservationValue::Boolean(value)) => {
+                value == expected
+            }
+            (ValuePredicate::Boolean { expected }, ObservationValue::Number(value)) => {
+                let value = numeric_boolean(*value)?;
+                value == *expected
+            }
+            (ValuePredicate::TextEquals { expected }, ObservationValue::Text(value)) => {
+                value == expected
+            }
+            (ValuePredicate::TextContains { needle }, ObservationValue::Text(value)) => {
+                value.contains(needle)
+            }
+            _ => return None,
+        };
+        self.evidence.push_back(matched);
+        while self.evidence.len() > self.config.sample_window {
+            self.evidence.pop_front();
+        }
+        let positive =
+            self.evidence.iter().filter(|&&sample| sample).count() >= self.config.required_samples;
+        let negative =
+            self.evidence.iter().filter(|&&sample| !sample).count() >= self.config.required_samples;
+        let desired = if positive && self.state != Some(true) {
+            Some(true)
+        } else if negative && self.state != Some(false) {
+            Some(false)
+        } else {
+            self.state
+        };
+        let now = observation.monotonic_timestamp();
+        if desired != self.state {
+            let desired = desired?;
+            let since = match self.candidate {
+                Some((candidate, since)) if candidate == desired => since,
+                _ => {
+                    self.candidate = Some((desired, now));
+                    now
+                }
+            };
+            if now.saturating_sub(since) < self.config.stable_for {
+                return None;
+            }
+            let previous = self.state;
+            if previous.is_some()
+                && self
+                    .last_transition
+                    .is_some_and(|last| now.saturating_sub(last) < self.config.cooldown)
+            {
+                return None;
+            }
+            self.state = Some(desired);
+            self.candidate = None;
+            self.last_update = Some(now);
+            if previous.is_none() && !self.config.emit_initial {
+                return None;
+            }
+            self.last_transition = Some(now);
+            return Some(self.transition(observation, confidence, desired));
+        }
+        self.candidate = None;
+        if self.state == Some(true)
+            && self.config.update_interval.is_some_and(|interval| {
+                self.last_update
+                    .is_some_and(|last| now.saturating_sub(last) >= interval)
+            })
+        {
+            self.last_update = Some(now);
+            return Some(self.transition_with_state(
+                observation,
+                confidence,
+                TransitionState::Updated,
+            ));
+        }
+        None
+    }
+
+    fn transition(&self, observation: &Observation, confidence: f32, active: bool) -> Transition {
+        let state = if active {
+            TransitionState::Entered
+        } else {
+            TransitionState::Left
+        };
+        self.transition_with_state(observation, confidence, state)
+    }
+
+    fn transition_with_state(
+        &self,
+        observation: &Observation,
+        confidence: f32,
+        state: TransitionState,
+    ) -> Transition {
+        Transition {
+            rule_id: self.config.id,
+            event: self.config.event.clone(),
+            timestamp_ms: observation.timestamp_ms,
+            state,
+            value: numeric_transition_value(&observation.value),
+            confidence,
+        }
+    }
+
+    #[must_use]
+    pub const fn active(&self) -> Option<bool> {
+        self.state
+    }
+}
+
+fn numeric_boolean(value: f64) -> Option<bool> {
+    if value.abs() <= f64::EPSILON {
+        Some(false)
+    } else if (value - 1.0).abs() <= f64::EPSILON {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn numeric_transition_value(value: &ObservationValue) -> f64 {
+    match value {
+        ObservationValue::Number(value) => *value,
+        ObservationValue::Boolean(value) => f64::from(u8::from(*value)),
+        ObservationValue::Text(_) | ObservationValue::None => 0.0,
+    }
+}
+
 /// Numeric temporal rule supporting confidence, N-of-M, hysteresis, and cooldown.
 #[derive(Clone, Debug)]
 pub struct NumericRule {
@@ -156,9 +505,14 @@ pub struct NumericRule {
     pub required_samples: usize,
     pub sample_window: usize,
     pub cooldown: Duration,
+    pub stable_for: Duration,
+    pub emit_initial: bool,
+    pub update_interval: Option<Duration>,
     state: Option<bool>,
     evidence: VecDeque<bool>,
+    candidate: Option<(bool, Duration)>,
     last_transition: Option<Duration>,
+    last_update: Option<Duration>,
 }
 
 /// Serializable-independent runtime configuration for a numeric temporal rule.
@@ -172,6 +526,9 @@ pub struct NumericRuleConfig {
     pub required_samples: usize,
     pub sample_window: usize,
     pub cooldown: Duration,
+    pub stable_for: Duration,
+    pub emit_initial: bool,
+    pub update_interval: Option<Duration>,
 }
 
 impl NumericRule {
@@ -190,6 +547,9 @@ impl NumericRule {
             required_samples,
             sample_window,
             cooldown,
+            stable_for,
+            emit_initial,
+            update_interval,
         } = config;
         if !enter_below.is_finite()
             || !leave_above.is_finite()
@@ -197,6 +557,7 @@ impl NumericRule {
             || !(0.0..=1.0).contains(&minimum_confidence)
             || required_samples == 0
             || required_samples > sample_window
+            || update_interval == Some(Duration::ZERO)
         {
             return Err(EngineError::InvalidRule);
         }
@@ -209,9 +570,14 @@ impl NumericRule {
             required_samples,
             sample_window,
             cooldown,
+            stable_for,
+            emit_initial,
+            update_interval,
             state: None,
             evidence: VecDeque::with_capacity(sample_window),
+            candidate: None,
             last_transition: None,
+            last_update: None,
         })
     }
 
@@ -247,18 +613,50 @@ impl NumericRule {
         } else {
             self.state
         };
+        let timestamp = observation.monotonic_timestamp();
         let previous = self.state;
         if next == previous {
+            self.candidate = None;
+            if self.state == Some(true)
+                && self.update_interval.is_some_and(|interval| {
+                    self.last_update
+                        .is_some_and(|last| timestamp.saturating_sub(last) >= interval)
+                })
+            {
+                self.last_update = Some(timestamp);
+                return Some(Transition {
+                    rule_id: self.id,
+                    event: self.event.clone(),
+                    timestamp_ms: observation.timestamp_ms,
+                    state: TransitionState::Updated,
+                    value: *value,
+                    confidence,
+                });
+            }
             return None;
         }
-        self.state = next;
-        previous?;
-        let timestamp = observation.monotonic_timestamp();
-        if self
-            .last_transition
-            .is_some_and(|last| timestamp.saturating_sub(last) < self.cooldown)
+        let next = next?;
+        let since = match self.candidate {
+            Some((candidate, since)) if candidate == next => since,
+            _ => {
+                self.candidate = Some((next, timestamp));
+                timestamp
+            }
+        };
+        if timestamp.saturating_sub(since) < self.stable_for {
+            return None;
+        }
+        if previous.is_some()
+            && self
+                .last_transition
+                .is_some_and(|last| timestamp.saturating_sub(last) < self.cooldown)
         {
-            self.state = previous;
+            return None;
+        }
+        self.state = Some(next);
+        self.candidate = None;
+        self.last_update = Some(timestamp);
+        if previous.is_none() && !self.emit_initial {
             return None;
         }
         self.last_transition = Some(timestamp);
@@ -266,7 +664,7 @@ impl NumericRule {
             rule_id: self.id,
             event: self.event.clone(),
             timestamp_ms: observation.timestamp_ms,
-            state: if next == Some(true) {
+            state: if next {
                 TransitionState::Entered
             } else {
                 TransitionState::Left
@@ -296,6 +694,7 @@ pub struct Transition {
 #[serde(rename_all = "snake_case")]
 pub enum TransitionState {
     Entered,
+    Updated,
     Left,
 }
 
@@ -306,7 +705,11 @@ pub struct ReplayManifest {
     pub profile_id: yash_app_events_profile::ProfileId,
     pub element_id: ElementId,
     /// Detector-specific synthetic fixture values, sampled every 100 ms.
+    #[serde(default)]
     pub values: Vec<u8>,
+    /// Optional profile-relative PNG frames, sampled every 100 ms.
+    #[serde(default)]
+    pub image_frames: Vec<std::path::PathBuf>,
     pub expected_events: Vec<ExpectedEvent>,
     #[serde(default)]
     pub regression: ReplayRegression,
@@ -427,6 +830,39 @@ pub enum EngineError {
     InvalidRule,
 }
 
+/// Runtime boundary for rules consuming typed observations.
+pub trait ObservationRule: std::fmt::Debug {
+    fn observe(&mut self, observation: &Observation) -> Option<Transition>;
+}
+
+impl ObservationRule for NumericRule {
+    fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        Self::observe(self, observation)
+    }
+}
+
+impl ObservationRule for TemporalRule {
+    fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        Self::observe(self, observation)
+    }
+}
+
+impl ObservationRule for CompositeRule {
+    fn observe(&mut self, observation: &Observation) -> Option<Transition> {
+        Self::observe(self, observation)
+    }
+}
+
+/// Detector-only processing rule used when a shared rule coordinator consumes results.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopRule;
+
+impl ObservationRule for NoopRule {
+    fn observe(&mut self, _observation: &Observation) -> Option<Transition> {
+        None
+    }
+}
+
 /// One analyzed frame's observation and optional meaningful transition.
 #[derive(Clone, Debug)]
 pub struct ProcessedFrame {
@@ -436,16 +872,16 @@ pub struct ProcessedFrame {
 
 /// Identical detector/rule path used by replay and live capture frames.
 #[derive(Debug)]
-pub struct FrameProcessor<D: Detector> {
+pub struct FrameProcessor<D: Detector, R: ObservationRule = NumericRule> {
     scheduler: AnalysisScheduler,
     detector: D,
     region: NormalizedRegion,
     detector_id: DetectorId,
     element_id: ElementId,
-    rule: NumericRule,
+    rule: R,
 }
 
-impl<D: Detector> FrameProcessor<D> {
+impl<D: Detector, R: ObservationRule> FrameProcessor<D, R> {
     #[must_use]
     pub fn new(
         scheduler: AnalysisScheduler,
@@ -453,7 +889,7 @@ impl<D: Detector> FrameProcessor<D> {
         region: NormalizedRegion,
         detector_id: DetectorId,
         element_id: ElementId,
-        rule: NumericRule,
+        rule: R,
     ) -> Self {
         Self {
             scheduler,
@@ -477,7 +913,11 @@ impl<D: Detector> FrameProcessor<D> {
             timestamp_ms: u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX),
             value: detection
                 .value
-                .map_or(ObservationValue::None, ObservationValue::Number),
+                .map_or(ObservationValue::None, |value| match value {
+                    DetectionValue::Number(value) => ObservationValue::Number(value),
+                    DetectionValue::Boolean(value) => ObservationValue::Boolean(value),
+                    DetectionValue::Text(value) => ObservationValue::Text(value),
+                }),
             confidence: detection.confidence,
             status: match detection.status {
                 DetectionStatus::Valid => ObservationStatus::Valid,
@@ -515,6 +955,222 @@ mod tests {
         }
     }
 
+    fn typed_observation(timestamp_ms: u64, value: ObservationValue) -> Observation {
+        Observation {
+            detector_id: DetectorId::new(),
+            element_id: ElementId::new(),
+            timestamp_ms,
+            value,
+            confidence: Some(0.9),
+            status: ObservationStatus::Valid,
+            diagnostic: String::new(),
+        }
+    }
+
+    fn typed_rule(predicate: ValuePredicate) -> TemporalRule {
+        TemporalRule::new(TemporalRuleConfig {
+            id: RuleId::new(),
+            event: "typed_event".into(),
+            predicate,
+            minimum_confidence: 0.8,
+            required_samples: 1,
+            sample_window: 1,
+            stable_for: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            emit_initial: false,
+            update_interval: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn boolean_rule_emits_appearance_and_disappearance() {
+        let mut rule = typed_rule(ValuePredicate::Boolean { expected: true });
+        assert!(rule
+            .observe(&typed_observation(0, ObservationValue::Boolean(false)))
+            .is_none());
+        assert_eq!(
+            rule.observe(&typed_observation(100, ObservationValue::Boolean(true)))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+        assert_eq!(
+            rule.observe(&typed_observation(200, ObservationValue::Boolean(false)))
+                .unwrap()
+                .state,
+            TransitionState::Left
+        );
+        let mut numeric_presence = typed_rule(ValuePredicate::Boolean { expected: true });
+        assert!(numeric_presence
+            .observe(&observation(0, 0.0, 0.9))
+            .is_none());
+        assert_eq!(
+            numeric_presence
+                .observe(&observation(100, 1.0, 0.9))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+    }
+
+    #[test]
+    fn text_rules_support_equality_and_contains() {
+        let mut equals = typed_rule(ValuePredicate::TextEquals {
+            expected: "victory".into(),
+        });
+        assert!(equals
+            .observe(&typed_observation(0, ObservationValue::Text("menu".into())))
+            .is_none());
+        assert_eq!(
+            equals
+                .observe(&typed_observation(
+                    100,
+                    ObservationValue::Text("victory".into())
+                ))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+        let mut contains = typed_rule(ValuePredicate::TextContains {
+            needle: "level".into(),
+        });
+        assert!(contains
+            .observe(&typed_observation(
+                0,
+                ObservationValue::Text("main menu".into())
+            ))
+            .is_none());
+        assert_eq!(
+            contains
+                .observe(&typed_observation(
+                    100,
+                    ObservationValue::Text("level complete".into())
+                ))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+    }
+
+    #[test]
+    fn stable_duration_initial_and_rate_limited_updates_are_explicit() {
+        let mut rule = TemporalRule::new(TemporalRuleConfig {
+            id: RuleId::new(),
+            event: "visible".into(),
+            predicate: ValuePredicate::Boolean { expected: true },
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            stable_for: Duration::from_millis(200),
+            cooldown: Duration::ZERO,
+            emit_initial: true,
+            update_interval: Some(Duration::from_millis(300)),
+        })
+        .unwrap();
+        assert!(rule
+            .observe(&typed_observation(0, ObservationValue::Boolean(true)))
+            .is_none());
+        assert!(rule
+            .observe(&typed_observation(199, ObservationValue::Boolean(true)))
+            .is_none());
+        assert_eq!(
+            rule.observe(&typed_observation(200, ObservationValue::Boolean(true)))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+        assert!(rule
+            .observe(&typed_observation(499, ObservationValue::Boolean(true)))
+            .is_none());
+        assert_eq!(
+            rule.observe(&typed_observation(500, ObservationValue::Boolean(true)))
+                .unwrap()
+                .state,
+            TransitionState::Updated
+        );
+    }
+
+    #[test]
+    fn conjunction_and_disjunction_use_bounded_latest_observations() {
+        let first = ElementId::new();
+        let second = ElementId::new();
+        let conditions = vec![
+            ObservationCondition {
+                element_id: first,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+            },
+            ObservationCondition {
+                element_id: second,
+                predicate: AtomicRulePredicate::TextContains {
+                    needle: "victory".into(),
+                },
+            },
+        ];
+        let build = |predicate| {
+            CompositeRule::new(CompositeRuleConfig {
+                id: RuleId::new(),
+                event: "combined".into(),
+                predicate,
+                minimum_confidence: 0.0,
+                required_samples: 1,
+                sample_window: 1,
+                stable_for: Duration::ZERO,
+                cooldown: Duration::ZERO,
+                emit_initial: false,
+                update_interval: None,
+            })
+            .unwrap()
+        };
+        let with_element = |timestamp_ms, element_id, value| Observation {
+            element_id,
+            ..typed_observation(timestamp_ms, value)
+        };
+        let mut all = build(RulePredicate::All {
+            conditions: conditions.clone(),
+        });
+        assert!(all
+            .observe(&with_element(0, first, ObservationValue::Boolean(true)))
+            .is_none());
+        assert!(all
+            .observe(&with_element(
+                100,
+                second,
+                ObservationValue::Text("menu".into())
+            ))
+            .is_none());
+        assert_eq!(all.active(), Some(false));
+        assert_eq!(
+            all.observe(&with_element(
+                200,
+                second,
+                ObservationValue::Text("victory screen".into())
+            ))
+            .unwrap()
+            .state,
+            TransitionState::Entered
+        );
+
+        let mut any = build(RulePredicate::Any { conditions });
+        assert!(any
+            .observe(&with_element(0, first, ObservationValue::Boolean(false)))
+            .is_none());
+        assert!(any
+            .observe(&with_element(
+                100,
+                second,
+                ObservationValue::Text("menu".into())
+            ))
+            .is_none());
+        assert_eq!(any.active(), Some(false));
+        assert_eq!(
+            any.observe(&with_element(200, first, ObservationValue::Boolean(true)))
+                .unwrap()
+                .state,
+            TransitionState::Entered
+        );
+    }
+
     #[test]
     fn sixty_fps_input_is_throttled_to_ten_analyses() {
         let mut scheduler = AnalysisScheduler::new(10).unwrap();
@@ -537,6 +1193,9 @@ mod tests {
             required_samples: 2,
             sample_window: 3,
             cooldown: Duration::from_millis(200),
+            stable_for: Duration::ZERO,
+            emit_initial: false,
+            update_interval: None,
         })
         .unwrap();
         let values = [0.8, 0.8, 0.19, 0.18, 0.17, 0.25, 0.31, 0.35];
@@ -561,11 +1220,43 @@ mod tests {
             required_samples: 1,
             sample_window: 1,
             cooldown: Duration::ZERO,
+            stable_for: Duration::ZERO,
+            emit_initial: false,
+            update_interval: None,
         })
         .unwrap();
         assert!(rule.observe(&observation(0, 0.8, 0.9)).is_none());
         assert!(rule.observe(&observation(1, 0.1, 0.1)).is_none());
         assert_eq!(rule.active(), Some(false));
+    }
+
+    #[test]
+    fn numeric_rule_honors_stability_initial_and_update_configuration() {
+        let mut rule = NumericRule::new(NumericRuleConfig {
+            id: RuleId::new(),
+            event: "critical".into(),
+            enter_below: 0.2,
+            leave_above: 0.3,
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown: Duration::ZERO,
+            stable_for: Duration::from_millis(200),
+            emit_initial: true,
+            update_interval: Some(Duration::from_millis(300)),
+        })
+        .unwrap();
+        assert!(rule.observe(&observation(0, 0.1, 1.0)).is_none());
+        assert!(rule.observe(&observation(199, 0.1, 1.0)).is_none());
+        assert_eq!(
+            rule.observe(&observation(200, 0.1, 1.0)).unwrap().state,
+            TransitionState::Entered
+        );
+        assert!(rule.observe(&observation(499, 0.1, 1.0)).is_none());
+        assert_eq!(
+            rule.observe(&observation(500, 0.1, 1.0)).unwrap().state,
+            TransitionState::Updated
+        );
     }
 
     #[test]
@@ -652,6 +1343,9 @@ mod tests {
                     required_samples: 2,
                     sample_window: 3,
                     cooldown: Duration::ZERO,
+                    stable_for: Duration::ZERO,
+                    emit_initial: false,
+                    update_interval: None,
                 })
                 .unwrap(),
             )

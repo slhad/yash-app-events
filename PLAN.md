@@ -33,7 +33,11 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 8: complete (2026-07-11). Versioned synthetic manifests, common-path daemon evaluation,
   event metrics, regression thresholds, CLI JSON/exit status 7, and GUI import,
   playback/event scrubbing and metrics satisfy deterministic tuning and regression gates.
-- Phase 9 remains deferred and optional for the first usable product.
+- Phase 9: complete as post-release work (2026-07-11). Synthetic English,
+  localization, scale, animation, and glow fixtures; reproducible accuracy,
+  confidence, latency, CPU, and memory comparison; Tesseract backend decision;
+  typed detector; change-triggered scheduling; profile/daemon/GUI configuration;
+  frozen diagnostics; and common-path image replay events pass.
 - Phase 10: complete (2026-07-11). A clean-prefix source install, user service, desktop
   metadata, icon, Bash completion, man pages, recovery documentation, security review,
   Hyprland portal acceptance, and installed GUI workflow pass.
@@ -340,13 +344,20 @@ Exit gate:
 - Schemas and CLI behavior have golden compatibility tests.
 - All release-scoped specification requirements have evidence and `VERIFIED` status.
 
-## Phase 11 — Post-release candidates
+## Phase 11 — Post-release work
 
-These are deliberately not prerequisites for the first usable Linux release:
+Completed after the first usable Linux release (2026-07-11):
+
+- Complete event-rule language (boolean/string/stable-duration/composition and
+  configurable updated/initial transitions).
+- OCR detector integration from Phase 9.
+- Privacy-bounded diagnostic bundle.
+- Generic ONNX image classifier workflow.
+
+Remaining candidates are deliberately unscheduled:
 
 - Shared-memory preview optimization.
 - DMA-BUF/GPU preprocessing.
-- Generic ONNX image classifiers.
 - OBS plugin/shared-texture integration.
 - X11 backend.
 - Windows Graphics Capture backend.
@@ -354,7 +365,8 @@ These are deliberately not prerequisites for the first usable Linux release:
 - MQTT, Home Assistant, and webhook output adapters.
 - Multi-source simultaneous capture.
 
-Promote one only after a concrete use case, benchmark, and specification update.
+Promote a remaining candidate only after a concrete use case, benchmark, and specification update.
+Milestone ordering and exit gates are maintained in `ROADMAP.md`.
 
 ## Cross-phase verification checklist
 

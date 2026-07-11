@@ -46,6 +46,7 @@ The binary names and protocol-v1 command names are compatibility-sensitive.
 - PipeWire.
 - Rust 1.85 or newer for source builds.
 - PipeWire, Wayland, D-Bus, and a working desktop portal development stack.
+- Tesseract 5 and Leptonica development libraries for the OCR backend.
 
 The current reference build is x86-64 CachyOS/Arch Linux with Hyprland,
 PipeWire 1.6.6, Wayland client 1.25.0, and Rust 1.95. Install from a checkout:
@@ -90,17 +91,26 @@ yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
 yash-eventsctl --json replay ./manifest.json
+yash-eventsctl diagnostic plan --profile-id <uuid> --element-id <uuid>
 ```
 
 The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation does
 not require a running daemon. All commands accept `--json`, `--socket`, and
 `--timeout-ms`.
 
+Post-release detector work adds typed boolean/text rules, Tesseract OCR, and portable
+ONNX classifiers. OCR and classifiers use change-triggered bounded scheduling and the
+same image replay and temporal-event path as deterministic detectors. See
+`docs/ocr.md`, `docs/classifier.md`, and `docs/diagnostics.md` for current evidence and
+limitations.
+
 ## Configuration and output
 
-Portable profiles will live below the XDG data directory and contain a versioned profile document plus relative template/model assets. Machine-local capture bindings will live separately below the XDG config directory.
+Portable profiles live below the XDG data directory and contain a versioned profile
+document plus relative template/model assets. Machine-local capture bindings live
+separately below the XDG config directory.
 
-Runtime output will provide:
+Runtime output provides:
 
 - `events.jsonl`: append-only meaningful state transitions.
 - `state.json`: atomically replaced current state snapshot.
@@ -144,11 +154,11 @@ The CI-safe replay vertical slice is covered by the daemon test
 the same two transitions appear in `events.jsonl`, atomic `state.json`, `state.get`,
 and a live protocol subscription.
 
-The Wayland portal backend and capture CLI are implemented, but interactive support
-is not yet claimed. Run the opt-in procedure in `docs/capture-smoke.md`. Capture is
-daemon-owned; `yash-eventsctl capture select` opens the picker, `capture status`
+Interactive Wayland capture is verified on the documented Hyprland environment. The
+daemon owns capture; `yash-eventsctl capture select` opens the picker, `capture status`
 reports metrics, `capture snapshot <path>` explicitly saves one PNG, and `capture
-stop` releases the session.
+stop` releases the session. See `docs/capture-smoke.md` for the acceptance procedure
+and the current GNOME/KDE compatibility boundary.
 
 ## Project principles
 

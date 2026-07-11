@@ -54,6 +54,34 @@ pub enum Command {
     },
     /// Evaluate a versioned synthetic replay manifest through the daemon engine.
     Replay { manifest: PathBuf },
+    /// Review and export a privacy-bounded diagnostic bundle.
+    Diagnostic {
+        #[command(subcommand)]
+        command: DiagnosticCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DiagnosticCommand {
+    /// Show the exact redacted entries and total size before export.
+    Plan {
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long = "element-id")]
+        element_ids: Vec<String>,
+    },
+    /// Export only after reviewing a plan and confirming its exact total size.
+    Export {
+        path: PathBuf,
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long = "element-id")]
+        element_ids: Vec<String>,
+        #[arg(long)]
+        expected_total_bytes: usize,
+        #[arg(long)]
+        privacy_reviewed: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,81 +188,112 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         env!("CARGO_PKG_VERSION"),
     )
     .await?;
-    let value = match &cli.command {
-        Command::Version => client.call(method::VERSION, Value::Null).await?,
-        Command::Status => client.call(method::STATUS, Value::Null).await?,
-        Command::State => client.call(method::STATE_GET, Value::Null).await?,
-        Command::Shutdown => client.call(method::SHUTDOWN, Value::Null).await?,
-        Command::Profile { command } => match command {
-            ProfileCommand::List => client.call(method::PROFILE_LIST, Value::Null).await?,
-            ProfileCommand::Get { profile_id } => {
-                client
-                    .call(method::PROFILE_GET, json!({"profile_id": profile_id}))
-                    .await?
-            }
-            ProfileCommand::Create {
-                name,
-                game,
-                width,
-                height,
-            } => {
-                let profile = Profile::new(name, game, *width, *height);
-                client
-                    .call(method::PROFILE_CREATE, json!({"profile": profile}))
-                    .await?
-            }
-            ProfileCommand::Duplicate { profile_id, name } => {
+    let value =
+        match &cli.command {
+            Command::Version => client.call(method::VERSION, Value::Null).await?,
+            Command::Status => client.call(method::STATUS, Value::Null).await?,
+            Command::State => client.call(method::STATE_GET, Value::Null).await?,
+            Command::Shutdown => client.call(method::SHUTDOWN, Value::Null).await?,
+            Command::Profile { command } => match command {
+                ProfileCommand::List => client.call(method::PROFILE_LIST, Value::Null).await?,
+                ProfileCommand::Get { profile_id } => {
+                    client
+                        .call(method::PROFILE_GET, json!({"profile_id": profile_id}))
+                        .await?
+                }
+                ProfileCommand::Create {
+                    name,
+                    game,
+                    width,
+                    height,
+                } => {
+                    let profile = Profile::new(name, game, *width, *height);
+                    client
+                        .call(method::PROFILE_CREATE, json!({"profile": profile}))
+                        .await?
+                }
+                ProfileCommand::Duplicate { profile_id, name } => {
+                    client
+                        .call(
+                            method::PROFILE_DUPLICATE,
+                            json!({"profile_id":profile_id,"name":name}),
+                        )
+                        .await?
+                }
+                ProfileCommand::Activate { profile_id } => {
+                    client
+                        .call(method::PROFILE_ACTIVATE, json!({"profile_id":profile_id}))
+                        .await?
+                }
+                ProfileCommand::Trash { profile_id } => {
+                    client
+                        .call(method::PROFILE_TRASH, json!({"profile_id":profile_id}))
+                        .await?
+                }
+                ProfileCommand::Restore { profile_id } => {
+                    client
+                        .call(method::PROFILE_RESTORE, json!({"profile_id":profile_id}))
+                        .await?
+                }
+                ProfileCommand::Import { path } => {
+                    client
+                        .call(method::PROFILE_IMPORT, json!({"path":path}))
+                        .await?
+                }
+                ProfileCommand::Export { profile_id, path } => {
+                    client
+                        .call(
+                            method::PROFILE_EXPORT,
+                            json!({"profile_id":profile_id,"path":path}),
+                        )
+                        .await?
+                }
+                ProfileCommand::Validate { .. } => unreachable!(),
+            },
+            Command::Capture { command } => execute_capture(&mut client, command).await?,
+            Command::Events { .. } => unreachable!(),
+            Command::Replay { .. } => {
                 client
                     .call(
-                        method::PROFILE_DUPLICATE,
-                        json!({"profile_id":profile_id,"name":name}),
+                        method::REPLAY_EVALUATE,
+                        serde_json::to_value(replay_manifest.as_ref().ok_or_else(|| {
+                            CliError::Replay("internal manifest routing error".into())
+                        })?)
+                        .map_err(|error| CliError::Replay(error.to_string()))?,
                     )
                     .await?
             }
-            ProfileCommand::Activate { profile_id } => {
-                client
-                    .call(method::PROFILE_ACTIVATE, json!({"profile_id":profile_id}))
-                    .await?
-            }
-            ProfileCommand::Trash { profile_id } => {
-                client
-                    .call(method::PROFILE_TRASH, json!({"profile_id":profile_id}))
-                    .await?
-            }
-            ProfileCommand::Restore { profile_id } => {
-                client
-                    .call(method::PROFILE_RESTORE, json!({"profile_id":profile_id}))
-                    .await?
-            }
-            ProfileCommand::Import { path } => {
-                client
-                    .call(method::PROFILE_IMPORT, json!({"path":path}))
-                    .await?
-            }
-            ProfileCommand::Export { profile_id, path } => {
-                client
+            Command::Diagnostic { command } => match command {
+                DiagnosticCommand::Plan {
+                    profile_id,
+                    element_ids,
+                } => {
+                    client
+                        .call(
+                            method::DIAGNOSTIC_PLAN,
+                            json!({"profile_id":profile_id,"selected_element_ids":element_ids}),
+                        )
+                        .await?
+                }
+                DiagnosticCommand::Export {
+                    path,
+                    profile_id,
+                    element_ids,
+                    expected_total_bytes,
+                    privacy_reviewed,
+                } => client
                     .call(
-                        method::PROFILE_EXPORT,
-                        json!({"profile_id":profile_id,"path":path}),
+                        method::DIAGNOSTIC_EXPORT,
+                        json!({
+                            "path":path,
+                            "bundle":{"profile_id":profile_id,"selected_element_ids":element_ids},
+                            "privacy_reviewed":privacy_reviewed,
+                            "expected_total_uncompressed_bytes":expected_total_bytes,
+                        }),
                     )
-                    .await?
-            }
-            ProfileCommand::Validate { .. } => unreachable!(),
-        },
-        Command::Capture { command } => execute_capture(&mut client, command).await?,
-        Command::Events { .. } => unreachable!(),
-        Command::Replay { .. } => {
-            client
-                .call(
-                    method::REPLAY_EVALUATE,
-                    serde_json::to_value(replay_manifest.as_ref().ok_or_else(|| {
-                        CliError::Replay("internal manifest routing error".into())
-                    })?)
-                    .map_err(|error| CliError::Replay(error.to_string()))?,
-                )
-                .await?
-        }
-    };
+                    .await?,
+            },
+        };
     Ok(value)
 }
 
@@ -385,6 +444,33 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn diagnostic_export_requires_explicit_review_inputs() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "diagnostic",
+            "export",
+            "/tmp/diagnostic.zip",
+            "--expected-total-bytes",
+            "123",
+            "--privacy-reviewed",
+        ])
+        .unwrap();
+        let Command::Diagnostic {
+            command:
+                DiagnosticCommand::Export {
+                    expected_total_bytes,
+                    privacy_reviewed,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("diagnostic command was not parsed");
+        };
+        assert_eq!(expected_total_bytes, 123);
+        assert!(privacy_reviewed);
+    }
     use yash_app_eventsd::{run, ServerConfig};
 
     #[test]

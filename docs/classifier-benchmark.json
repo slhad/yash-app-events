@@ -1,0 +1,12 @@
+{
+  "accuracy": 1.0,
+  "cpu_ticks": 26,
+  "evaluations": 80000,
+  "iterations": 10000,
+  "mean_confidence": 0.533599466085434,
+  "mean_latency_ms": 0.0033274237375,
+  "model": "hud_icon.onnx",
+  "model_sha256": "12ac2f734bbe111526ef82db676086b75a30635a28c2ab8a032a1b1f10759fc6",
+  "peak_rss_kib": 26792,
+  "schema": 1
+}

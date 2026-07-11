@@ -10,6 +10,12 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod diagnostic;
+pub use diagnostic::{
+    export_diagnostic_bundle, plan_diagnostic_bundle, DiagnosticBundle, DiagnosticCrop,
+    DiagnosticError, DiagnosticLimits, DiagnosticPlan,
+};
+
 /// Current event and state output schema version.
 pub const OUTPUT_SCHEMA_VERSION: u16 = 1;
 
@@ -224,6 +230,17 @@ mod tests {
                 "\n"
             )
         );
+    }
+
+    #[test]
+    fn updated_transition_has_a_stable_external_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut record = event(107);
+        record.state = EventState::Updated;
+        let mut writer = OutputWriter::new(directory.path(), OutputConfig::default());
+        writer.append_event(&record).unwrap();
+        let contents = fs::read_to_string(directory.path().join("events.jsonl")).unwrap();
+        assert!(contents.contains("\"state\":\"updated\""));
     }
 
     #[test]

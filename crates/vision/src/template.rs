@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use yash_app_events_capture::Frame;
 use yash_app_events_profile::NormalizedRegion;
 
-use crate::{grayscale_crop, Detection, DetectionStatus, Detector, GrayImage, PreprocessPipeline};
+use crate::{
+    grayscale_crop, Detection, DetectionStatus, DetectionValue, Detector, GrayImage,
+    PreprocessPipeline,
+};
 
 /// One named grayscale template and optional row-major mask.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -80,7 +83,9 @@ impl Detector for TemplateDetector {
             return Detection::unknown("all templates exceed processed crop dimensions");
         };
         Detection {
-            value: Some(f64::from(score >= self.config.threshold)),
+            value: Some(DetectionValue::Number(f64::from(
+                score >= self.config.threshold,
+            ))),
             confidence: Some(score),
             status: DetectionStatus::Valid,
             diagnostic: format!("best template {name} at {x},{y} score {score:.4}"),
@@ -193,7 +198,7 @@ mod tests {
                 height: 1.0,
             },
         );
-        assert_eq!(result.value, Some(1.0));
+        assert_eq!(result.value, Some(DetectionValue::Number(1.0)));
         assert!(result.diagnostic.contains("cross"));
     }
 }

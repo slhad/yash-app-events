@@ -6,6 +6,11 @@ installed profile element; `values` are detector-specific synthetic samples spac
 100 ms apart. The daemon builds frames from those samples and sends them through the
 same configured detector, scheduler, and event rule used by live capture.
 
+For OCR and classifier profiles, replace `values` with `image_frames`, a list of
+profile-relative PNG assets. Exactly one input list must contain 1–10,000 entries.
+Image paths cannot be absolute or traverse parents; files are capped at 16 MiB and
+decoded images must be 8-bit grayscale/RGB/RGBA at no more than 4096×4096.
+
 ```json
 {
   "schema": 1,
@@ -24,6 +29,20 @@ same configured detector, scheduler, and event rule used by live capture.
 }
 ```
 
+Image example:
+
+```json
+{
+  "schema": 1,
+  "profile_id": "00000000-0000-0000-0000-000000000001",
+  "element_id": "00000000-0000-0000-0000-000000000002",
+  "image_frames": ["replay/menu.png", "replay/victory.png"],
+  "expected_events": [
+    {"event":"victory","state":"entered","timestamp_ms":100,"tolerance_ms":0}
+  ]
+}
+```
+
 Run `yash-eventsctl --json replay manifest.json`. The JSON result contains observed
 events and event-level precision, recall, duplicates, misses, and mean absolute
 latency. Exit status 7 means the configured thresholds were not met. Invalid schema,
@@ -35,6 +54,7 @@ Synthetic values mean:
 - color bar: filled tenths from 0 through 10;
 - template: zero produces an inverted template and any nonzero value the template;
 - region change: grayscale intensity from 0 through 255.
+- OCR/classifier: bounded profile-relative PNG frames through `image_frames`.
 
 Replay evaluation never writes captures. The older replay RPC that demonstrates
 durable output remains separate because evaluation must not contaminate live output.

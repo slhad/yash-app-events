@@ -13,12 +13,14 @@ Implemented controls include:
 - portal source selection, stop, metrics, opt-in preview, and freeze;
 - aspect-preserving preview, zoom, pan, draw/select/move/resize/duplicate regions,
   enable state, labels, normalized coordinates, and reference-pixel sizes.
+- numeric, boolean, text, stable-duration, composed, initial, and updated event rules;
+- deterministic, OCR, and portable ONNX classifier configuration and diagnostics;
+- diagnostic bundle entry/size/privacy review and confirmed export.
 
 Preview is a per-connection lease. The daemon downsamples to at most 320×180 and
 returns a compressed PNG from a clone of the latest frame; detector input is unchanged.
 Disconnecting the GUI drops the lease automatically, and preview never writes a file.
 
 Automated evidence includes normalized interaction tests, preview lease/downscale PNG
-tests, strict workspace Clippy/tests, and a five-second native Wayland launch alongside
-the daemon on 2026-07-11. Live picker/preview interaction remains part of the manual
-capture smoke gate.
+tests, strict workspace Clippy/tests, and native Wayland picker/preview/configuration
+acceptance alongside the daemon on 2026-07-11.

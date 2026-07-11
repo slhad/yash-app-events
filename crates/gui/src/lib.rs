@@ -11,8 +11,9 @@ use eframe::egui;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
-    BarDirection, Detector, DetectorId, Element, ElementId, EventRule, NormalizedRegion,
-    PreprocessOperation, Profile, ProfileStore, RuleId,
+    AtomicRulePredicate, BarDirection, Detector, DetectorId, Element, ElementId, EventRule,
+    NormalizedRegion, ObservationCondition, PreprocessOperation, Profile, ProfileStore, RuleId,
+    RulePredicate,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -33,6 +34,8 @@ enum RequestKind {
     DetectorTest,
     TemplateCapture,
     Replay,
+    DiagnosticPlan,
+    DiagnosticExport,
 }
 
 #[derive(Debug)]
@@ -311,6 +314,9 @@ pub struct App {
     replay_frame: usize,
     replay_playing: bool,
     replay_last_step: Instant,
+    diagnostic_path: String,
+    diagnostic_plan: Value,
+    diagnostic_privacy_reviewed: bool,
 }
 
 impl fmt::Debug for App {
@@ -376,6 +382,9 @@ impl App {
             replay_frame: 0,
             replay_playing: false,
             replay_last_step: Instant::now(),
+            diagnostic_path: String::new(),
+            diagnostic_plan: json!({}),
+            diagnostic_privacy_reviewed: false,
         }
     }
 
@@ -496,6 +505,10 @@ impl App {
                         RequestKind::Replay => {
                             self.replay_result = value;
                             self.replay_frame = 0;
+                        }
+                        RequestKind::DiagnosticPlan | RequestKind::DiagnosticExport => {
+                            self.diagnostic_plan = value;
+                            self.diagnostic_privacy_reviewed = false;
                         }
                     }
                 }
@@ -631,6 +644,45 @@ impl App {
                 ui.horizontal(|ui| { ui.label("Import"); ui.text_edit_singleline(&mut self.import_path); if ui.button("Go").clicked() { self.worker.send(RequestKind::Mutation,method::PROFILE_IMPORT,json!({"path":self.import_path})); } });
                 ui.horizontal(|ui| { ui.label("Export"); ui.text_edit_singleline(&mut self.export_path); if ui.button("Go").clicked() { self.worker.send(RequestKind::Mutation,method::PROFILE_EXPORT,json!({"profile_id":profile.id,"path":self.export_path})); } });
                 ui.horizontal(|ui| { ui.label("Restore ID"); ui.text_edit_singleline(&mut self.restore_id); if ui.button("Go").clicked() { self.worker.send(RequestKind::Mutation,method::PROFILE_RESTORE,json!({"profile_id":self.restore_id})); } });
+                ui.collapsing("Diagnostic bundle", |ui| {
+                    let selected_element_ids: Vec<_> = self
+                        .selected_region
+                        .and_then(|index| profile.elements.get(index))
+                        .map(|element| vec![element.id])
+                        .unwrap_or_default();
+                    ui.label("Freeze the preview and select a zone to include its crop. Full screenshots, tokens, and machine capture bindings are excluded.");
+                    if ui.button("Review exact contents").clicked() {
+                        self.worker.send(
+                            RequestKind::DiagnosticPlan,
+                            method::DIAGNOSTIC_PLAN,
+                            json!({"profile_id":profile.id,"selected_element_ids":selected_element_ids}),
+                        );
+                    }
+                    if let Some(entries) = self.diagnostic_plan["entries"].as_array() {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            self.diagnostic_plan["privacy_warning"].as_str().unwrap_or("Review all diagnostic entries before export."),
+                        );
+                        for entry in entries {
+                            ui.label(format!("{} · {} bytes{}", entry["path"].as_str().unwrap_or("?"), entry["bytes"].as_u64().unwrap_or(0), if entry["user_selected_image"].as_bool().unwrap_or(false) { " · selected image" } else { "" }));
+                        }
+                        ui.label(format!("Total uncompressed: {} bytes", self.diagnostic_plan["total_uncompressed_bytes"].as_u64().unwrap_or(0)));
+                        ui.checkbox(&mut self.diagnostic_privacy_reviewed, "I reviewed every listed entry and selected crop");
+                        ui.text_edit_singleline(&mut self.diagnostic_path);
+                        if ui.add_enabled(self.diagnostic_privacy_reviewed && !self.diagnostic_path.is_empty(), egui::Button::new("Export reviewed bundle")).clicked() {
+                            self.worker.send(
+                                RequestKind::DiagnosticExport,
+                                method::DIAGNOSTIC_EXPORT,
+                                json!({
+                                    "path":self.diagnostic_path,
+                                    "bundle":{"profile_id":profile.id,"selected_element_ids":selected_element_ids},
+                                    "privacy_reviewed":true,
+                                    "expected_total_uncompressed_bytes":self.diagnostic_plan["total_uncompressed_bytes"],
+                                }),
+                            );
+                        }
+                    }
+                });
             }
         });
     }
@@ -829,6 +881,8 @@ impl App {
                         Detector::ColorBar { .. } => "color bar",
                         Detector::Template { .. } => "template",
                         Detector::RegionChange { .. } => "region change",
+                        Detector::Ocr { .. } => "OCR",
+                        Detector::Classifier { .. } => "classifier",
                     };
                     let label = format!(
                         "{} · {}{}",
@@ -926,6 +980,8 @@ impl App {
             Detector::ColorBar { .. } => "Color bar",
             Detector::Template { .. } => "Template",
             Detector::RegionChange { .. } => "Region change",
+            Detector::Ocr { .. } => "OCR",
+            Detector::Classifier { .. } => "Classifier",
         };
         let mut chosen = current;
         egui::ComboBox::from_label("Detector type")
@@ -934,6 +990,8 @@ impl App {
                 ui.selectable_value(&mut chosen, "Color bar", "Color bar");
                 ui.selectable_value(&mut chosen, "Template", "Template");
                 ui.selectable_value(&mut chosen, "Region change", "Region change");
+                ui.selectable_value(&mut chosen, "OCR", "OCR");
+                ui.selectable_value(&mut chosen, "Classifier", "Classifier");
             });
         if chosen != current {
             profile.elements[index].detector = match chosen {
@@ -948,6 +1006,29 @@ impl App {
                     id: DetectorId::new(),
                     threshold: 0.1,
                     preprocessing: Vec::new(),
+                },
+                "OCR" => Detector::Ocr {
+                    id: DetectorId::new(),
+                    language: "eng".into(),
+                    page_segmentation_mode: 7,
+                    character_whitelist: None,
+                    change_trigger_threshold: 0.02,
+                    maximum_interval_ms: 1_000,
+                    preprocessing: Vec::new(),
+                },
+                "Classifier" => Detector::Classifier {
+                    id: DetectorId::new(),
+                    model: PathBuf::from("models/classifier.onnx"),
+                    model_sha256: "0".repeat(64),
+                    labels: vec!["absent".into(), "present".into()],
+                    input_width: 8,
+                    input_height: 8,
+                    preprocessing: vec![PreprocessOperation::Resize {
+                        width: 8,
+                        height: 8,
+                    }],
+                    change_trigger_threshold: 0.02,
+                    maximum_interval_ms: 1_000,
                 },
                 _ => Detector::ColorBar {
                     id: DetectorId::new(),
@@ -1033,6 +1114,121 @@ impl App {
                     .changed();
                 preprocessing_editor(ui, preprocessing, &mut changed);
             }
+            Detector::Ocr {
+                language,
+                page_segmentation_mode,
+                character_whitelist,
+                change_trigger_threshold,
+                maximum_interval_ms,
+                preprocessing,
+                ..
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("Tesseract language");
+                    changed |= ui.text_edit_singleline(language).changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(page_segmentation_mode)
+                                .range(0..=13)
+                                .prefix("page mode "),
+                        )
+                        .changed();
+                });
+                let mut whitelist_enabled = character_whitelist.is_some();
+                if ui
+                    .checkbox(&mut whitelist_enabled, "Restrict recognized characters")
+                    .changed()
+                {
+                    *character_whitelist = whitelist_enabled.then(String::new);
+                    changed = true;
+                }
+                if let Some(whitelist) = character_whitelist {
+                    ui.horizontal(|ui| {
+                        ui.label("Character whitelist");
+                        changed |= ui.text_edit_singleline(whitelist).changed();
+                    });
+                }
+                changed |= ui
+                    .add(
+                        egui::Slider::new(change_trigger_threshold, 0.0..=1.0)
+                            .text("Run when crop change exceeds"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(maximum_interval_ms)
+                            .range(100..=60_000)
+                            .prefix("refresh at least every ms "),
+                    )
+                    .changed();
+                preprocessing_editor(ui, preprocessing, &mut changed);
+            }
+            Detector::Classifier {
+                model,
+                model_sha256,
+                labels,
+                input_width,
+                input_height,
+                preprocessing,
+                change_trigger_threshold,
+                maximum_interval_ms,
+                ..
+            } => {
+                let mut model_text = model.to_string_lossy().into_owned();
+                ui.horizontal(|ui| {
+                    ui.label("Profile-relative ONNX model");
+                    if ui.text_edit_singleline(&mut model_text).changed() {
+                        *model = PathBuf::from(&model_text);
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Model SHA-256");
+                    changed |= ui.text_edit_singleline(model_sha256).changed();
+                });
+                let mut labels_text = labels.join(",");
+                ui.horizontal(|ui| {
+                    ui.label("Labels (output order)");
+                    if ui.text_edit_singleline(&mut labels_text).changed() {
+                        *labels = labels_text
+                            .split(',')
+                            .map(str::trim)
+                            .map(str::to_owned)
+                            .collect();
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(input_width)
+                                .range(1..=4_096)
+                                .prefix("width "),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(input_height)
+                                .range(1..=4_096)
+                                .prefix("height "),
+                        )
+                        .changed();
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(change_trigger_threshold, 0.0..=1.0)
+                            .text("Run when crop change exceeds"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(maximum_interval_ms)
+                            .range(100..=60_000)
+                            .prefix("refresh at least every ms "),
+                    )
+                    .changed();
+                preprocessing_editor(ui, preprocessing, &mut changed);
+            }
         }
         if changed {
             self.mark_dirty();
@@ -1094,31 +1290,110 @@ impl App {
                 required_samples: 2,
                 sample_window: 3,
                 cooldown_ms: 500,
+                predicate: yash_app_events_profile::RulePredicate::default(),
+                stable_for_ms: 0,
+                emit_initial: false,
+                update_interval_ms: None,
             });
             self.mark_dirty();
         }
         if let Some(rule_index) = rule_index {
+            let element_options: Vec<_> = profile
+                .elements
+                .iter()
+                .map(|element| (element.id, element.name.clone()))
+                .collect();
             let rule = &mut profile.rules[rule_index];
             let mut rule_changed = false;
             ui.horizontal(|ui| {
                 ui.label("Event name");
                 rule_changed |= ui.text_edit_singleline(&mut rule.event).changed();
             });
+            egui::ComboBox::from_label("Observation predicate")
+                .selected_text(rule_predicate_name(&rule.predicate))
+                .show_ui(ui, |ui| {
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::Numeric,
+                        "Numeric below",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::Boolean,
+                        "Boolean appearance",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::TextEquals,
+                        "Text equals",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::TextContains,
+                        "Text contains",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::All,
+                        "All observations",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
+                        RulePredicateChoice::Any,
+                        "Any observation",
+                        element_id,
+                    );
+                });
+            match &mut rule.predicate {
+                RulePredicate::NumericBelow => {
+                    ui.horizontal(|ui| {
+                        rule_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut rule.enter_below)
+                                    .speed(0.01)
+                                    .prefix("enter < "),
+                            )
+                            .changed();
+                        rule_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut rule.leave_above)
+                                    .speed(0.01)
+                                    .prefix("leave > "),
+                            )
+                            .changed();
+                    });
+                }
+                RulePredicate::Boolean { expected } => {
+                    rule_changed |= ui.checkbox(expected, "Expected value").changed();
+                }
+                RulePredicate::TextEquals { expected } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Expected text");
+                        rule_changed |= ui.text_edit_singleline(expected).changed();
+                    });
+                }
+                RulePredicate::TextContains { needle } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Required substring");
+                        rule_changed |= ui.text_edit_singleline(needle).changed();
+                    });
+                }
+                RulePredicate::All { conditions } | RulePredicate::Any { conditions } => {
+                    rule_changed |= composition_editor(ui, conditions, &element_options);
+                }
+            }
             ui.horizontal(|ui| {
-                rule_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut rule.enter_below)
-                            .speed(0.01)
-                            .prefix("enter < "),
-                    )
-                    .changed();
-                rule_changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut rule.leave_above)
-                            .speed(0.01)
-                            .prefix("leave > "),
-                    )
-                    .changed();
                 rule_changed |= ui
                     .add(
                         egui::Slider::new(&mut rule.minimum_confidence, 0.0..=1.0)
@@ -1144,14 +1419,40 @@ impl App {
                 rule_changed |= ui
                     .add(egui::DragValue::new(&mut rule.cooldown_ms).prefix("cooldown ms "))
                     .changed();
+                rule_changed |= ui
+                    .add(egui::DragValue::new(&mut rule.stable_for_ms).prefix("stable ms "))
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                rule_changed |= ui
+                    .checkbox(&mut rule.emit_initial, "Emit initial state")
+                    .changed();
+                let mut updates_enabled = rule.update_interval_ms.is_some();
+                if ui
+                    .checkbox(&mut updates_enabled, "Emit active updates")
+                    .changed()
+                {
+                    rule.update_interval_ms = updates_enabled.then_some(1_000);
+                    rule_changed = true;
+                }
+                if let Some(interval) = &mut rule.update_interval_ms {
+                    rule_changed |= ui
+                        .add(
+                            egui::DragValue::new(interval)
+                                .range(1..=u64::MAX)
+                                .prefix("every ms "),
+                        )
+                        .changed();
+                }
             });
             rule.sample_window = rule.sample_window.max(rule.required_samples);
             ui.label(format!(
-                "state={} · hysteresis {:.3} · evidence {} of {} · cooldown {} ms",
+                "state={} · predicate={} · evidence {} of {} · stable {} ms · cooldown {} ms",
                 self.state["events"][&rule.event],
-                rule.leave_above - rule.enter_below,
+                rule_predicate_name(&rule.predicate),
                 rule.required_samples,
                 rule.sample_window,
+                rule.stable_for_ms,
                 rule.cooldown_ms
             ));
             if rule_changed {
@@ -1433,6 +1734,203 @@ fn preprocessing_editor(
         ui.small(format!("{operation:?}"));
     }
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RulePredicateChoice {
+    Numeric,
+    Boolean,
+    TextEquals,
+    TextContains,
+    All,
+    Any,
+}
+
+fn rule_predicate_choice(predicate: &RulePredicate) -> RulePredicateChoice {
+    match predicate {
+        RulePredicate::NumericBelow => RulePredicateChoice::Numeric,
+        RulePredicate::Boolean { .. } => RulePredicateChoice::Boolean,
+        RulePredicate::TextEquals { .. } => RulePredicateChoice::TextEquals,
+        RulePredicate::TextContains { .. } => RulePredicateChoice::TextContains,
+        RulePredicate::All { .. } => RulePredicateChoice::All,
+        RulePredicate::Any { .. } => RulePredicateChoice::Any,
+    }
+}
+
+fn rule_predicate_name(predicate: &RulePredicate) -> &'static str {
+    match rule_predicate_choice(predicate) {
+        RulePredicateChoice::Numeric => "numeric below",
+        RulePredicateChoice::Boolean => "boolean appearance",
+        RulePredicateChoice::TextEquals => "text equals",
+        RulePredicateChoice::TextContains => "text contains",
+        RulePredicateChoice::All => "all observations",
+        RulePredicateChoice::Any => "any observation",
+    }
+}
+
+fn predicate_choice(
+    ui: &mut egui::Ui,
+    predicate: &mut RulePredicate,
+    choice: RulePredicateChoice,
+    label: &str,
+    element_id: ElementId,
+) -> bool {
+    if !ui
+        .selectable_label(rule_predicate_choice(predicate) == choice, label)
+        .clicked()
+    {
+        return false;
+    }
+    if rule_predicate_choice(predicate) != choice {
+        *predicate = match choice {
+            RulePredicateChoice::Numeric => RulePredicate::NumericBelow,
+            RulePredicateChoice::Boolean => RulePredicate::Boolean { expected: true },
+            RulePredicateChoice::TextEquals => RulePredicate::TextEquals {
+                expected: "text".into(),
+            },
+            RulePredicateChoice::TextContains => RulePredicate::TextContains {
+                needle: "text".into(),
+            },
+            RulePredicateChoice::All => RulePredicate::All {
+                conditions: vec![ObservationCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                }],
+            },
+            RulePredicateChoice::Any => RulePredicate::Any {
+                conditions: vec![ObservationCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                }],
+            },
+        };
+        return true;
+    }
+    false
+}
+
+fn composition_editor(
+    ui: &mut egui::Ui,
+    conditions: &mut Vec<ObservationCondition>,
+    elements: &[(ElementId, String)],
+) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    for (index, condition) in conditions.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("condition_element", index))
+                    .selected_text(
+                        elements
+                            .iter()
+                            .find(|(id, _)| *id == condition.element_id)
+                            .map_or("missing element", |(_, name)| name),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (id, name) in elements {
+                            changed |= ui
+                                .selectable_value(&mut condition.element_id, *id, name)
+                                .changed();
+                        }
+                    });
+                let mut kind = atomic_predicate_kind(&condition.predicate);
+                egui::ComboBox::from_id_salt(("condition_kind", index))
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in AtomicPredicateKind::ALL {
+                            changed |= ui
+                                .selectable_value(&mut kind, candidate, candidate.label())
+                                .changed();
+                        }
+                    });
+                if kind != atomic_predicate_kind(&condition.predicate) {
+                    condition.predicate = kind.default_predicate();
+                }
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            match &mut condition.predicate {
+                AtomicRulePredicate::Boolean { expected } => {
+                    changed |= ui.checkbox(expected, "Expected value").changed();
+                }
+                AtomicRulePredicate::TextEquals { expected } => {
+                    changed |= ui.text_edit_singleline(expected).changed();
+                }
+                AtomicRulePredicate::TextContains { needle } => {
+                    changed |= ui.text_edit_singleline(needle).changed();
+                }
+                AtomicRulePredicate::NumericBelow { threshold_micros } => {
+                    changed |= ui
+                        .add(egui::DragValue::new(threshold_micros).prefix("threshold µ "))
+                        .changed();
+                }
+            }
+        });
+    }
+    if let Some(index) = remove {
+        conditions.remove(index);
+        changed = true;
+    }
+    if conditions.len() < 16 && ui.button("Add observation condition").clicked() {
+        conditions.push(ObservationCondition {
+            element_id: elements.first().map_or_else(ElementId::new, |(id, _)| *id),
+            predicate: AtomicRulePredicate::Boolean { expected: true },
+        });
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AtomicPredicateKind {
+    Boolean,
+    TextEquals,
+    TextContains,
+    NumericBelow,
+}
+
+impl AtomicPredicateKind {
+    const ALL: [Self; 4] = [
+        Self::Boolean,
+        Self::TextEquals,
+        Self::TextContains,
+        Self::NumericBelow,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::TextEquals => "text equals",
+            Self::TextContains => "text contains",
+            Self::NumericBelow => "numeric below",
+        }
+    }
+
+    fn default_predicate(self) -> AtomicRulePredicate {
+        match self {
+            Self::Boolean => AtomicRulePredicate::Boolean { expected: true },
+            Self::TextEquals => AtomicRulePredicate::TextEquals {
+                expected: "text".into(),
+            },
+            Self::TextContains => AtomicRulePredicate::TextContains {
+                needle: "text".into(),
+            },
+            Self::NumericBelow => AtomicRulePredicate::NumericBelow {
+                threshold_micros: 200_000,
+            },
+        }
+    }
+}
+
+fn atomic_predicate_kind(predicate: &AtomicRulePredicate) -> AtomicPredicateKind {
+    match predicate {
+        AtomicRulePredicate::Boolean { .. } => AtomicPredicateKind::Boolean,
+        AtomicRulePredicate::TextEquals { .. } => AtomicPredicateKind::TextEquals,
+        AtomicRulePredicate::TextContains { .. } => AtomicPredicateKind::TextContains,
+        AtomicRulePredicate::NumericBelow { .. } => AtomicPredicateKind::NumericBelow,
+    }
+}
+
 fn normalized_point(
     canvas: egui::Rect,
     zoom: f32,
