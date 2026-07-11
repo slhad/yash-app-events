@@ -299,6 +299,122 @@ pub enum TransitionState {
     Left,
 }
 
+/// Versioned, redistributable synthetic replay fixture.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReplayManifest {
+    pub schema: u32,
+    pub profile_id: yash_app_events_profile::ProfileId,
+    pub element_id: ElementId,
+    /// Detector-specific synthetic fixture values, sampled every 100 ms.
+    pub values: Vec<u8>,
+    pub expected_events: Vec<ExpectedEvent>,
+    #[serde(default)]
+    pub regression: ReplayRegression,
+}
+
+/// An expected transition annotation and its matching tolerance.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExpectedEvent {
+    pub event: String,
+    pub state: TransitionState,
+    pub timestamp_ms: u64,
+    #[serde(default = "default_event_tolerance_ms")]
+    pub tolerance_ms: u64,
+}
+
+const fn default_event_tolerance_ms() -> u64 {
+    100
+}
+
+/// Optional acceptance thresholds used by CLI/CI regression checks.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReplayRegression {
+    pub minimum_precision: f64,
+    pub minimum_recall: f64,
+    pub maximum_mean_latency_ms: Option<f64>,
+}
+
+impl Default for ReplayRegression {
+    fn default() -> Self {
+        Self {
+            minimum_precision: 1.0,
+            minimum_recall: 1.0,
+            maximum_mean_latency_ms: None,
+        }
+    }
+}
+
+/// Event-level replay evaluation result.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReplayMetrics {
+    pub expected: usize,
+    pub observed: usize,
+    pub matched: usize,
+    pub duplicates: usize,
+    pub misses: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub mean_latency_ms: Option<f64>,
+    pub passed: bool,
+}
+
+/// Matches observed transitions to annotations deterministically in expected order.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn evaluate_replay(
+    expected: &[ExpectedEvent],
+    observed: &[Transition],
+    regression: &ReplayRegression,
+) -> ReplayMetrics {
+    let mut used = vec![false; observed.len()];
+    let mut latencies = Vec::new();
+    for annotation in expected {
+        let candidate = observed.iter().enumerate().find(|(index, transition)| {
+            !used[*index]
+                && transition.event == annotation.event
+                && transition.state == annotation.state
+                && transition.timestamp_ms.abs_diff(annotation.timestamp_ms)
+                    <= annotation.tolerance_ms
+        });
+        if let Some((index, transition)) = candidate {
+            used[index] = true;
+            latencies.push(transition.timestamp_ms.abs_diff(annotation.timestamp_ms) as f64);
+        }
+    }
+    let matched = latencies.len();
+    let duplicates = observed.len().saturating_sub(matched);
+    let misses = expected.len().saturating_sub(matched);
+    let precision = ratio(matched, observed.len());
+    let recall = ratio(matched, expected.len());
+    let mean_latency_ms =
+        (!latencies.is_empty()).then(|| latencies.iter().sum::<f64>() / latencies.len() as f64);
+    let latency_passes = regression
+        .maximum_mean_latency_ms
+        .is_none_or(|maximum| mean_latency_ms.is_some_and(|latency| latency <= maximum));
+    ReplayMetrics {
+        expected: expected.len(),
+        observed: observed.len(),
+        matched,
+        duplicates,
+        misses,
+        precision,
+        recall,
+        mean_latency_ms,
+        passed: precision >= regression.minimum_precision
+            && recall >= regression.minimum_recall
+            && latency_passes,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EngineError {
     #[error("analysis FPS must be within 1 through 10")]
@@ -559,5 +675,44 @@ mod tests {
             run(build()),
             vec![TransitionState::Entered, TransitionState::Left]
         );
+    }
+
+    #[test]
+    fn replay_metrics_detect_regressions_and_latency() {
+        let rule_id = RuleId::new();
+        let observed = vec![
+            Transition {
+                rule_id,
+                event: "critical".into(),
+                timestamp_ms: 120,
+                state: TransitionState::Entered,
+                value: 0.1,
+                confidence: 1.0,
+            },
+            Transition {
+                rule_id,
+                event: "critical".into(),
+                timestamp_ms: 125,
+                state: TransitionState::Entered,
+                value: 0.1,
+                confidence: 1.0,
+            },
+        ];
+        let metrics = evaluate_replay(
+            &[ExpectedEvent {
+                event: "critical".into(),
+                state: TransitionState::Entered,
+                timestamp_ms: 100,
+                tolerance_ms: 50,
+            }],
+            &observed,
+            &ReplayRegression::default(),
+        );
+        assert_eq!(
+            (metrics.matched, metrics.duplicates, metrics.misses),
+            (1, 1, 0)
+        );
+        assert_eq!(metrics.mean_latency_ms, Some(20.0));
+        assert!(!metrics.passed);
     }
 }

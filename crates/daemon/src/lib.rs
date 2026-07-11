@@ -20,8 +20,8 @@ use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
 use yash_app_events_engine::{
-    AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig, ProcessedFrame,
-    TransitionState,
+    evaluate_replay, AnalysisScheduler, FrameProcessor, NumericRule, NumericRuleConfig,
+    ProcessedFrame, ReplayManifest, TransitionState,
 };
 use yash_app_events_output::{EventRecord, EventState, OutputConfig, OutputWriter, StateSnapshot};
 use yash_app_events_profile::{
@@ -472,6 +472,8 @@ async fn dispatch(
             .and_then(|params| capture_template(state, &params)),
         method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
             .and_then(|params| run_profile_replay(state, &params)),
+        method::REPLAY_EVALUATE => parse::<ReplayManifest>(request.params)
+            .and_then(|manifest| evaluate_profile_replay(state, &manifest)),
         method::CAPTURE_SELECT => match parse::<CaptureSelectParams>(request.params) {
             Ok(params) => select_capture(state, params).await,
             Err(error) => Err(error),
@@ -913,6 +915,58 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
         &profile.id.to_string(),
         &profile.game,
     )
+}
+
+fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<Value, RpcError> {
+    if manifest.schema != 1 || manifest.values.is_empty() || manifest.values.len() > 10_000 {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "replay schema must be 1 and values must contain 1..=10000 samples",
+        ));
+    }
+    let profile = state
+        .profiles
+        .load(manifest.profile_id)
+        .map_err(store_error)?;
+    let element = profile
+        .elements
+        .iter()
+        .find(|element| element.id == manifest.element_id)
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
+    let rule = profile
+        .rules
+        .iter()
+        .find(|rule| rule.element_id == element.id)
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element has no event rule"))?;
+    let directory = state.profiles.profile_directory(profile.id);
+    let frames = replay_fixture_frames(&element.detector, &directory, &manifest.values)?;
+    let mut processor = FrameProcessor::new(
+        AnalysisScheduler::new(10).map_err(internal_error)?,
+        configured_detector(&element.detector, &directory)?,
+        element.region,
+        detector_id(&element.detector),
+        element.id,
+        NumericRule::new(NumericRuleConfig {
+            id: rule.id,
+            event: rule.event.clone(),
+            enter_below: rule.enter_below,
+            leave_above: rule.leave_above,
+            minimum_confidence: rule.minimum_confidence,
+            required_samples: usize::from(rule.required_samples),
+            sample_window: usize::from(rule.sample_window),
+            cooldown: Duration::from_millis(rule.cooldown_ms),
+        })
+        .map_err(internal_error)?,
+    );
+    let transitions = ReplaySource::new(frames)
+        .filter_map(|frame| processor.process(&frame)?.transition)
+        .collect::<Vec<_>>();
+    let metrics = evaluate_replay(
+        &manifest.expected_events,
+        &transitions,
+        &manifest.regression,
+    );
+    serde_json::to_value(json!({"metrics":metrics,"events":transitions})).map_err(internal_error)
 }
 
 fn replay_fixture_frames(
@@ -1988,6 +2042,19 @@ mod tests {
                     mask: None,
                 },
             });
+        color_profile
+            .rules
+            .push(yash_app_events_profile::EventRule {
+                id: RuleId::new(),
+                element_id: color_element,
+                event: "critical_health".into(),
+                enter_below: 0.2,
+                leave_above: 0.3,
+                minimum_confidence: 0.0,
+                required_samples: 2,
+                sample_window: 3,
+                cooldown_ms: 0,
+            });
         call(
             &mut client,
             2,
@@ -2003,6 +2070,26 @@ mod tests {
         )
         .await;
         assert_eq!(color["result"]["observations"][0]["value"], 0.5);
+        let evaluation = call(
+            &mut client,
+            30,
+            method::REPLAY_EVALUATE,
+            json!({
+                "schema":1,
+                "profile_id":color_profile.id,
+                "element_id":color_element,
+                "values":[8,8,1,1,1,4,4],
+                "expected_events":[
+                    {"event":"critical_health","state":"entered","timestamp_ms":300,"tolerance_ms":0},
+                    {"event":"critical_health","state":"left","timestamp_ms":600,"tolerance_ms":0}
+                ],
+                "regression":{"minimum_precision":1.0,"minimum_recall":1.0,"maximum_mean_latency_ms":0.0}
+            }),
+        )
+        .await;
+        assert_eq!(evaluation["result"]["metrics"]["passed"], true);
+        assert_eq!(evaluation["result"]["metrics"]["matched"], 2);
+        assert_eq!(evaluation["result"]["events"].as_array().unwrap().len(), 2);
 
         let mut template_profile = Profile::new("Template", "synthetic_game", 3, 3);
         let template_element = ElementId::new();

@@ -168,6 +168,7 @@ pub mod method {
     pub const DETECTOR_TEST: &str = "detector.test";
     pub const DETECTOR_CAPTURE_TEMPLATE: &str = "detector.capture_template";
     pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
+    pub const REPLAY_EVALUATE: &str = "replay.evaluate";
     pub const CAPTURE_SELECT: &str = "capture.select";
     pub const CAPTURE_START: &str = "capture.start";
     pub const CAPTURE_STOP: &str = "capture.stop";

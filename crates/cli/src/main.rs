@@ -15,8 +15,17 @@ async fn main() -> ExitCode {
     ) {
         follow(&cli).await
     } else {
-        execute(&cli).await.map(|value| {
+        execute(&cli).await.and_then(|value| {
             println!("{}", format_result(&cli.command, &value, cli.json));
+            if matches!(cli.command, Command::Replay { .. })
+                && !value["metrics"]["passed"].as_bool().unwrap_or(false)
+            {
+                Err(yash_eventsctl::CliError::Replay(
+                    "configured metric thresholds were not met".into(),
+                ))
+            } else {
+                Ok(())
+            }
         })
     };
     match result {

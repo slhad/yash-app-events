@@ -522,9 +522,10 @@ SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/t
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | IN_PROGRESS | output errors are typed/non-panicking and failure-injection tested; daemon status/log/IPC/GUI surfacing pending
 SPEC-DET-002 | VERIFIED | four-direction RGB range/mask detector handles padded stride, partial/scaled bars, noise and brightness variation; profile-backed daemon RPC plus replay produces files/state/subscription events (2026-07-11)
-SPEC-REPLAY-001 | IN_PROGRESS | `ReplaySource` frames feed the same `FrameProcessor<Detector>` boundary intended for live capture; daemon live wiring pending
+SPEC-REPLAY-001 | VERIFIED | live latest-frame and replay manifest paths both feed the configured detector and `FrameProcessor` temporal-rule boundary; daemon integration tests exercise both (2026-07-11)
 SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
-SPEC-REPLAY-003 | IN_PROGRESS | redistributable in-memory synthetic health fixtures cover bounded frames and transitions; repository manifest/fixture format pending
+SPEC-REPLAY-003 | VERIFIED | schema-v1 bounded synthetic manifest format, detector-specific fixture semantics, validation, and redistributable deterministic integration cases are documented in `docs/replay.md` (2026-07-11)
+SPEC-REPLAY-004 | VERIFIED | engine evaluator and daemon/CLI report precision, recall, duplicates, misses, mean event latency, pass/fail thresholds, stable JSON, and regression exit status 7; tests cover passing known events and duplicate regression (2026-07-11)
 SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
 SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)
 SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/best diagnostics and brightness test; profile replay integration asserts entered/left records identical in JSONL and RPC (2026-07-11)

@@ -21,7 +21,15 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
   assets, profile replay, daemon RPC, temporal output, and recorded benchmarks.
   `docs/vision.md` records why measured pure-Rust routines defer the proposed OpenCV
   dependency while retaining replaceable project-owned boundaries.
-- Phases 5–10: not yet complete.
+- Phase 5: implementation complete; interactive portal evidence on two Wayland
+  environments remains outstanding.
+- Phase 6: implementation complete; interactive portal acceptance remains outstanding.
+- Phase 7: in progress. Detector/rule forms, frozen and continuous testing, diagnostic
+  previews, template capture, and a recent timeline are implemented.
+- Phase 8: in progress. Versioned synthetic manifests, common-path daemon evaluation,
+  event metrics, regression thresholds, CLI JSON, and exit status 7 are implemented;
+  GUI replay controls remain outstanding.
+- Phases 9–10: not yet complete. Phase 9 remains optional for the first usable product.
 
 ## Planning principles
 

@@ -16,6 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 yash-app-events-profile = { path = "../profile" }
 yash-app-events-protocol = { path = "../protocol" }
+yash-app-events-engine = { path = "../engine" }
 
 [dev-dependencies]
 tempfile.workspace = true

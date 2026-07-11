@@ -6,6 +6,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use thiserror::Error;
+use yash_app_events_engine::ReplayManifest;
 use yash_app_events_profile::{load_profile, Profile};
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -51,6 +52,8 @@ pub enum Command {
         #[command(subcommand)]
         command: CaptureCommand,
     },
+    /// Evaluate a versioned synthetic replay manifest through the daemon engine.
+    Replay { manifest: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,6 +122,7 @@ pub enum CaptureCommand {
 /// # Errors
 ///
 /// Returns connection, timeout, protocol, RPC, or offline-validation errors.
+#[allow(clippy::too_many_lines)]
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     if let Command::Profile {
         command: ProfileCommand::Validate { path },
@@ -138,6 +142,16 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     ) {
         return Err(CliError::FollowRequiresStream);
     }
+    let replay_manifest = if let Command::Replay { manifest } = &cli.command {
+        let bytes = std::fs::read(manifest)
+            .map_err(|error| CliError::Replay(format!("cannot read manifest: {error}")))?;
+        Some(
+            serde_json::from_slice::<ReplayManifest>(&bytes)
+                .map_err(|error| CliError::Replay(format!("invalid manifest: {error}")))?,
+        )
+    } else {
+        None
+    };
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
     let mut client = UnixRpcClient::connect(
         &socket,
@@ -209,6 +223,17 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         },
         Command::Capture { command } => execute_capture(&mut client, command).await?,
         Command::Events { .. } => unreachable!(),
+        Command::Replay { .. } => {
+            client
+                .call(
+                    method::REPLAY_EVALUATE,
+                    serde_json::to_value(replay_manifest.as_ref().ok_or_else(|| {
+                        CliError::Replay("internal manifest routing error".into())
+                    })?)
+                    .map_err(|error| CliError::Replay(error.to_string()))?,
+                )
+                .await?
+        }
     };
     Ok(value)
 }
@@ -337,6 +362,8 @@ pub enum CliError {
     Validation(String),
     #[error("event follow requires streaming execution")]
     FollowRequiresStream,
+    #[error("replay evaluation failed: {0}")]
+    Replay(String),
 }
 
 impl CliError {
@@ -346,6 +373,7 @@ impl CliError {
             Self::Client(ClientError::Io(_) | ClientError::Disconnected) => 3,
             Self::Client(ClientError::Timeout) => 6,
             Self::Validation(_) => 5,
+            Self::Replay(_) => 7,
             Self::Client(ClientError::Json(_) | ClientError::Rpc(_))
             | Self::FollowRequiresStream => 4,
         }
