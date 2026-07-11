@@ -53,12 +53,17 @@ Local evidence (intentionally ignored by Git because it contains copyrighted gam
 - Color-bar confidence incorrectly equaled fill percentage, suppressing low-health rules.
 - Preview/freeze leases were not restored after worker reconnect.
 - Successful RPC/preview responses did not clear stale GUI error messages.
+- GUI source selection inherited the three-second ordinary RPC deadline. The portal
+  remained interactive after the GUI worker disconnected, leading to a late broken
+  pipe and a misleading compositor-looking failure. `capture.select` now waits up to
+  five minutes on the background worker, disables duplicate selection, and visibly
+  reports that it is waiting for the portal.
 
-## Remaining issue
+## GUI portal-selection retest
 
-Invoking the interactive portal picker from inside the native GUI produced a Hyprland
-Wayland protocol failure (`wl_display: invalid object 7`) after selection and terminated
-the GUI. Starting capture through the CLI/JSON-RPC client and then using GUI preview is
-stable. This remains release-blocking for `SPEC-UI-003`; it needs a separately
-reproducible compositor/parent-window investigation rather than being hidden by the
-successful preview evidence.
+The installed GUI initiated `capture.select` through protocol-v1 and remained connected
+for the complete portal interaction. The restored Hyprland selection became active as
+PipeWire node 199 at 3840×2160, approximately 59.8 input FPS and 9.2 analysis FPS; the
+GUI process remained alive and the daemon log contained no broken pipe or Wayland
+protocol failure. Cancellation/denial acceptance and a second independent portal backend
+remain outstanding for the release-wide capture requirements.

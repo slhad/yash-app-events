@@ -26,6 +26,7 @@ enum RequestKind {
     Draft,
     Mutation,
     Capture,
+    CaptureSelect,
     PreviewStart,
     PreviewStop,
     PreviewFrame,
@@ -169,11 +170,18 @@ impl Worker {
                         };
                         let result = match params {
                             Ok(params) => {
-                                client
-                                    .as_mut()
-                                    .expect("client was initialized")
-                                    .call(request.method, params)
-                                    .await
+                                let client = client.as_mut().expect("client was initialized");
+                                if request.method == method::CAPTURE_SELECT {
+                                    client
+                                        .call_with_timeout(
+                                            request.method,
+                                            params,
+                                            Duration::from_secs(300),
+                                        )
+                                        .await
+                                } else {
+                                    client.call(request.method, params).await
+                                }
                             }
                             Err(error) => {
                                 Err(ClientError::Rpc(yash_app_events_protocol::RpcError::new(
@@ -251,6 +259,7 @@ pub struct App {
     export_path: String,
     restore_id: String,
     capture_status: Value,
+    capture_select_pending: bool,
     preview_enabled: bool,
     frozen: bool,
     preview_pending: bool,
@@ -315,6 +324,7 @@ impl App {
             export_path: String::new(),
             restore_id: String::new(),
             capture_status: json!({}),
+            capture_select_pending: false,
             preview_enabled: false,
             frozen: false,
             preview_pending: false,
@@ -351,6 +361,9 @@ impl App {
                 Payload::Error(error) => {
                     self.error = Some(error);
                     self.preview_pending = false;
+                    if response.kind == RequestKind::CaptureSelect {
+                        self.capture_select_pending = false;
+                    }
                 }
                 Payload::Preview(image) => {
                     self.error = None;
@@ -432,7 +445,12 @@ impl App {
                                 Value::Null,
                             );
                         }
-                        RequestKind::Capture => self.capture_status = value,
+                        RequestKind::Capture | RequestKind::CaptureSelect => {
+                            self.capture_status = value;
+                            if response.kind == RequestKind::CaptureSelect {
+                                self.capture_select_pending = false;
+                            }
+                        }
                         RequestKind::PreviewStart => {
                             self.preview_enabled = value["enabled"].as_bool().unwrap_or(false);
                         }
@@ -595,13 +613,24 @@ impl App {
     fn topbar(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("capture").show(context, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Select source").clicked() {
+                if ui
+                    .add_enabled(
+                        !self.capture_select_pending,
+                        egui::Button::new("Select source"),
+                    )
+                    .clicked()
+                {
                     let profile_id = self.draft.as_ref().map(|profile| profile.id);
+                    self.capture_select_pending = true;
                     self.worker.send(
-                        RequestKind::Capture,
+                        RequestKind::CaptureSelect,
                         method::CAPTURE_SELECT,
                         json!({"source":"window_or_monitor","profile_id":profile_id}),
                     );
+                }
+                if self.capture_select_pending {
+                    ui.spinner();
+                    ui.label("Waiting for portal selection…");
                 }
                 if ui.button("Stop").clicked() {
                     self.worker
