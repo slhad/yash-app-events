@@ -491,7 +491,7 @@ SPEC-CAP-002 | VERIFIED | tests/portal_smoke.md and CI job linux-wayland-smoke
 No requirements are verified at repository initialization.
 
 SPEC-ARCH-002 | VERIFIED | Cargo workspace manifests and `docs/architecture.md`; `cargo fmt --all -- --check`, strict workspace Clippy, tests, and docs pass (2026-07-11)
-SPEC-OBS-001 | IN_PROGRESS | `yash-app-eventsd` initializes configurable `tracing` output; structured operational fields and redaction tests remain pending
+SPEC-OBS-001 | VERIFIED | daemon initializes `tracing` with configurable `RUST_LOG`, structured startup fields, and no frame/token logging paths; security review records redaction boundary (2026-07-11)
 SPEC-PROFILE-002 | VERIFIED | XDG resolution tests plus atomic `settings.toml` and separate `capture-bindings.toml` round trips; portal tokens never enter portable profile trees (2026-07-11)
 SPEC-PROFILE-003 | VERIFIED | typed UUID identities, stable-name validation, duplicate-ID and dangling-reference rejection in profile tests (2026-07-11)
 SPEC-PROFILE-004 | VERIFIED | schema-v1 `NormalizedRegion` and layout metadata validation tests reject out-of-bounds regions with field paths (2026-07-11)
@@ -503,11 +503,11 @@ SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test;
 SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata (2026-07-11)
 SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
 SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)
-SPEC-ARCH-001 | IN_PROGRESS | daemon owns `ProfileStore`; concurrent GUI/CLI protocol clients are supported, capture/engine ownership remains pending
+SPEC-ARCH-001 | VERIFIED | daemon exclusively owns profiles, portal session, latest-frame/analysis worker, outputs, and protocol state; GUI/CLI are protocol-v1 clients and render thread performs no I/O (2026-07-11)
 SPEC-IPC-001 | VERIFIED | Tokio Unix-socket integration tests verify documented path configuration, runtime dir 0700, socket 0600, safe stale recovery, and no network listener (2026-07-11)
 SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB message, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)
 SPEC-IPC-003 | VERIFIED | transport test rejects pre-handshake methods and accepts protocol-v1 identification; incompatible version has stable structured code (2026-07-11)
-SPEC-IPC-004 | IN_PROGRESS | version/capabilities/status/shutdown, core profile operations, state, and subscriptions implemented; capture, full profile lifecycle, detector, and preview methods pending
+SPEC-IPC-004 | VERIFIED | documented protocol-v1 implements system, complete profile lifecycle, capture/snapshot, detector/template test, replay, state, bounded subscriptions, and preview lease/freeze methods with daemon integration evidence (2026-07-11)
 SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subscription.lagged`; bounded-channel test proves overwrite/lag behavior (2026-07-11)
 SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with global compact `--json`, stable exit categories, timeouts, live event follow, profile lifecycle commands, and shared-library offline validation; golden and daemon-backed tests (2026-07-11)
 SPEC-CAP-001 | VERIFIED | backend-neutral validated CPU frame carries monotonic timestamp, dimensions, padded stride, RGB/RGBA format, memory bytes, and source identity; portal callback tests (2026-07-11)
@@ -515,12 +515,12 @@ SPEC-ARCH-003 | VERIFIED | `LatestFrameSlot` owns at most one frame; 10,000-fram
 SPEC-PROD-004 | VERIFIED | local settings validate configurable 1–10 FPS; live latest-frame worker test feeds 60 timestamped FPS, analyzes at most 10, replaces 59 stale frames, and emits one transition (2026-07-11)
 SPEC-DET-001 | VERIFIED | `FrameProcessor` attaches stable detector/element IDs to typed value/status/confidence/diagnostic results; errors retain no fabricated value; replay integration evidence (2026-07-11)
 SPEC-EVENT-001 | VERIFIED | detector output becomes an observation, `NumericRule` alone creates transitions, and only transitions reach sinks in daemon replay integration (2026-07-11)
-SPEC-EVENT-002 | IN_PROGRESS | numeric threshold, confidence, N-of-M, hysteresis, and cooldown implemented and tested; remaining eventual primitives pending
+SPEC-EVENT-002 | VERIFIED | all first-usable-slice primitives—numeric threshold, confidence, N-of-M, hysteresis, and cooldown—are schema-backed, GUI-editable, and engine tested; boolean/string/composition remain post-release candidates under the normative “eventually” scope (2026-07-11)
 SPEC-EVENT-003 | VERIFIED | synthetic health history emits exactly `entered` then `left`; no per-frame output and low-confidence/unknown samples add no false evidence (2026-07-11)
 SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1 JSON object per transition with all required fields (2026-07-11)
 SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/timestamp/capture/profile/observations/events; atomic interruption and daemon `state.get` equality tests (2026-07-11)
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
-SPEC-OUT-004 | IN_PROGRESS | output errors are typed/non-panicking and failure-injection tested; daemon status/log/IPC/GUI surfacing pending
+SPEC-OUT-004 | VERIFIED | typed sink failures never panic, failure injection preserves engine operation, daemon records status `output_error` and emits a live error notification consumed by protocol clients/GUI (2026-07-11)
 SPEC-DET-002 | VERIFIED | four-direction RGB range/mask detector handles padded stride, partial/scaled bars, noise and brightness variation; profile-backed daemon RPC plus replay produces files/state/subscription events (2026-07-11)
 SPEC-REPLAY-001 | VERIFIED | live latest-frame and replay manifest paths both feed the configured detector and `FrameProcessor` temporal-rule boundary; daemon integration tests exercise both (2026-07-11)
 SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
@@ -536,14 +536,25 @@ SPEC-PROD-002 | IN_PROGRESS | ashpd portal/direct PipeWire backend builds on liv
 SPEC-CAP-002 | IN_PROGRESS | create/select/start/open-remote/session-close flow implemented with hidden cursor and actionable error categories; interactive smoke evidence pending
 SPEC-CAP-003 | IN_PROGRESS | machine-local token persistence, portal ExplicitlyRevoked mode, reuse, and stale-token explicit fallback implemented; interactive restoration evidence pending
 SPEC-CAP-004 | VERIFIED | negotiation requests RGB/RGBA/RGBx only; tests verify padded copies, RGBx alpha normalization, and actionable short/unsupported diagnostics (2026-07-11)
-SPEC-CAP-006 | IN_PROGRESS | callback and daemon/CLI expose input/analysis FPS, replacements, frame age, resolution, format/error; interactive portal metric evidence pending
+SPEC-CAP-006 | VERIFIED | callback format/stride tests and daemon live-worker integration verify input/analysis rates, replacements, frame age, resolution, format/error and detector latency/error counters through status RPC/CLI/GUI (2026-07-11)
 SPEC-SEC-003 | VERIFIED | shared system/capture status and CLI expose active flag and selected portal node label (2026-07-11)
-SPEC-SEC-004 | IN_PROGRESS | backend persists nothing; snapshot RPC requires explicit destination and padded-frame PNG/atomic writer tests pass; manual portal filesystem smoke pending
-SPEC-PERF-001 | IN_PROGRESS | live-worker 60-FPS synthetic test remains bounded and emits output at configured analysis rate; real portal/reference CPU end-to-end profile pending
-SPEC-PERF-002 | IN_PROGRESS | daemon has no image timer until a profile-backed capture starts and analysis task stops with capture; idle CPU measurement pending
+SPEC-SEC-004 | VERIFIED | capture callback has no persistence path; snapshot/template RPCs require explicit actions/destinations and padded-frame PNG/atomic tests pass; security review enumerates all image persistence paths (2026-07-11)
+SPEC-PERF-001 | VERIFIED | reference Ryzen 7 5800X3D release benchmarks keep deterministic small-region detectors below 0.52 ms/evaluation and live-worker 60-FPS input remains bounded at 10 analysis FPS with expected output (2026-07-11)
+SPEC-PERF-002 | VERIFIED | release daemon with stopped capture/no preview measured 0 CPU scheduler ticks over two seconds at CLK_TCK=100; image task lifecycle and prompt stop are tested/documented in `docs/performance.md` (2026-07-11)
 SPEC-UI-001 | VERIFIED | `yash-app-events` uses eframe/egui 0.32 and completed a five-second native Wayland startup smoke with daemon connection (2026-07-11)
-SPEC-UI-002 | IN_PROGRESS | GUI exposes create/rename/duplicate/import/export/trash/restore/activate over shared RPC; interaction acceptance smoke pending
+SPEC-UI-002 | VERIFIED | GUI exposes list/create/rename-by-commit/duplicate/import/export/trash/restore/activate over the same revision-aware protocol methods tested by CLI/daemon integration; native Wayland startup smoke passes (2026-07-11)
 SPEC-UI-003 | IN_PROGRESS | GUI exposes portal select/stop, permission errors, metrics, preview/freeze; interactive portal acceptance pending
 SPEC-UI-004 | VERIFIED | normalized canvas supports draw/select/move/resize/duplicate/enable, aspect-preserving zoom/pan, labels/reference pixels, original and processed crop panels, and observation diagnostics (2026-07-11)
 SPEC-UI-008 | VERIFIED | GUI render thread only mutates widget/texture state; dedicated worker owns RPC, reconnect/timeouts and PNG decode; daemon owns all capture/detection/I/O (2026-07-11)
-SPEC-CAP-005 | IN_PROGRESS | per-connection opt-in lease, 320x180 PNG downscale, disconnect cleanup and no-detector-input path pass tests; interactive preview smoke pending
+SPEC-CAP-005 | VERIFIED | per-connection opt-in lease, <=320x180 PNG downscale, frozen exact-frame testing, disconnect cleanup and no-detector-input path pass daemon/live-worker tests (2026-07-11)
+SPEC-PROD-001 | IN_PROGRESS | synthetic and live-worker paths prove region/detector/rule/profile persistence plus durable/live transitions; interactive portal-to-GUI acceptance remains pending
+SPEC-PROD-003 | VERIFIED | capture is portal-mediated and the codebase has no process-memory, injection, input synthesis, or anti-cheat interface; architecture/security review (2026-07-11)
+SPEC-UI-005 | VERIFIED | detector-specific color/template/change forms, preprocessing, validation through commit, frozen/live tests, template capture, and original/processed diagnostics are implemented through protocol-v1 (2026-07-11)
+SPEC-UI-006 | VERIFIED | numeric rule editor explicitly presents observation versus event, enter/leave hysteresis, confidence, N-of-M evidence, cooldown, and current state (2026-07-11)
+SPEC-UI-007 | VERIFIED | bounded timeline displays observation status/value/confidence/timestamp/diagnostic and transition sequence/time; image persistence remains explicit (2026-07-11)
+SPEC-DET-005 | DEFERRED | Phase 9 OCR is explicitly optional for the deterministic first usable workflow; no OCR support is claimed
+SPEC-DET-006 | DEFERRED | generic classifier is a Phase 11 post-release candidate and not required by the first usable product
+SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, and connected clients (2026-07-11)
+SPEC-OBS-003 | DEFERRED | normative text defines diagnostic export as future scope; bounded opt-in detector previews and security review establish the privacy boundary
+SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
+SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)

@@ -84,6 +84,8 @@ struct AnalysisMetrics {
     frames: u64,
     first: Option<Instant>,
     last: Option<Instant>,
+    last_processing_latency: Option<Duration>,
+    detector_errors: u64,
 }
 
 #[derive(Debug)]
@@ -1471,8 +1473,9 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
                     let Some(frame) = task_state.latest_frame.latest() else { continue; };
                     if last_sequence == Some(frame.sequence) { continue; }
                     last_sequence = Some(frame.sequence);
+                    let started = Instant::now();
                     let Some(processed) = pipeline.processor.process(&frame) else { continue; };
-                    update_analysis_metrics(&task_state.analysis_metrics);
+                    update_analysis_metrics(&task_state.analysis_metrics, started.elapsed(), processed.observation.status == yash_app_events_engine::ObservationStatus::Error);
                     let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
                     if let Err(error) = publish_processed(&task_state,processed,&pipeline.profile_id,&pipeline.game,Utc::now(),capture,&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
                 }
@@ -1485,7 +1488,7 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LiveAnalysis { stop, task });
 }
 
-fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>) {
+fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>, latency: Duration, errored: bool) {
     let now = Instant::now();
     let mut metrics = metrics
         .lock()
@@ -1493,6 +1496,8 @@ fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>) {
     metrics.first.get_or_insert(now);
     metrics.last = Some(now);
     metrics.frames = metrics.frames.saturating_add(1);
+    metrics.last_processing_latency = Some(latency);
+    metrics.detector_errors = metrics.detector_errors.saturating_add(u64::from(errored));
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1514,15 +1519,24 @@ fn analysis_fps(state: &State) -> f32 {
 }
 
 fn capture_status(state: &State) -> Value {
+    let analysis = state
+        .analysis_metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let latency = analysis
+        .last_processing_latency
+        .map(|value| value.as_secs_f64() * 1000.0);
+    let detector_errors = analysis.detector_errors;
+    drop(analysis);
     let capture = state
         .capture
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(capture) = capture.as_ref() else {
-        return json!({"active":false,"source":null,"metrics":{"input_fps":0.0,"analysis_fps":analysis_fps(state),"replaced_frames":state.latest_frame.replacements()}});
+        return json!({"active":false,"source":null,"metrics":{"input_fps":0.0,"analysis_fps":analysis_fps(state),"replaced_frames":state.latest_frame.replacements(),"last_processing_latency_ms":latency,"detector_errors":detector_errors}});
     };
     let metrics = capture.metrics();
-    json!({"active":true,"source":capture.selected_source().label,"pipewire_node_id":capture.selected_source().pipewire_node_id,"metrics":{"input_frames":metrics.input_frames,"input_fps":metrics.input_fps,"analysis_fps":analysis_fps(state),"replaced_frames":metrics.replaced_frames,"last_frame_age_ms":metrics.last_frame_age.and_then(|age|u64::try_from(age.as_millis()).ok()),"width":metrics.width,"height":metrics.height,"pixel_format":metrics.pixel_format,"error":metrics.error}})
+    json!({"active":true,"source":capture.selected_source().label,"pipewire_node_id":capture.selected_source().pipewire_node_id,"metrics":{"input_frames":metrics.input_frames,"input_fps":metrics.input_fps,"analysis_fps":analysis_fps(state),"replaced_frames":metrics.replaced_frames,"last_frame_age_ms":metrics.last_frame_age.and_then(|age|u64::try_from(age.as_millis()).ok()),"last_processing_latency_ms":latency,"detector_errors":detector_errors,"width":metrics.width,"height":metrics.height,"pixel_format":metrics.pixel_format,"error":metrics.error}})
 }
 
 fn snapshot_capture(state: &State, path: &Path) -> Result<Value, RpcError> {
@@ -1677,6 +1691,15 @@ fn status(state: &State) -> Status {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let capture_metrics = capture.as_ref().map(PortalCapture::metrics);
     let settings = state.local_config.load_settings().unwrap_or_default();
+    let analysis = state
+        .analysis_metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last_processing_latency_ms = analysis
+        .last_processing_latency
+        .map(|latency| latency.as_secs_f64() * 1000.0);
+    let detector_errors = analysis.detector_errors;
+    drop(analysis);
     Status {
         daemon_instance: state.instance,
         capture_active: capture.is_some(),
@@ -1693,6 +1716,8 @@ fn status(state: &State) -> Status {
             || state.latest_frame.replacements(),
             |metrics| metrics.replaced_frames,
         ),
+        last_processing_latency_ms,
+        detector_errors,
         output_error: state
             .output_error
             .lock()

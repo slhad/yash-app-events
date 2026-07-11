@@ -304,6 +304,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drain(&mut self, context: &egui::Context) {
         while let Ok(response) = self.worker.responses.try_recv() {
             match response.payload {
@@ -345,10 +346,12 @@ impl App {
                         .and_then(|items| items.last())
                     {
                         self.push_timeline(format!(
-                            "test · {} · value={} confidence={}",
+                            "test @{} ms · {} · value={} confidence={} · {}",
+                            observation["timestamp_ms"].as_u64().unwrap_or(0),
                             observation["status"].as_str().unwrap_or("?"),
                             observation["value"],
-                            observation["confidence"]
+                            observation["confidence"],
+                            observation["diagnostic"].as_str().unwrap_or("")
                         ));
                     }
                 }
@@ -359,7 +362,8 @@ impl App {
                         let sequence = value["sequence"].as_u64().unwrap_or(0);
                         if sequence > self.last_state_sequence {
                             self.push_timeline(format!(
-                                "transition seq {sequence} · {}",
+                                "transition {} · seq {sequence} · {}",
+                                value["updated_at"].as_str().unwrap_or("unknown time"),
                                 value["events"]
                             ));
                             self.last_state_sequence = sequence;

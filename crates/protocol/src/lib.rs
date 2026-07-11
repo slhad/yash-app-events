@@ -112,6 +112,8 @@ pub struct Status {
     pub input_fps: f32,
     pub analysis_fps: f32,
     pub replaced_frames: u64,
+    pub last_processing_latency_ms: Option<f64>,
+    pub detector_errors: u64,
     pub output_error: Option<String>,
 }
 

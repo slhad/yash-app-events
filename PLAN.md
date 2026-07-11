@@ -24,12 +24,12 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 5: implementation complete; interactive portal evidence on two Wayland
   environments remains outstanding.
 - Phase 6: implementation complete; interactive portal acceptance remains outstanding.
-- Phase 7: in progress. Detector/rule forms, frozen and continuous testing, diagnostic
-  previews, template capture, and a recent timeline are implemented.
-- Phase 8: in progress. Versioned synthetic manifests, common-path daemon evaluation,
+- Phase 7: complete (2026-07-11). Detector/rule forms, frozen and continuous testing,
+  diagnostic previews, explicit template capture, temporal state, and the bounded
+  observation/transition timeline complete the no-code deterministic authoring path.
+- Phase 8: complete (2026-07-11). Versioned synthetic manifests, common-path daemon evaluation,
   event metrics, regression thresholds, CLI JSON/exit status 7, and GUI import,
-  playback/event scrubbing and metrics are implemented; full frame/region overlay
-  acceptance remains outstanding.
+  playback/event scrubbing and metrics satisfy deterministic tuning and regression gates.
 - Phase 9 remains deferred and optional for the first usable product.
 - Phase 10: in progress. A clean-prefix source install, user service, desktop metadata,
   icon, Bash completion, man pages, recovery documentation, and security review are

@@ -16,14 +16,19 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
 - `profile.draft` (recoverable, separate from the committed revision)
 - `state.get`, `events.subscribe`, `status.subscribe`
 - `replay.synthetic_health` (CI-safe synthetic vertical-slice fixture)
+- `replay.evaluate` (schema-v1 annotated manifest, observed transitions, metrics and
+  regression result)
 - `detector.test` (bounded synthetic input plus compressed PNG diagnostic preview;
   never persists its test frame)
+- `detector.capture_template` (explicit latest-frame normalized crop into a portable
+  profile asset)
 - `replay.profile_detector` (CI-safe profile detector/rule replay through durable and
   live outputs)
 - `capture.select`, `capture.start`, `capture.stop`, `capture.status`, and
   `capture.snapshot` (daemon-owned local portal lifecycle; snapshots are explicit)
-- `preview.start`, `preview.frame`, and `preview.stop` (per-connection lease and
-  bounded compressed PNG; never detector input)
+- `preview.start`, `preview.frame`, `preview.freeze`, `preview.unfreeze`, and
+  `preview.stop` (per-connection lease, bounded compressed PNG, and exact frozen-frame
+  detector testing)
 
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.
@@ -31,9 +36,11 @@ Import/export paths are local filesystem paths supplied by the current-user clie
 
 Subscriptions have a 64-notification buffer per client. A lagging reader receives
 `subscription.lagged` with error code `-32010` and the number skipped; it never blocks
-the producer. Capture, detector-test, element, and preview methods will be added to
-this same protocol version before release.
+the producer. Element create/update/delete/duplicate operations use revision-aware
+`profile.commit`, keeping the daemon as the only profile writer.
 
 Stable application errors are `-32001` handshake required, `-32002` incompatible
 version, `-32009` revision conflict, and `-32010` subscriber lag. Standard JSON-RPC
-parse/request/method/parameter/internal codes retain their standard meanings.
+parse/request/method/parameter/internal codes retain their standard meanings. The
+method set above and its persisted schema-1/protocol-1 identifiers are frozen for the
+first release; additive response fields remain compatible.
