@@ -6,8 +6,9 @@ It will capture a selected game window through the Wayland ScreenCast portal and
 
 > Status: engineering baseline implemented. The workspace builds and its placeholder
 > binaries run. The internal profile library now provides validated schema-v1 storage,
-> revision recovery, duplication, trash/restore, and safe portable archives; live IPC,
-> capture, detection, and the GUI workflow are not implemented yet.
+> revision recovery, duplication, trash/restore, and safe portable archives. The local
+> protocol-v1 daemon and CLI profile/status operations work; capture, detection, event
+> output, and the GUI workflow are not implemented yet.
 
 ## Intended use cases
 
@@ -63,17 +64,21 @@ Exact distribution-specific packages and build commands will be added after the 
 9. Save or export the profile.
 10. Consume events from files, the CLI, or JSON-RPC subscriptions.
 
-Example future CLI usage:
+Implemented CLI usage:
 
 ```bash
 yash-eventsctl status
 yash-eventsctl profile list
-yash-eventsctl profile activate blazblue
+yash-eventsctl profile create "My game" my_game
+yash-eventsctl profile validate ./profile.json
+yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
 ```
 
-These commands document the intended interface; they are not implemented yet.
+The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation does
+not require a running daemon. All commands accept `--json`, `--socket`, and
+`--timeout-ms`.
 
 ## Configuration and output
 

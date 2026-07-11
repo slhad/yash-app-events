@@ -32,6 +32,7 @@ sha2 = "0.10.8"
 zip = { version = "2.2.2", default-features = false, features = ["deflate"] }
 toml = "0.8.19"
 tokio = { version = "1.43.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+clap = { version = "4.5.27", features = ["derive", "env"] }
 
 [workspace.dependencies.tempfile]
 version = "3.15.0"

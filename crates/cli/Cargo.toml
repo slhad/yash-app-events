@@ -10,6 +10,13 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 yash-app-events-profile = { path = "../profile" }
 yash-app-events-protocol = { path = "../protocol" }
 
+[dev-dependencies]
+tempfile.workspace = true
+yash-app-eventsd = { path = "../daemon" }

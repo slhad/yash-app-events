@@ -14,7 +14,10 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
-use yash_app_events_profile::{Profile, ProfileId, ProfileStore, StoreError};
+use yash_app_events_profile::{
+    export_profile, import_profile, ImportLimits, LocalConfig, Profile, ProfileId, ProfileStore,
+    StoreError,
+};
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
     Request, RequestId, Response, RpcError, Status, MAXIMUM_MESSAGE_BYTES, MAXIMUM_NESTING_DEPTH,
@@ -28,6 +31,7 @@ const SUBSCRIPTION_CAPACITY: usize = 64;
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub data_root: PathBuf,
+    pub config_root: PathBuf,
     pub maximum_connections: usize,
 }
 
@@ -36,6 +40,7 @@ pub struct ServerConfig {
 struct State {
     instance: Uuid,
     profiles: ProfileStore,
+    local_config: LocalConfig,
     connected: AtomicUsize,
     maximum_connections: usize,
     shutdown: Notify,
@@ -53,6 +58,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let state = Arc::new(State {
         instance: Uuid::new_v4(),
         profiles: ProfileStore::new(config.data_root, 20),
+        local_config: LocalConfig::new(config.config_root),
         connected: AtomicUsize::new(0),
         maximum_connections: config.maximum_connections,
         shutdown: Notify::new(),
@@ -218,6 +224,7 @@ async fn serve_connection(stream: UnixStream, state: Arc<State>) -> Result<(), S
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dispatch(request: Request, state: &State) -> Response {
     let id = request.id;
     let result: Result<Value, RpcError> = match request.method.as_str() {
@@ -259,6 +266,65 @@ fn dispatch(request: Request, state: &State) -> Response {
                     .map_err(store_error)
             })
             .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
+        method::PROFILE_DUPLICATE => parse::<DuplicateParams>(request.params)
+            .and_then(|params| {
+                state
+                    .profiles
+                    .duplicate_profile(params.profile_id, params.name)
+                    .map_err(store_error)
+            })
+            .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
+        method::PROFILE_VALIDATE => parse::<ProfileParam>(request.params).and_then(|params| {
+            params
+                .profile
+                .validate()
+                .map(|()| json!({"valid": true}))
+                .map_err(internal_error)
+        }),
+        method::PROFILE_IMPORT => parse::<PathParam>(request.params).and_then(|params| {
+            import_profile(
+                &params.path,
+                state.profiles.profiles_root(),
+                ImportLimits::default(),
+            )
+            .and_then(|profile| serde_json::to_value(profile).map_err(Into::into))
+            .map_err(internal_error)
+        }),
+        method::PROFILE_EXPORT => parse::<ExportParams>(request.params).and_then(|params| {
+            export_profile(
+                &state.profiles.profile_directory(params.profile_id),
+                &params.path,
+            )
+            .and_then(|manifest| serde_json::to_value(manifest).map_err(Into::into))
+            .map_err(internal_error)
+        }),
+        method::PROFILE_TRASH => parse::<ProfileIdParam>(request.params).and_then(|params| {
+            state
+                .profiles
+                .trash(params.profile_id)
+                .map(|()| json!({"trashed": true}))
+                .map_err(store_error)
+        }),
+        method::PROFILE_RESTORE => parse::<ProfileIdParam>(request.params).and_then(|params| {
+            state
+                .profiles
+                .restore(params.profile_id)
+                .map(|()| json!({"restored": true}))
+                .map_err(store_error)
+        }),
+        method::PROFILE_ACTIVATE => parse::<ProfileIdParam>(request.params).and_then(|params| {
+            state
+                .profiles
+                .load(params.profile_id)
+                .map_err(store_error)?;
+            let mut settings = state.local_config.load_settings().map_err(internal_error)?;
+            settings.active_profile = Some(params.profile_id);
+            state
+                .local_config
+                .save_settings(&settings)
+                .map_err(internal_error)?;
+            Ok(json!({"active_profile": params.profile_id}))
+        }),
         method::STATE_GET => Ok(
             json!({"schema": 1, "daemon_instance": state.instance, "sequence": 0, "observations": {}, "events": {}}),
         ),
@@ -322,12 +388,12 @@ async fn serve_subscription(
     loop {
         let notification = match receiver.recv().await {
             Ok(value) => Notification {
-                jsonrpc: "2.0",
+                jsonrpc: "2.0".into(),
                 method: "event".into(),
                 params: value,
             },
             Err(broadcast::error::RecvError::Lagged(skipped)) => Notification {
-                jsonrpc: "2.0",
+                jsonrpc: "2.0".into(),
                 method: "subscription.lagged".into(),
                 params: json!({"code": error_code::SUBSCRIPTION_LAGGED, "skipped": skipped}),
             },
@@ -361,6 +427,20 @@ struct ProfileParam {
 struct CommitParams {
     profile: Profile,
     expected_revision: u64,
+}
+#[derive(Deserialize)]
+struct DuplicateParams {
+    profile_id: ProfileId,
+    name: String,
+}
+#[derive(Deserialize)]
+struct PathParam {
+    path: PathBuf,
+}
+#[derive(Deserialize)]
+struct ExportParams {
+    profile_id: ProfileId,
+    path: PathBuf,
 }
 
 /// Daemon transport failure.
@@ -396,6 +476,7 @@ mod tests {
         let config = ServerConfig {
             socket_path: socket.clone(),
             data_root: directory.join("data"),
+            config_root: directory.join("config"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config));
@@ -512,6 +593,7 @@ mod tests {
         let config = ServerConfig {
             socket_path: socket.clone(),
             data_root: directory.path().join("data"),
+            config_root: directory.path().join("config"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config.clone()));

@@ -32,7 +32,7 @@ pub struct Request {
 /// One JSON-RPC success or error response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Response {
-    pub jsonrpc: &'static str,
+    pub jsonrpc: String,
     pub id: RequestId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -44,7 +44,7 @@ impl Response {
     #[must_use]
     pub fn success(id: RequestId, result: Value) -> Self {
         Self {
-            jsonrpc: "2.0",
+            jsonrpc: "2.0".into(),
             id,
             result: Some(result),
             error: None,
@@ -54,7 +54,7 @@ impl Response {
     #[must_use]
     pub fn failure(id: RequestId, error: RpcError) -> Self {
         Self {
-            jsonrpc: "2.0",
+            jsonrpc: "2.0".into(),
             id,
             result: None,
             error: Some(error),
@@ -115,7 +115,7 @@ pub struct Status {
 /// Server notification, sent without a request identifier.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Notification {
-    pub jsonrpc: &'static str,
+    pub jsonrpc: String,
     pub method: String,
     pub params: Value,
 }
@@ -150,6 +150,13 @@ pub mod method {
     pub const PROFILE_GET: &str = "profile.get";
     pub const PROFILE_CREATE: &str = "profile.create";
     pub const PROFILE_COMMIT: &str = "profile.commit";
+    pub const PROFILE_DUPLICATE: &str = "profile.duplicate";
+    pub const PROFILE_VALIDATE: &str = "profile.validate";
+    pub const PROFILE_IMPORT: &str = "profile.import";
+    pub const PROFILE_EXPORT: &str = "profile.export";
+    pub const PROFILE_TRASH: &str = "profile.trash";
+    pub const PROFILE_RESTORE: &str = "profile.restore";
+    pub const PROFILE_ACTIVATE: &str = "profile.activate";
     pub const STATE_GET: &str = "state.get";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";

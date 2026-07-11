@@ -239,8 +239,16 @@ impl ProfileStore {
         Ok(())
     }
 
-    fn profile_directory(&self, id: ProfileId) -> PathBuf {
+    /// Returns the portable directory for a stable profile ID.
+    #[must_use]
+    pub fn profile_directory(&self, id: ProfileId) -> PathBuf {
         self.profiles.join(id.to_string())
+    }
+
+    /// Returns the root containing all portable profiles.
+    #[must_use]
+    pub fn profiles_root(&self) -> &Path {
+        &self.profiles
     }
 
     fn prune_revisions(&self, history: &Path) -> io::Result<()> {

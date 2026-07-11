@@ -10,7 +10,10 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 1: complete (2026-07-11). Profile schemas, atomic local storage, revisions,
   duplication, trash/restore, migration dispatch, and resource-limited portable
   archives pass sixteen profile tests.
-- Phases 2–10: not yet complete.
+- Phase 2: complete (2026-07-11). Protocol-v1 Unix transport, concurrent clients,
+  profile lifecycle RPCs, bounded subscriptions, and the real CLI pass daemon-backed
+  integration and golden-output tests.
+- Phases 3–10: not yet complete.
 
 ## Planning principles
 

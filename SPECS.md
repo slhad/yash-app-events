@@ -509,3 +509,4 @@ SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB message, depth-
 SPEC-IPC-003 | VERIFIED | transport test rejects pre-handshake methods and accepts protocol-v1 identification; incompatible version has stable structured code (2026-07-11)
 SPEC-IPC-004 | IN_PROGRESS | version/capabilities/status/shutdown, core profile operations, state, and subscriptions implemented; capture, full profile lifecycle, detector, and preview methods pending
 SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subscription.lagged`; bounded-channel test proves overwrite/lag behavior (2026-07-11)
+SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with global compact `--json`, stable exit categories, timeouts, live event follow, profile lifecycle commands, and shared-library offline validation; golden and daemon-backed tests (2026-07-11)
