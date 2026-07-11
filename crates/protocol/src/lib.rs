@@ -162,6 +162,7 @@ pub mod method {
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
     pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
     pub const DETECTOR_TEST: &str = "detector.test";
+    pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
 }
 
 pub mod error_code {

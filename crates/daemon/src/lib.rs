@@ -32,8 +32,9 @@ use yash_app_events_protocol::{
     PROTOCOL_VERSION,
 };
 use yash_app_events_vision::{
-    ColorBarConfig, ColorBarDetector, Detector as VisionDetector, GrayImage, PreprocessPipeline,
-    RegionChangeConfig, RegionChangeDetector, Template, TemplateConfig, TemplateDetector,
+    ColorBarConfig, ColorBarDetector, Detection, Detector as VisionDetector, GrayImage,
+    PreprocessPipeline, RegionChangeConfig, RegionChangeDetector, Template, TemplateConfig,
+    TemplateDetector,
 };
 
 const SUBSCRIPTION_CAPACITY: usize = 64;
@@ -370,6 +371,8 @@ fn dispatch(request: Request, state: &State) -> Response {
             .and_then(|params| run_synthetic_health(state, params)),
         method::DETECTOR_TEST => parse::<DetectorTestParams>(request.params)
             .and_then(|params| test_detector(state, params)),
+        method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
+            .and_then(|params| run_profile_replay(state, &params)),
         _ => Err(RpcError::new(
             error_code::METHOD_NOT_FOUND,
             "method not found",
@@ -461,6 +464,22 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
         .map(|(index, fill)| synthetic_health_frame(u64::try_from(index).unwrap_or(u64::MAX), fill))
         .collect::<Result<Vec<_>, _>>()
         .map_err(internal_error)?;
+    publish_replay(
+        state,
+        &mut processor,
+        frames,
+        &params.profile_id,
+        &params.game,
+    )
+}
+
+fn publish_replay<D: VisionDetector>(
+    state: &State,
+    processor: &mut FrameProcessor<D>,
+    frames: Vec<Arc<Frame>>,
+    profile_id: &str,
+    game: &str,
+) -> Result<Value, RpcError> {
     let start = Utc
         .with_ymd_and_hms(2026, 7, 11, 16, 43, 27)
         .single()
@@ -475,7 +494,7 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
         };
         processed_count = processed_count.saturating_add(1);
         observations.insert(
-            element_id.to_string(),
+            processed.observation.element_id.to_string(),
             serde_json::to_value(&processed.observation).map_err(internal_error)?,
         );
         if let Some(transition) = processed.transition {
@@ -500,8 +519,8 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
                 daemon_instance: state.instance,
                 sequence,
                 timestamp: EventRecord::timestamp_rfc3339(timestamp),
-                profile_id: params.profile_id.clone(),
-                game: params.game.clone(),
+                profile_id: profile_id.to_owned(),
+                game: game.to_owned(),
                 event: transition.event,
                 state: event_state,
                 value: json!(transition.value),
@@ -530,7 +549,7 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
             sequence: state.sequence.load(Ordering::Relaxed),
             updated_at: EventRecord::timestamp_rfc3339(timestamp),
             capture: json!({"active":false,"source":"replay","resolution":[10,2],"pixel_format":"rgba8"}),
-            active_profile: Some(params.profile_id.clone()),
+            active_profile: Some(profile_id.to_owned()),
             observations: Value::Object(observations.clone()),
             events: Value::Object(event_states.clone()),
         };
@@ -591,6 +610,198 @@ fn set_output_error(state: &State, error: &str) {
     let _ = state
         .notifications
         .send(json!({"type":"output_error","error":error}));
+}
+
+#[derive(Debug)]
+enum ConfiguredDetector {
+    Color(ColorBarDetector),
+    Template(TemplateDetector),
+    RegionChange(RegionChangeDetector),
+}
+
+impl VisionDetector for ConfiguredDetector {
+    fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
+        match self {
+            Self::Color(detector) => detector.detect(frame, region),
+            Self::Template(detector) => detector.detect(frame, region),
+            Self::RegionChange(detector) => detector.detect(frame, region),
+        }
+    }
+}
+
+fn configured_detector(
+    detector: &ProfileDetector,
+    directory: &Path,
+) -> Result<ConfiguredDetector, RpcError> {
+    match detector {
+        ProfileDetector::ColorBar {
+            direction,
+            minimum_rgb,
+            maximum_rgb,
+            mask,
+            ..
+        } => {
+            let mask = mask
+                .as_ref()
+                .map(|path| read_bounded_json::<Vec<bool>>(&directory.join(path)))
+                .transpose()?;
+            ColorBarDetector::new(ColorBarConfig {
+                direction: *direction,
+                minimum_rgb: *minimum_rgb,
+                maximum_rgb: *maximum_rgb,
+                line_match_fraction: 0.8,
+                mask,
+            })
+            .map(ConfiguredDetector::Color)
+            .map_err(internal_error)
+        }
+        ProfileDetector::Template {
+            templates,
+            masks,
+            threshold,
+            preprocessing,
+            ..
+        } => {
+            let templates = load_templates(directory, templates, masks)?;
+            TemplateDetector::new(TemplateConfig {
+                templates,
+                threshold: *threshold,
+                preprocessing: PreprocessPipeline {
+                    operations: preprocessing.clone(),
+                },
+            })
+            .map(ConfiguredDetector::Template)
+            .map_err(internal_error)
+        }
+        ProfileDetector::RegionChange {
+            threshold,
+            preprocessing,
+            ..
+        } => RegionChangeDetector::new(RegionChangeConfig {
+            change_threshold: *threshold,
+            preprocessing: PreprocessPipeline {
+                operations: preprocessing.clone(),
+            },
+        })
+        .map(ConfiguredDetector::RegionChange)
+        .map_err(internal_error),
+    }
+}
+
+fn load_templates(
+    directory: &Path,
+    paths: &[PathBuf],
+    masks: &[Option<PathBuf>],
+) -> Result<Vec<Template>, RpcError> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let image = read_bounded_json::<GrayImage>(&directory.join(path))?;
+            let mask = masks
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|path| read_bounded_json::<Vec<bool>>(&directory.join(path)))
+                .transpose()?;
+            Ok(Template {
+                name: path.to_string_lossy().into_owned(),
+                image,
+                mask,
+            })
+        })
+        .collect()
+}
+
+fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Value, RpcError> {
+    if params.values.is_empty() || params.values.len() > 10_000 {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "values must contain 1..=10000 samples",
+        ));
+    }
+    let profile = state
+        .profiles
+        .load(params.profile_id)
+        .map_err(store_error)?;
+    let element = profile
+        .elements
+        .iter()
+        .find(|element| element.id == params.element_id)
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
+    let rule = profile
+        .rules
+        .iter()
+        .find(|rule| rule.element_id == element.id)
+        .ok_or_else(|| {
+            RpcError::new(
+                error_code::INVALID_PARAMS,
+                "element has no numeric event rule",
+            )
+        })?;
+    let directory = state.profiles.profile_directory(profile.id);
+    let detector = configured_detector(&element.detector, &directory)?;
+    let frames = replay_fixture_frames(&element.detector, &directory, &params.values)?;
+    let numeric_rule = NumericRule::new(NumericRuleConfig {
+        id: rule.id,
+        event: rule.event.clone(),
+        enter_below: rule.enter_below,
+        leave_above: rule.leave_above,
+        minimum_confidence: rule.minimum_confidence,
+        required_samples: usize::from(rule.required_samples),
+        sample_window: usize::from(rule.sample_window),
+        cooldown: Duration::from_millis(rule.cooldown_ms),
+    })
+    .map_err(internal_error)?;
+    let mut processor = FrameProcessor::new(
+        AnalysisScheduler::new(10).map_err(internal_error)?,
+        detector,
+        element.region,
+        detector_id(&element.detector),
+        element.id,
+        numeric_rule,
+    );
+    publish_replay(
+        state,
+        &mut processor,
+        frames,
+        &profile.id.to_string(),
+        &profile.game,
+    )
+}
+
+fn replay_fixture_frames(
+    detector: &ProfileDetector,
+    directory: &Path,
+    values: &[u8],
+) -> Result<Vec<Arc<Frame>>, RpcError> {
+    values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            let sequence = u64::try_from(index).unwrap_or(u64::MAX);
+            match detector {
+                ProfileDetector::ColorBar { .. } => {
+                    synthetic_health_frame(sequence, value.min(10)).map_err(internal_error)
+                }
+                ProfileDetector::Template { templates, .. } => {
+                    let template = templates.first().ok_or_else(|| {
+                        RpcError::new(error_code::INVALID_PARAMS, "no template asset")
+                    })?;
+                    let mut image = read_bounded_json::<GrayImage>(&directory.join(template))?;
+                    if value == 0 {
+                        for pixel in &mut image.pixels {
+                            *pixel = 255_u8.saturating_sub(*pixel);
+                        }
+                    }
+                    gray_frame(sequence, &image).map_err(internal_error)
+                }
+                ProfileDetector::RegionChange { .. } => GrayImage::new(2, 2, vec![value; 4])
+                    .map_err(internal_error)
+                    .and_then(|image| gray_frame(sequence, &image).map_err(internal_error)),
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -882,6 +1093,12 @@ struct DetectorTestParams {
     #[serde(default = "default_change_value")]
     change_value: u8,
 }
+#[derive(Deserialize)]
+struct ProfileReplayParams {
+    profile_id: ProfileId,
+    element_id: ElementId,
+    values: Vec<u8>,
+}
 const fn default_fill() -> u8 {
     5
 }
@@ -1162,6 +1379,19 @@ mod tests {
                     preprocessing: Vec::new(),
                 },
             });
+        template_profile
+            .rules
+            .push(yash_app_events_profile::EventRule {
+                id: RuleId::new(),
+                element_id: template_element,
+                event: "icon_missing".into(),
+                enter_below: 0.5,
+                leave_above: 0.5,
+                minimum_confidence: 0.0,
+                required_samples: 2,
+                sample_window: 2,
+                cooldown_ms: 0,
+            });
         call(
             &mut client,
             4,
@@ -1213,6 +1443,19 @@ mod tests {
                     preprocessing: Vec::new(),
                 },
             });
+        change_profile
+            .rules
+            .push(yash_app_events_profile::EventRule {
+                id: RuleId::new(),
+                element_id: change_element,
+                event: "region_stable".into(),
+                enter_below: 0.2,
+                leave_above: 0.3,
+                minimum_confidence: 0.0,
+                required_samples: 1,
+                sample_window: 1,
+                cooldown_ms: 0,
+            });
         call(
             &mut client,
             6,
@@ -1235,7 +1478,63 @@ mod tests {
             "image/png"
         );
         assert_eq!(change["result"]["diagnostic"]["preview"]["bytes"][0], 137);
-        call(&mut client, 8, method::SHUTDOWN, Value::Null).await;
+        let mut subscriber = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        handshake(&mut subscriber).await;
+        call(&mut subscriber, 8, method::EVENTS_SUBSCRIBE, Value::Null).await;
+        let template_replay = call(&mut client, 9, method::REPLAY_PROFILE_DETECTOR, json!({"profile_id":template_profile.id,"element_id":template_element,"values":[1,1,0,0,1,1]})).await;
+        assert_eq!(
+            template_replay["result"]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let region_replay = call(&mut client, 10, method::REPLAY_PROFILE_DETECTOR, json!({"profile_id":change_profile.id,"element_id":change_element,"values":[0,0,255,255]})).await;
+        assert_eq!(
+            region_replay["result"]["events"].as_array().unwrap().len(),
+            2
+        );
+        let notifications = [
+            notification(&mut subscriber).await,
+            notification(&mut subscriber).await,
+            notification(&mut subscriber).await,
+            notification(&mut subscriber).await,
+        ];
+        assert_eq!(
+            notifications
+                .iter()
+                .map(|value| value["params"]["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "icon_missing",
+                "icon_missing",
+                "region_stable",
+                "region_stable"
+            ]
+        );
+        assert_eq!(
+            notifications
+                .iter()
+                .map(|value| value["params"]["state"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["entered", "left", "left", "entered"]
+        );
+        let durable: Vec<Value> = fs::read_to_string(directory.path().join("state/events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            durable,
+            notifications
+                .iter()
+                .map(|value| value["params"].clone())
+                .collect::<Vec<_>>()
+        );
+        let snapshot = call(&mut client, 11, method::STATE_GET, Value::Null).await;
+        assert_eq!(snapshot["result"]["events"]["region_stable"], true);
+        assert_eq!(snapshot["result"]["sequence"], 4);
+        call(&mut client, 12, method::SHUTDOWN, Value::Null).await;
         task.await.unwrap().unwrap();
     }
 

@@ -349,4 +349,50 @@ mod tests {
         assert_eq!(result.status, DetectionStatus::Error);
         assert_eq!(result.value, None);
     }
+
+    #[test]
+    fn scaled_bar_tolerates_minor_noise_and_brightness_variation() {
+        let width = 20_usize;
+        let height = 4_usize;
+        let mut bytes = vec![0_u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = (y * width + x) * 4;
+                let pixel = if x < 10 && !(x == 4 && y == 0) {
+                    if (x + y) % 2 == 0 {
+                        [190, 10, 10, 255]
+                    } else {
+                        [245, 55, 55, 255]
+                    }
+                } else {
+                    [30, 30, 30, 255]
+                };
+                bytes[offset..offset + 4].copy_from_slice(&pixel);
+            }
+        }
+        let frame = Frame::new(
+            0,
+            Duration::ZERO,
+            FrameLayout {
+                width: 20,
+                height: 4,
+                row_stride: 80,
+                format: PixelFormat::Rgba8,
+            },
+            None,
+            Arc::from(bytes),
+        )
+        .unwrap();
+        let result = detector(BarDirection::LeftToRight).detect(
+            &frame,
+            NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(result.status, DetectionStatus::Valid);
+        assert_eq!(result.value, Some(0.5));
+    }
 }

@@ -521,13 +521,13 @@ SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1
 SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/timestamp/capture/profile/observations/events; atomic interruption and daemon `state.get` equality tests (2026-07-11)
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | IN_PROGRESS | output errors are typed/non-panicking and failure-injection tested; daemon status/log/IPC/GUI surfacing pending
-SPEC-DET-002 | IN_PROGRESS | RGB range detector supports four directions, configurable channel thresholds, optional binary mask, line threshold, normalized fill/confidence/diagnostic; broader synthetic variation and RPC pending
+SPEC-DET-002 | VERIFIED | four-direction RGB range/mask detector handles padded stride, partial/scaled bars, noise and brightness variation; profile-backed daemon RPC plus replay produces files/state/subscription events (2026-07-11)
 SPEC-REPLAY-001 | IN_PROGRESS | `ReplaySource` frames feed the same `FrameProcessor<Detector>` boundary intended for live capture; daemon live wiring pending
 SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
 SPEC-REPLAY-003 | IN_PROGRESS | redistributable in-memory synthetic health fixtures cover bounded frames and transitions; repository manifest/fixture format pending
 SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
 SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)
-SPEC-DET-003 | IN_PROGRESS | multi-template normalized matching, portable assets/masks, profile validation, best diagnostics, brightness-shift unit test, and daemon RPC integration pass; event/output replay integration pending
-SPEC-DET-004 | IN_PROGRESS | stateful normalized change/stability with serialized preprocessing and daemon RPC baseline/change integration pass; event/output replay integration pending
+SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/best diagnostics and brightness test; profile replay integration asserts entered/left records identical in JSONL and RPC (2026-07-11)
+SPEC-DET-004 | VERIFIED | normalized change/stability unknown-baseline behavior plus profile replay integration asserts left/entered records identical in JSONL/RPC and final state (2026-07-11)
 SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
 SPEC-PERF-003 | VERIFIED | release-mode three-detector baseline and reference CPU recorded in `docs/performance.md`; results do not justify advanced transfer/GPU optimization (2026-07-11)

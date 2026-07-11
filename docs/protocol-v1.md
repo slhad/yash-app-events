@@ -17,6 +17,8 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
 - `replay.synthetic_health` (CI-safe synthetic vertical-slice fixture)
 - `detector.test` (bounded synthetic input plus compressed PNG diagnostic preview;
   never persists its test frame)
+- `replay.profile_detector` (CI-safe profile detector/rule replay through durable and
+  live outputs)
 
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.

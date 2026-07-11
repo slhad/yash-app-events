@@ -16,7 +16,12 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 3: complete (2026-07-11). Synthetic replay frames traverse color detection,
   typed observations, temporal rules, daemon-owned JSONL/atomic state output, and a
   bounded live RPC subscription in one end-to-end integration test.
-- Phases 4–10: not yet complete.
+- Phase 4: complete (2026-07-11). Color-bar, multi-template, and region-change
+  detectors use serializable preprocessing, bounded diagnostic PNG previews, portable
+  assets, profile replay, daemon RPC, temporal output, and recorded benchmarks.
+  `docs/vision.md` records why measured pure-Rust routines defer the proposed OpenCV
+  dependency while retaining replaceable project-owned boundaries.
+- Phases 5–10: not yet complete.
 
 ## Planning principles
 
