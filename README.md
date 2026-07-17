@@ -75,10 +75,24 @@ the documented Hyprland environment. GNOME and KDE are not currently claimed.
 9. Save or export the profile.
 10. Consume events from files, the CLI, or JSON-RPC subscriptions.
 
+The profile sidebar includes daemon-backed revision history. Selecting a retained
+revision shows a stable-ID comparison; rollback requires confirmation and creates a
+new revision, leaving the replaced revision recoverable.
+
+Detection hierarchy supports daemon-owned derived text observations. Selecting a derived
+parent exposes its name, enabled state, format placeholders, named detector inputs, live
+value, and text event rule; selecting a child opens that detector's tuning controls.
+
+The GUI's **Layout compatibility** panel compares the portable profile reference
+resolution/aspect ratio with the current capture, shows X/Y scaling and normalized-zone
+behavior, and warns when letterboxing, cropping, UI scale, or aspect mismatch may make a
+profile created on another machine target the wrong pixels.
+
 The preview requests a bounded high-detail image up to 1600×900; it never changes the
 full-resolution frame used by detectors. The always-visible **Live evidence** panel shows
-capture resolution/rates/errors, current observations, event states, and the most recent
-manual detector-test value, confidence, status, and diagnostic.
+capture resolution/rates/errors, current observations, event states, daemon/GUI CPU and
+resident memory, and the most recent manual detector-test value, confidence, status,
+and diagnostic.
 
 Implemented CLI usage:
 
@@ -91,18 +105,43 @@ yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
 yash-eventsctl --json replay ./manifest.json
+yash-eventsctl --json suite evaluate /path/to/blazblue-entropy-effect
+yash-eventsctl collection policy-set <profile-uuid> /path/to/blazblue-entropy-effect --enabled true
+yash-eventsctl --json collection auto-review <profile-uuid>
+yash-eventsctl collection review <profile-uuid> <item-id> correct --expected ./expected.json
+yash-eventsctl collection review <profile-uuid> <item-id> promote --expected ./expected.json
 yash-eventsctl diagnostic plan --profile-id <uuid> --element-id <uuid>
 ```
+
+Profile replay uses the same daemon publication boundary as live processing: durable
+state/events, subscriptions, and enabled profile output routes are updated while the
+manifest is evaluated. The GUI keeps long image/OCR evaluations bounded to five minutes
+and displays the final metrics when processing completes.
 
 The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation does
 not require a running daemon. All commands accept `--json`, `--socket`, and
 `--timeout-ms`.
 
-Post-release detector work adds typed boolean/text rules, Tesseract OCR, and portable
-ONNX classifiers. OCR and classifiers use change-triggered bounded scheduling and the
+Post-release detector work adds typed boolean/text rules, Tesseract OCR, deterministic
+fixed-layout seven-segment recognition, and portable ONNX classifiers. OCR and classifiers use change-triggered bounded scheduling and the
 same image replay and temporal-event path as deterministic detectors. See
 `docs/ocr.md`, `docs/classifier.md`, and `docs/diagnostics.md` for current evidence and
 limitations.
+
+Real-game regression media can remain outside Git (the repository ignores `/assets/`).
+An external suite pins a portable profile and checksummed media, and can mix full
+captures, partial screenshots positioned in the profile's reference frame, and exact
+zone crops. Run it through `suite evaluate`; a detector or event mismatch returns exit
+status 7. See `docs/replay.md` for the package schema and calibration workflow.
+
+The opt-in passive collector can extend such a package only while its game capture is
+active. Its machine-local policy defaults to 70 seconds with 10 seconds of jitter,
+skips perceptually similar frames when detector evidence is also unchanged, and applies
+item/byte quotas. Captures enter an unverified review queue with their exact analyzed
+frame, observations, transitions, profile revision/hash, and source metadata. The GUI
+and `collection` CLI expose the same protocol operations to inspect, compare, accept,
+correct, reject, safely auto-review, and promote items. Ambiguous automation results
+remain `needs_correction`; only promoted items become checksummed regression cases.
 
 ## Configuration and output
 
@@ -115,8 +154,17 @@ Runtime output provides:
 - `events.jsonl`: append-only meaningful state transitions.
 - `state.json`: atomically replaced current state snapshot.
 - JSON-RPC subscriptions: live events for connected clients.
+- Machine-local profile output routes: filtered event/state JSON or raw-text templates delivered to
+  append/replace files or direct bounded commands, with GUI enable/test controls.
 
-See `SPECS.md` for normative schemas and behavior.
+Routes never travel with portable profiles and command sinks never use a shell. Configure
+them with `yash-eventsctl output`, then review, test, and enable them in the GUI or CLI.
+See `docs/outputs.md` and `SPECS.md` for schemas and behavior.
+
+Portable profiles may instead carry inert output recipes. The GUI lists these examples,
+shows their source hash and disclosed output, supports safe preview/editing, requires the user
+to choose an absolute local sink, and installs a new machine-local route disabled. Preview,
+delivery testing, and enabling are three separate actions.
 
 ## Backup, recovery, upgrade, and uninstall
 
@@ -170,3 +218,8 @@ and the current GNOME/KDE compatibility boundary.
 - Portable, versioned, recoverable configuration.
 - One daemon and one protocol for GUI, CLI, and integrations.
 - Inspectable outputs and replay-based verification.
+
+## License
+
+Licensed under either of the Apache License, Version 2.0 or the MIT license, at your
+option. See `LICENSE-APACHE` and `LICENSE-MIT`.

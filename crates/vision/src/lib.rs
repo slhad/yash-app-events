@@ -7,11 +7,13 @@ mod classifier;
 mod ocr;
 mod preprocess;
 mod region_change;
+mod seven_segment;
 mod template;
 pub use classifier::{ClassifierConfig, OnnxClassifierDetector};
 pub use ocr::{OcrConfig, OcrDetector};
 pub use preprocess::{GrayImage, PreprocessPipeline};
 pub use region_change::{RegionChangeConfig, RegionChangeDetector};
+pub use seven_segment::{SevenSegmentConfig, SevenSegmentDetector};
 pub use template::{Template, TemplateConfig, TemplateDetector};
 pub use yash_app_events_profile::PreprocessOperation;
 
@@ -76,6 +78,8 @@ pub struct ColorBarConfig {
     pub maximum_rgb: [u8; 3],
     /// Required matching fraction across each line perpendicular to fill direction.
     pub line_match_fraction: f32,
+    /// Small separators allowed inside an otherwise contiguous segmented bar.
+    pub maximum_gap_fraction: f32,
     /// Optional row-major binary mask matching the detector crop dimensions.
     pub mask: Option<Vec<bool>>,
 }
@@ -106,12 +110,21 @@ impl ColorBarDetector {
         {
             return Err("line match fraction must be within [0,1]");
         }
+        if !config.maximum_gap_fraction.is_finite()
+            || !(0.0..=0.25).contains(&config.maximum_gap_fraction)
+        {
+            return Err("maximum gap fraction must be within [0,0.25]");
+        }
         Ok(Self { config })
     }
 }
 
 impl Detector for ColorBarDetector {
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let Some(crop) = Crop::new(frame, region) else {
             return Detection::error("invalid or empty crop");
@@ -166,18 +179,28 @@ impl Detector for ColorBarDetector {
             self.config.direction,
             BarDirection::RightToLeft | BarDirection::BottomToTop
         );
-        let contiguous = if reverse {
-            matching_lines
-                .iter()
-                .rev()
-                .take_while(|&&matched| matched)
-                .count()
+        let maximum_gap =
+            ((lines as f32 * self.config.maximum_gap_fraction).ceil() as usize).max(1);
+        let ordered: Box<dyn Iterator<Item = bool>> = if reverse {
+            Box::new(matching_lines.iter().rev().copied())
         } else {
-            matching_lines
-                .iter()
-                .take_while(|&&matched| matched)
-                .count()
+            Box::new(matching_lines.iter().copied())
         };
+        let mut contiguous = 0;
+        let mut last_match = 0;
+        let mut gap = 0;
+        for (index, matched) in ordered.enumerate() {
+            if matched {
+                last_match = index + 1;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > maximum_gap {
+                    break;
+                }
+            }
+            contiguous = last_match;
+        }
         let fill = contiguous as f64 / lines as f64;
         let confidence = if lines == 0 {
             0.0
@@ -320,6 +343,7 @@ mod tests {
             minimum_rgb: [180, 0, 0],
             maximum_rgb: [255, 60, 60],
             line_match_fraction: 0.75,
+            maximum_gap_fraction: 0.02,
             mask: None,
         })
         .unwrap()
@@ -428,6 +452,7 @@ mod tests {
             minimum_rgb: [180, 0, 0],
             maximum_rgb: [255, 60, 60],
             line_match_fraction: 0.8,
+            maximum_gap_fraction: 0.02,
             mask: None,
         })
         .unwrap();

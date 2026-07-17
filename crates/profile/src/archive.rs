@@ -61,6 +61,8 @@ pub fn export_profile(
 ) -> Result<Manifest, ArchiveError> {
     let profile = load_profile(&profile_directory.join(PROFILE_FILE))?;
     validate_declared_assets(&profile, profile_directory)?;
+    crate::store::load_output_recipes_from_profile_directory(profile_directory)
+        .map_err(|error| ArchiveError::InvalidOutputRecipe(error.to_string()))?;
     let mut paths = Vec::new();
     collect_portable_files(profile_directory, profile_directory, &mut paths)?;
     paths.sort();
@@ -160,6 +162,8 @@ pub fn import_profile(
             return Err(ArchiveError::InvalidManifest);
         }
         validate_declared_assets(&profile, &staging)?;
+        crate::store::load_output_recipes_from_profile_directory(&staging)
+            .map_err(|error| ArchiveError::InvalidOutputRecipe(error.to_string()))?;
         fs::rename(&staging, &destination)?;
         Ok(profile)
     });
@@ -343,6 +347,8 @@ pub enum ArchiveError {
     MissingDeclaredFile,
     #[error("portable asset is missing: {0}")]
     MissingAsset(PathBuf),
+    #[error("portable output recipe is invalid: {0}")]
+    InvalidOutputRecipe(String),
     #[error("profile {0} already exists")]
     AlreadyExists(ProfileId),
 }
@@ -350,6 +356,10 @@ pub enum ArchiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use yash_app_events_output::{
+        EventState, OutputFormat, OutputRecipe, OutputRecipeSink, OutputTrigger,
+    };
 
     fn source_profile(root: &Path) -> Profile {
         let profile = Profile::new("Demo", "demo_game", 1920, 1080);
@@ -358,6 +368,51 @@ mod tests {
         fs::create_dir(root.join("templates")).unwrap();
         fs::write(root.join("templates/icon.bin"), b"portable asset").unwrap();
         profile
+    }
+
+    #[test]
+    fn inert_output_recipe_round_trips_as_a_hashed_portable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let profile = source_profile(&source);
+        let recipes = source.join("output-recipes");
+        fs::create_dir_all(&recipes).unwrap();
+        let recipe = OutputRecipe {
+            schema: 1,
+            id: Uuid::new_v4(),
+            name: "Stage file".into(),
+            description: "Example only".into(),
+            trigger: OutputTrigger::Event {
+                events: vec!["stage_changed".into()],
+                states: vec![EventState::Updated],
+            },
+            format: OutputFormat::JsonTemplate {
+                template: json!({"stage":"{{event.value}}"}),
+            },
+            suggested_sink: OutputRecipeSink::File {
+                mode: yash_app_events_output::FileMode::Append,
+                suggested_filename: "stages.jsonl".into(),
+            },
+        };
+        fs::write(
+            recipes.join("stages.json"),
+            serde_json::to_vec_pretty(&recipe).unwrap(),
+        )
+        .unwrap();
+        let archive = directory.path().join("recipe.hudprofile");
+        let manifest = export_profile(&source, &archive).unwrap();
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.path == "output-recipes/stages.json"));
+        let profiles = directory.path().join("profiles");
+        import_profile(&archive, &profiles, ImportLimits::default()).unwrap();
+        let imported = crate::store::load_output_recipes_from_profile_directory(
+            &profiles.join(profile.id.to_string()),
+        )
+        .unwrap();
+        assert_eq!(imported[0].recipe, recipe);
+        assert_eq!(imported[0].sha256.len(), 64);
     }
 
     #[test]

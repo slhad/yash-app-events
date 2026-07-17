@@ -33,6 +33,8 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 8: complete (2026-07-11). Versioned synthetic manifests, common-path daemon evaluation,
   event metrics, regression thresholds, CLI JSON/exit status 7, and GUI import,
   playback/event scrubbing and metrics satisfy deterministic tuning and regression gates.
+  Profile replay also publishes through durable state/events and enabled output routes;
+  long image/OCR GUI requests have a bounded five-minute completion window (2026-07-17).
 - Phase 9: complete as post-release work (2026-07-11). Synthetic English,
   localization, scale, animation, and glow fixtures; reproducible accuracy,
   confidence, latency, CPU, and memory comparison; Tesseract backend decision;
@@ -275,25 +277,39 @@ Exit gate:
 
 Goal: make tuning reproducible and measurable.
 
-Requirements: `SPEC-REPLAY-001` through `SPEC-REPLAY-004`.
+Requirements: `SPEC-REPLAY-001` through `SPEC-REPLAY-006`.
 
 Steps:
 
 1. Define a replay manifest containing frame/video source, timing, expected events, and optional annotations.
 2. Add explicit user-controlled replay recording or import.
-3. Route replay through the identical detector and event engine.
+3. Route replay through the identical detector, derived-observation, event, durable
+   publication, and enabled output-route boundaries.
 4. Add frame scrubbing and playback controls to the GUI.
 5. Overlay regions, observations, rules, and events during replay.
 6. Implement expected-event annotations.
 7. Report precision, recall, duplicates, misses, and detection latency.
 8. Add CLI replay evaluation with JSON output and nonzero exit status for configured regressions.
 9. Create CI-safe synthetic replay suites.
+10. Support ignored or separately distributed real-game regression packages containing
+    a pinned profile, checksummed media, full/partial/zone-crop placement, typed
+    observation expectations, event expectations, and categorized JSON results through
+    the shared daemon/CLI protocol.
+11. Add an opt-in daemon-owned passive evidence collector with a machine-local 70-second
+    default policy, bounded jitter/quotas, perceptual plus evidence-aware deduplication,
+    exact-frame metadata, and a shared GUI/CLI/JSON-RPC review queue. Support
+    accept/correct/reject, conservative automatic batch review, and checksum-updating
+    promotion into the external package.
 
 Exit gate:
 
 - Detector tuning can be performed without a running game.
 - A known regression changes a replay metric and fails its test.
 - Live and replay processing share the same engine path.
+- The local BlazBlue package evaluates 33 categorized cases / 50 frames / 126 typed
+  observation assertions without installing the pinned profile; 12 are reviewed passive
+  captures. A real low-motion 10-second pair is rejected as similar at 0.008501 versus
+  the configured 0.015 threshold (2026-07-14).
 
 ## Phase 9 — OCR spike and integration
 
@@ -353,6 +369,10 @@ Completed after the first usable Linux release (2026-07-11):
 - OCR detector integration from Phase 9.
 - Privacy-bounded diagnostic bundle.
 - Generic ONNX image classifier workflow.
+- Profile-scoped output routing with JSON/raw-text templates, file/direct-command sinks, bounded
+  daemon execution, shared CLI/RPC control, and GUI enable/test verification.
+- Portable inert output recipes with archive validation, provenance/hash review,
+  side-effect-free GUI preview/editing, explicit local sink selection, and disabled install.
 
 Remaining candidates are deliberately unscheduled:
 

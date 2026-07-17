@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use thiserror::Error;
 use yash_app_events_engine::ReplayManifest;
-use yash_app_events_profile::{load_profile, Profile};
+use yash_app_events_profile::{load_profile, CollectionPolicy, OutputRoute, Profile};
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
 /// `yash-eventsctl` command line.
@@ -54,10 +54,116 @@ pub enum Command {
     },
     /// Evaluate a versioned synthetic replay manifest through the daemon engine.
     Replay { manifest: PathBuf },
+    /// Evaluate portable external detector regression packages.
+    Suite {
+        #[command(subcommand)]
+        command: SuiteCommand,
+    },
+    /// Configure passive evidence capture and review collected batches.
+    Collection {
+        #[command(subcommand)]
+        command: CollectionCommand,
+    },
+    /// Configure profile-scoped file and command output routes.
+    Output {
+        #[command(subcommand)]
+        command: OutputCommand,
+    },
     /// Review and export a privacy-bounded diagnostic bundle.
     Diagnostic {
         #[command(subcommand)]
         command: DiagnosticCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OutputCommand {
+    List {
+        profile_id: String,
+    },
+    /// Create or replace a route from a JSON document.
+    Set {
+        profile_id: String,
+        route: PathBuf,
+    },
+    Enable {
+        profile_id: String,
+        route_id: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    Remove {
+        profile_id: String,
+        route_id: String,
+    },
+    /// Deliver a sample payload through the configured sink.
+    Test {
+        profile_id: String,
+        route_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SuiteCommand {
+    /// Evaluate every case without installing or modifying the pinned profile.
+    Evaluate { path: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CollectionCommand {
+    PolicyGet {
+        profile_id: String,
+    },
+    PolicySet {
+        profile_id: String,
+        dataset_root: PathBuf,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        enabled: bool,
+        #[arg(long, default_value_t = 70)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = 10)]
+        jitter_seconds: u64,
+        #[arg(long, default_value_t = 0.015)]
+        similarity_threshold: f32,
+        #[arg(long, default_value_t = 1000)]
+        maximum_pending_items: usize,
+        #[arg(long, default_value_t = 2_147_483_648)]
+        maximum_bytes: u64,
+        #[arg(long = "novelty-target")]
+        novelty_targets: Vec<String>,
+    },
+    Status {
+        profile_id: String,
+    },
+    Items {
+        profile_id: String,
+        #[arg(long)]
+        status: Option<String>,
+    },
+    Get {
+        profile_id: String,
+        id: String,
+    },
+    Review {
+        profile_id: String,
+        id: String,
+        action: String,
+        #[arg(long)]
+        reason: Option<String>,
+        /// JSON object mapping observation names to expected-observation contracts.
+        #[arg(long)]
+        expected: Option<PathBuf>,
+    },
+    AutoReview {
+        profile_id: String,
+        #[arg(long)]
+        promote: bool,
+    },
+    Compare {
+        first: PathBuf,
+        second: PathBuf,
+        #[arg(long, default_value_t = 0.015)]
+        threshold: f32,
     },
 }
 
@@ -89,6 +195,22 @@ pub enum ProfileCommand {
     List,
     Get {
         profile_id: String,
+    },
+    /// List retained snapshots from oldest to current.
+    Revisions {
+        profile_id: String,
+    },
+    /// Read one retained snapshot.
+    RevisionGet {
+        profile_id: String,
+        revision: u64,
+    },
+    /// Restore a snapshot by committing it as a new current revision.
+    Rollback {
+        profile_id: String,
+        revision: u64,
+        #[arg(long)]
+        expected_revision: u64,
     },
     Create {
         name: String,
@@ -140,6 +262,13 @@ pub enum CaptureCommand {
     Start,
     Stop,
     Status,
+    AutoGet,
+    AutoSet {
+        profile_id: String,
+        process_match: String,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
     Snapshot {
         path: PathBuf,
     },
@@ -181,9 +310,14 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         None
     };
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let timeout_ms = if matches!(cli.command, Command::Suite { .. }) {
+        cli.timeout_ms.max(60_000)
+    } else {
+        cli.timeout_ms
+    };
     let mut client = UnixRpcClient::connect(
         &socket,
-        Duration::from_millis(cli.timeout_ms),
+        Duration::from_millis(timeout_ms),
         "yash-eventsctl",
         env!("CARGO_PKG_VERSION"),
     )
@@ -199,6 +333,34 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                 ProfileCommand::Get { profile_id } => {
                     client
                         .call(method::PROFILE_GET, json!({"profile_id": profile_id}))
+                        .await?
+                }
+                ProfileCommand::Revisions { profile_id } => {
+                    client
+                        .call(method::PROFILE_REVISIONS, json!({"profile_id":profile_id}))
+                        .await?
+                }
+                ProfileCommand::RevisionGet {
+                    profile_id,
+                    revision,
+                } => {
+                    client
+                        .call(
+                            method::PROFILE_REVISION_GET,
+                            json!({"profile_id":profile_id,"revision":revision}),
+                        )
+                        .await?
+                }
+                ProfileCommand::Rollback {
+                    profile_id,
+                    revision,
+                    expected_revision,
+                } => {
+                    client
+                        .call(
+                            method::PROFILE_ROLLBACK,
+                            json!({"profile_id":profile_id,"revision":revision,"expected_revision":expected_revision}),
+                        )
                         .await?
                 }
                 ProfileCommand::Create {
@@ -263,6 +425,177 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                     )
                     .await?
             }
+            Command::Suite {
+                command: SuiteCommand::Evaluate { path },
+            } => {
+                let path = std::fs::canonicalize(path)
+                    .map_err(|error| CliError::Replay(format!("cannot open suite: {error}")))?;
+                client
+                    .call(method::SUITE_EVALUATE, json!({"path":path}))
+                    .await?
+            }
+            Command::Collection { command } => match command {
+                CollectionCommand::PolicyGet { profile_id } => client
+                    .call(method::COLLECTION_POLICY_GET, json!({"profile_id":profile_id}))
+                    .await?,
+                CollectionCommand::PolicySet {
+                    profile_id,
+                    dataset_root,
+                    enabled,
+                    interval_seconds,
+                    jitter_seconds,
+                    similarity_threshold,
+                    maximum_pending_items,
+                    maximum_bytes,
+                    novelty_targets,
+                } => {
+                    let dataset_root = if dataset_root.is_absolute() {
+                        dataset_root.clone()
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|error| CliError::Validation(error.to_string()))?
+                            .join(dataset_root)
+                    };
+                    let policy = CollectionPolicy {
+                        enabled: *enabled,
+                        dataset_root,
+                        interval_seconds: *interval_seconds,
+                        jitter_seconds: *jitter_seconds,
+                        similarity_threshold: *similarity_threshold,
+                        maximum_pending_items: *maximum_pending_items,
+                        maximum_bytes: *maximum_bytes,
+                        novelty_targets: novelty_targets.clone(),
+                    };
+                    client
+                        .call(
+                            method::COLLECTION_POLICY_SET,
+                            json!({"profile_id":profile_id,"policy":policy}),
+                        )
+                        .await?
+                }
+                CollectionCommand::Status { profile_id } => client
+                    .call(method::COLLECTION_STATUS, json!({"profile_id":profile_id}))
+                    .await?,
+                CollectionCommand::Items { profile_id, status } => client
+                    .call(
+                        method::COLLECTION_ITEMS,
+                        json!({"profile_id":profile_id,"status":status}),
+                    )
+                    .await?,
+                CollectionCommand::Get { profile_id, id } => client
+                    .call(
+                        method::COLLECTION_ITEM_GET,
+                        json!({"profile_id":profile_id,"id":id}),
+                    )
+                    .await?,
+                CollectionCommand::Review {
+                    profile_id,
+                    id,
+                    action,
+                    reason,
+                    expected,
+                } => {
+                    let expected_observations = expected
+                        .as_ref()
+                        .map(|path| {
+                            std::fs::read(path)
+                                .map_err(|error| CliError::Validation(error.to_string()))
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<Value>(&bytes)
+                                        .map_err(|error| CliError::Validation(error.to_string()))
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| json!({}));
+                    client
+                        .call(
+                            method::COLLECTION_REVIEW,
+                            json!({
+                                "profile_id":profile_id,"id":id,"action":action,
+                                "reason":reason,"expected_observations":expected_observations
+                            }),
+                        )
+                        .await?
+                }
+                CollectionCommand::AutoReview {
+                    profile_id,
+                    promote,
+                } => client
+                    .call(
+                        method::COLLECTION_AUTO_REVIEW,
+                        json!({"profile_id":profile_id,"promote":promote}),
+                    )
+                    .await?,
+                CollectionCommand::Compare {
+                    first,
+                    second,
+                    threshold,
+                } => {
+                    let first = std::fs::canonicalize(first)
+                        .map_err(|error| CliError::Validation(error.to_string()))?;
+                    let second = std::fs::canonicalize(second)
+                        .map_err(|error| CliError::Validation(error.to_string()))?;
+                    client
+                        .call(
+                            method::COLLECTION_COMPARE,
+                            json!({"first":first,"second":second,"threshold":threshold}),
+                        )
+                    .await?
+                }
+            },
+            Command::Output { command } => match command {
+                OutputCommand::List { profile_id } => client
+                    .call(method::OUTPUT_LIST, json!({"profile_id":profile_id}))
+                    .await?,
+                OutputCommand::Set { profile_id, route } => {
+                    let route = serde_json::from_slice::<OutputRoute>(&std::fs::read(route).map_err(
+                        |error| CliError::Validation(format!("read output route: {error}")),
+                    )?)
+                    .map_err(|error| {
+                        CliError::Validation(format!("parse output route JSON: {error}"))
+                    })?;
+                    client
+                        .call(
+                            method::OUTPUT_SET,
+                            json!({"profile_id":profile_id,"route":route}),
+                        )
+                        .await?
+                }
+                OutputCommand::Enable {
+                    profile_id,
+                    route_id,
+                    enabled,
+                } => {
+                    client
+                        .call(
+                            method::OUTPUT_ENABLE,
+                            json!({"profile_id":profile_id,"route_id":route_id,"enabled":enabled}),
+                        )
+                        .await?
+                }
+                OutputCommand::Remove {
+                    profile_id,
+                    route_id,
+                } => {
+                    client
+                        .call(
+                            method::OUTPUT_REMOVE,
+                            json!({"profile_id":profile_id,"route_id":route_id}),
+                        )
+                        .await?
+                }
+                OutputCommand::Test {
+                    profile_id,
+                    route_id,
+                } => {
+                    client
+                        .call(
+                            method::OUTPUT_TEST,
+                            json!({"profile_id":profile_id,"route_id":route_id}),
+                        )
+                        .await?
+                }
+            },
             Command::Diagnostic { command } => match command {
                 DiagnosticCommand::Plan {
                     profile_id,
@@ -313,6 +646,17 @@ async fn execute_capture(
         CaptureCommand::Start => client.call(method::CAPTURE_START, Value::Null).await,
         CaptureCommand::Stop => client.call(method::CAPTURE_STOP, Value::Null).await,
         CaptureCommand::Status => client.call(method::CAPTURE_STATUS, Value::Null).await,
+        CaptureCommand::AutoGet => client.call(method::CAPTURE_AUTO_GET, Value::Null).await,
+        CaptureCommand::AutoSet {
+            profile_id,
+            process_match,
+            enabled,
+        } => client
+            .call(
+                method::CAPTURE_AUTO_SET,
+                json!({"profile_id":profile_id,"process_match":process_match,"enabled":enabled}),
+            )
+            .await,
         CaptureCommand::Snapshot { path } => {
             client
                 .call(method::CAPTURE_SNAPSHOT, json!({"path":path}))
@@ -558,6 +902,20 @@ mod tests {
         assert_eq!(profiles[0]["name"], "Demo");
         let profile_id = profiles[0]["id"].as_str().unwrap().to_owned();
         cli.command = Command::Profile {
+            command: ProfileCommand::Revisions {
+                profile_id: profile_id.clone(),
+            },
+        };
+        let revisions = execute(&cli).await.unwrap();
+        assert_eq!(revisions.as_array().unwrap().len(), 1);
+        cli.command = Command::Profile {
+            command: ProfileCommand::RevisionGet {
+                profile_id: profile_id.clone(),
+                revision: 0,
+            },
+        };
+        assert_eq!(execute(&cli).await.unwrap()["revision"], 0);
+        cli.command = Command::Profile {
             command: ProfileCommand::Duplicate {
                 profile_id: profile_id.clone(),
                 name: "Copy".into(),
@@ -571,6 +929,27 @@ mod tests {
             },
         };
         assert_eq!(execute(&cli).await.unwrap()["active_profile"], profile_id);
+        cli.command = Command::Collection {
+            command: CollectionCommand::PolicySet {
+                profile_id: profile_id.clone(),
+                dataset_root: directory.path().join("dataset"),
+                enabled: true,
+                interval_seconds: 70,
+                jitter_seconds: 10,
+                similarity_threshold: 0.015,
+                maximum_pending_items: 100,
+                maximum_bytes: 10 * 1024 * 1024,
+                novelty_targets: vec!["stage".into()],
+            },
+        };
+        assert_eq!(execute(&cli).await.unwrap()["policy"]["enabled"], true);
+        cli.command = Command::Collection {
+            command: CollectionCommand::AutoReview {
+                profile_id: profile_id.clone(),
+                promote: true,
+            },
+        };
+        assert_eq!(execute(&cli).await.unwrap()["processed"], 0);
         cli.command = Command::Profile {
             command: ProfileCommand::Trash {
                 profile_id: profile_id.clone(),
@@ -611,5 +990,90 @@ mod tests {
         assert_eq!(CliError::Client(ClientError::Disconnected).exit_code(), 3);
         assert_eq!(CliError::Validation("bad".into()).exit_code(), 5);
         assert_eq!(CliError::FollowRequiresStream.exit_code(), 4);
+    }
+
+    #[test]
+    fn external_suite_command_accepts_any_package_path() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "suite",
+            "evaluate",
+            "/tmp/blazblue-entropy-effect",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Suite {
+                command: SuiteCommand::Evaluate { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn collection_policy_and_batch_review_commands_are_scriptable() {
+        let policy = Cli::try_parse_from([
+            "yash-eventsctl",
+            "collection",
+            "policy-set",
+            "00000000-0000-0000-0000-000000000001",
+            "/tmp/game-package",
+            "--interval-seconds",
+            "70",
+            "--novelty-target",
+            "stage",
+        ])
+        .unwrap();
+        assert!(matches!(
+            policy.command,
+            Command::Collection {
+                command: CollectionCommand::PolicySet { .. }
+            }
+        ));
+        let review = Cli::try_parse_from([
+            "yash-eventsctl",
+            "collection",
+            "auto-review",
+            "00000000-0000-0000-0000-000000000001",
+            "--promote",
+        ])
+        .unwrap();
+        assert!(matches!(
+            review.command,
+            Command::Collection {
+                command: CollectionCommand::AutoReview { promote: true, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn output_routes_have_scriptable_set_enable_and_test_commands() {
+        let set = Cli::try_parse_from([
+            "yash-eventsctl",
+            "output",
+            "set",
+            "00000000-0000-0000-0000-000000000001",
+            "stage-marker.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            set.command,
+            Command::Output {
+                command: OutputCommand::Set { .. }
+            }
+        ));
+        let test = Cli::try_parse_from([
+            "yash-eventsctl",
+            "output",
+            "test",
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ])
+        .unwrap();
+        assert!(matches!(
+            test.command,
+            Command::Output {
+                command: OutputCommand::Test { .. }
+            }
+        ));
     }
 }

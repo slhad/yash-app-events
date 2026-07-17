@@ -24,6 +24,7 @@ fn main() {
         minimum_rgb: [180, 0, 0],
         maximum_rgb: [255, 80, 80],
         line_match_fraction: 0.8,
+        maximum_gap_fraction: 0.02,
         mask: None,
     })
     .unwrap();

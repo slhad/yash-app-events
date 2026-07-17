@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use leptess::{LepTess, Variable};
 use serde::{Deserialize, Serialize};
 use yash_app_events_capture::Frame;
-use yash_app_events_profile::NormalizedRegion;
+use yash_app_events_profile::{NormalizedRegion, PreprocessOperation};
 
 use crate::{
     grayscale_crop, Detection, DetectionStatus, DetectionValue, Detector, PreprocessPipeline,
@@ -20,6 +20,8 @@ pub struct OcrConfig {
     pub change_trigger_threshold: f32,
     pub maximum_interval_ms: u64,
     pub preprocessing: PreprocessPipeline,
+    pub empty_value: Option<String>,
+    pub zero_pad_to: Option<u8>,
 }
 
 pub struct OcrDetector {
@@ -56,6 +58,9 @@ impl OcrDetector {
                 .character_whitelist
                 .as_ref()
                 .is_some_and(|whitelist| whitelist.len() > 256)
+            || config
+                .zero_pad_to
+                .is_some_and(|width| !(1..=16).contains(&width))
         {
             return Err("invalid OCR language, page segmentation mode, or whitelist".into());
         }
@@ -80,6 +85,21 @@ impl OcrDetector {
             last_detection: None,
             last_run_ms: None,
         })
+    }
+
+    fn recognize_binary_fallback(&mut self, image: &crate::GrayImage) -> Option<String> {
+        let binary = PreprocessPipeline {
+            operations: vec![PreprocessOperation::Threshold {
+                minimum: 77,
+                maximum: 255,
+            }],
+        }
+        .apply(image)
+        .ok()?;
+        let encoded = encode_grayscale_png(&binary).ok()?;
+        self.engine.set_image_from_mem(&encoded).ok()?;
+        let text = self.engine.get_utf8_text().ok()?.trim().to_owned();
+        (!text.is_empty()).then_some(text)
     }
 }
 
@@ -114,27 +134,76 @@ impl Detector for OcrDetector {
         if let Err(error) = self.engine.set_image_from_mem(&encoded) {
             return Detection::error(format!("Tesseract rejected the OCR crop: {error}"));
         }
-        let text = match self.engine.get_utf8_text() {
+        let mut text = match self.engine.get_utf8_text() {
             Ok(text) => text.trim().to_owned(),
             Err(error) => {
                 return Detection::error(format!("Tesseract recognition failed: {error}"))
             }
         };
+        let mut binary_fallback = false;
         if text.is_empty() {
+            if let Some(fallback_text) = self.recognize_binary_fallback(&image) {
+                text = fallback_text;
+                binary_fallback = true;
+            }
+        }
+        if text.is_empty() {
+            self.last_run_ms = Some(timestamp_ms);
+            if let Some(value) = &self.config.empty_value {
+                let detection = Detection {
+                    value: Some(DetectionValue::Text(value.clone())),
+                    confidence: Some(1.0),
+                    status: DetectionStatus::Valid,
+                    diagnostic: format!("optional OCR value absent; emitted configured {value}"),
+                };
+                self.last_detection = Some(detection.clone());
+                return detection;
+            }
+            if let Some(mut cached) = self.last_detection.clone() {
+                cached.confidence = cached.confidence.map(|confidence| confidence * 0.8);
+                cached
+                    .diagnostic
+                    .push_str("; retained after transient empty OCR result");
+                return cached;
+            }
             return Detection::unknown("Tesseract found no text");
         }
+        let zero_padded = zero_pad_text(&mut text, self.config.zero_pad_to);
         #[allow(clippy::cast_precision_loss)]
         let confidence = (self.engine.mean_text_conf() as f32 / 100.0).clamp(0.0, 1.0);
         let detection = Detection {
             value: Some(DetectionValue::Text(text.clone())),
             confidence: Some(confidence),
             status: DetectionStatus::Valid,
-            diagnostic: format!("Tesseract recognized {} character(s)", text.chars().count()),
+            diagnostic: format!(
+                "Tesseract recognized {} character(s){}{}",
+                text.chars().count(),
+                if binary_fallback {
+                    " after binary fallback"
+                } else {
+                    ""
+                },
+                if zero_padded {
+                    " with zero padding"
+                } else {
+                    ""
+                }
+            ),
         };
         self.last_run_ms = Some(timestamp_ms);
         self.last_detection = Some(detection.clone());
         detection
     }
+}
+
+fn zero_pad_text(text: &mut String, width: Option<u8>) -> bool {
+    let Some(width) = width else { return false };
+    let missing = usize::from(width).saturating_sub(text.chars().count());
+    if missing == 0 {
+        return false;
+    }
+    text.insert_str(0, &"0".repeat(missing));
+    true
 }
 
 fn normalized_difference(previous: &crate::GrayImage, current: &crate::GrayImage) -> f32 {
@@ -182,6 +251,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_width_is_preserved_without_truncating_longer_results() {
+        let mut short = "5".to_owned();
+        assert!(zero_pad_text(&mut short, Some(2)));
+        assert_eq!(short, "05");
+        let mut complete = "116".to_owned();
+        assert!(!zero_pad_text(&mut complete, Some(2)));
+        assert_eq!(complete, "116");
+    }
+
+    #[test]
     fn rejects_unbounded_configuration_before_native_initialization() {
         let error = OcrDetector::new(OcrConfig {
             language: "eng".into(),
@@ -191,6 +270,8 @@ mod tests {
             change_trigger_threshold: 0.02,
             maximum_interval_ms: 1_000,
             preprocessing: PreprocessPipeline::default(),
+            empty_value: None,
+            zero_pad_to: None,
         })
         .unwrap_err();
         assert!(error.contains("invalid OCR"));
@@ -207,6 +288,8 @@ mod tests {
             change_trigger_threshold: 0.02,
             maximum_interval_ms: 1_000,
             preprocessing: PreprocessPipeline::default(),
+            empty_value: None,
+            zero_pad_to: None,
         })
         .unwrap();
         let detection = detector.detect(
@@ -238,6 +321,46 @@ mod tests {
         assert!(cached
             .diagnostic
             .contains("cached because crop is unchanged"));
+    }
+
+    #[test]
+    fn optional_counter_emits_zero_when_text_is_absent() {
+        let frame = Frame::new(
+            0,
+            Duration::ZERO,
+            FrameLayout {
+                width: 40,
+                height: 40,
+                row_stride: 120,
+                format: PixelFormat::Rgb8,
+            },
+            Some("blank-optional-counter".into()),
+            Arc::from(vec![0_u8; 40 * 40 * 3]),
+        )
+        .unwrap();
+        let mut detector = OcrDetector::new(OcrConfig {
+            language: "eng".into(),
+            data_path: None,
+            page_segmentation_mode: 10,
+            character_whitelist: Some("0123456789".into()),
+            change_trigger_threshold: 0.01,
+            maximum_interval_ms: 500,
+            preprocessing: PreprocessPipeline::default(),
+            empty_value: Some("0".into()),
+            zero_pad_to: None,
+        })
+        .unwrap();
+        let detection = detector.detect(
+            &frame,
+            NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(detection.status, DetectionStatus::Valid);
+        assert_eq!(detection.value, Some(DetectionValue::Text("0".into())));
     }
 
     #[test]
@@ -279,6 +402,8 @@ mod tests {
                 change_trigger_threshold: 0.02,
                 maximum_interval_ms: 1_000,
                 preprocessing: PreprocessPipeline::default(),
+                empty_value: None,
+                zero_pad_to: None,
             })
             .unwrap();
             let detection = detector.detect(

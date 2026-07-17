@@ -1,5 +1,8 @@
 //! Latest-frame scheduling, typed observations, temporal rules, and transitions.
 
+pub mod collection;
+pub mod suite;
+
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
@@ -1323,6 +1326,7 @@ mod tests {
                     minimum_rgb: [180, 0, 0],
                     maximum_rgb: [255, 60, 60],
                     line_match_fraction: 0.8,
+                    maximum_gap_fraction: 0.02,
                     mask: None,
                 })
                 .unwrap(),

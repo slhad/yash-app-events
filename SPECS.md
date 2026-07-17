@@ -183,6 +183,21 @@ Profile and state snapshot writes shall use write-to-temporary-file, flush, and 
 
 The GUI shall autosave recoverable drafts separately from the last committed profile. Committing a valid profile shall increment its revision. The system shall retain a bounded revision history, defaulting to 20 revisions.
 
+Revision history shall be available through the shared control protocol. Clients shall
+be able to list and inspect retained snapshots, compare them with the current profile,
+and roll a selected snapshot forward as a new revision after optimistic-concurrency
+validation. Rollback shall never erase or overwrite the current revision.
+
+Profiles may define stable-ID derived text observations with an enabled state, a bounded
+format string, and named inputs referencing detector observations. The daemon shall own
+composition and publish derived values through the same state, rule, output, and JSON-RPC
+paths as detector observations. The GUI shall expose the hierarchy and editable composition.
+
+Event rules may detect a bounded rapid numeric increase over a configured time window.
+Digit-only text observations shall be accepted as numeric inputs. Emission shall retain
+stable rule/event IDs and obey cooldown, enabling downstream recording consumers without
+embedding recording actions in detection.
+
 ### SPEC-PROFILE-007 — Optimistic concurrency
 
 Mutating RPC requests shall provide the expected profile revision. A stale edit shall receive a conflict containing the current revision rather than overwriting newer work.
@@ -257,6 +272,11 @@ The UI shall show recent observations, emitted transitions, confidence, timestam
 
 Capture, image processing, OCR, inference, profile I/O, and output I/O shall not run on the GUI render thread.
 
+The daemon shall optionally monitor a machine-local game-process match for the active
+profile. After bounded debounce it shall restore capture when the process appears and
+stop capture when it disappears. Process policy and portal tokens shall remain outside
+portable profiles and shall be controllable through the shared JSON-RPC protocol.
+
 ## 7. Detection
 
 ### SPEC-DET-001 — Detector contract
@@ -290,6 +310,10 @@ OCR shall be a detector backend introduced after deterministic detectors work en
 
 OCR is not required for the first vertical slice.
 
+Optional OCR HUD counters may configure an explicit empty value. When their visual token
+disappears, the detector shall emit that value as valid rather than retaining stale text;
+ordinary OCR detectors shall keep transient-empty retention behavior.
+
 ### SPEC-DET-006 — Classifier
 
 Generic ONNX classification shall load explicitly declared portable model assets only
@@ -308,6 +332,13 @@ Acceptance:
 ### SPEC-DET-007 — Preprocessing
 
 Detector preprocessing shall be explicit, serializable, previewable, and deterministic. Supported operations should begin with crop, resize, grayscale, color conversion, threshold, and simple morphology.
+
+### SPEC-DET-008 — Seven-segment recognition
+
+Fixed-layout seven-segment HUD text shall use deterministic glyph decoding rather than
+general-purpose OCR. Profiles shall declare the digit count, optional separator
+position, brightness threshold, and preprocessing. Invalid or ambiguous glyphs shall
+produce `unknown`, never a fabricated digit.
 
 ## 8. Event engine
 
@@ -396,6 +427,58 @@ Flush policy and log rotation shall be configurable. Defaults must balance durab
 
 Output failure shall be visible in daemon status, logs, IPC notifications, and the GUI. It shall not terminate capture unless explicitly configured as fatal.
 
+### SPEC-OUT-005 — Profile-scoped output routes
+
+The daemon shall support bounded machine-local output routes keyed by profile ID. A route
+shall select meaningful event transitions or rendered state changes, render either the
+stable full contract, a bounded JSON template, or a bounded raw-text template, and deliver it to an append/replace file
+or a directly executed local program. Route execution shall not use a shell.
+
+Command routes are executable local policy, not portable profile content. They shall be
+disabled until explicitly configured on the machine, require an absolute executable path,
+receive compact JSON on standard input, have bounded arguments and timeout, and run outside
+capture/analysis and GUI render threads. Imported profiles shall never create or authorize
+command routes.
+
+Acceptance:
+
+- At most 64 routes per profile and 64 pending deliveries are retained.
+- Event routes filter stable event names and `entered`/`updated`/`left` states.
+- State routes compare the rendered payload and do not deliver an unchanged template.
+- JSON placeholders preserve typed values when the placeholder is the complete JSON string.
+- Raw-text templates write UTF-8 without JSON quoting, with an explicit default-on
+  trailing line feed and no carriage return; disabling the line feed writes no line-ending
+  bytes. Atomic replace supports a universally readable current-value file.
+- The shared protocol and CLI can list, set, enable/disable, remove, and test routes.
+- The GUI lists routes and exposes enable/disable plus an explicit delivery test.
+- Profile replay publishes through the same durable state/event and output-route boundary as
+  live processing; long image/OCR replays remain bounded and visible in the GUI.
+- Delivery failures remain non-fatal and appear in status and live notifications.
+
+### SPEC-OUT-006 — Portable inert output recipes
+
+Portable profiles may carry bounded schema-1 output recipes under `output-recipes/`.
+A recipe may describe an event/state trigger, JSON or raw-text format, and suggested file or command
+sink, but shall contain neither an authorized filesystem destination nor an executable
+path or enabled state. Import/export shall validate, hash, and resource-limit recipes.
+
+The GUI shall list packaged recipes, disclose their source path/hash, trigger, payload,
+suggested sink, and description, and allow trigger/payload editing. Preview shall render
+sample JSON without side effects. Installation shall require an explicit absolute local
+file or executable selection, revalidate the reviewed recipe hash, record immutable source
+provenance, allocate a local route ID, and always install disabled. Delivery testing and
+enabling remain separate explicit actions.
+
+Acceptance:
+
+- Imported recipes cannot authorize or execute a route.
+- At most 32 recipe files of at most 64 KiB each are accepted per profile.
+- Unsafe entries, malformed recipes, duplicate recipe IDs, and changed review hashes fail.
+- Portable archive round trips retain recipe manifest hashes and semantics.
+- GUI list/edit/preview/install uses shared versioned daemon methods.
+- Editing or manually replacing an installed route removes recipe provenance rather than
+  falsely presenting it as the reviewed recipe.
+
 ## 10. IPC and CLI
 
 ### SPEC-IPC-001 — Local transport
@@ -459,6 +542,32 @@ The repository shall support small redistributable synthetic fixtures. Copyright
 ### SPEC-REPLAY-004 — Metrics
 
 Replay evaluation should report event precision, recall, duplicates, misses, and detection latency. OCR character accuracy alone is not a product success metric.
+
+### SPEC-REPLAY-005 — External detector suites
+
+The daemon shall evaluate schema-versioned detector-regression packages located outside
+the repository without installing or mutating their pinned portable profile. Packages
+shall support full frames, partial screenshots with explicit reference-frame placement,
+and exact detector-zone crops. Each case shall declare typed expected observations,
+optional event expectations, purpose, categories, and source-media provenance. A
+SHA-256 inventory and canonical path checks shall reject changed or escaping files.
+The CLI shall expose the same JSON-RPC method, stable JSON results, and a nonzero exit
+status when any assertion or checked event regression fails.
+
+### SPEC-REPLAY-006 — Passive evidence collection and review
+
+The daemon shall optionally collect exact analyzed game frames into an external
+regression package while capture is active. The machine-local per-profile policy shall
+default to a 70-second interval, support bounded jitter, perceptual-similarity and
+detector-evidence deduplication, storage/item quotas, and explicitly selected novelty
+targets. Each item shall atomically retain the frame, pinned profile revision/hash,
+observations, transitions, source metadata, image hash, and an unverified review state.
+
+Pending evidence shall never become ground truth without review. The shared versioned
+control protocol, CLI, and GUI shall support listing, inspection, accept, correction,
+rejection, conservative automatic batch review, comparison, and promotion. Automation
+shall leave ambiguous observations as `needs_correction`; promotion shall create a
+checksummed external-suite case without mutating or installing the portable profile.
 
 ## 12. Observability and diagnostics
 
@@ -540,7 +649,7 @@ SPEC-PROFILE-002 | VERIFIED | XDG resolution tests plus atomic `settings.toml` a
 SPEC-PROFILE-003 | VERIFIED | typed UUID identities, stable-name validation, duplicate-ID and dangling-reference rejection in profile tests (2026-07-11)
 SPEC-PROFILE-004 | VERIFIED | schema-v1 `NormalizedRegion` and layout metadata validation tests reject out-of-bounds regions with field paths (2026-07-11)
 SPEC-PROFILE-005 | VERIFIED | same-directory temporary write, flush, sync, and rename; injected pre-rename failure test proves the prior document remains valid (2026-07-11)
-SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft separation, revision increment/history pruning, and tests with configurable bounded history (2026-07-11)
+SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft separation, revision increment/history pruning, protocol list/get/rollback with expected-revision conflicts, roll-forward preservation tests, and GUI history/comparison/confirmation workflow (2026-07-12)
 SPEC-PROFILE-007 | VERIFIED | stale-commit test proves structured expected/current revision conflict without overwrite (2026-07-11)
 SPEC-PROFILE-008 | VERIFIED | tests prove profile assets are deep-copied with all internal IDs rekeyed and element rules copy only on explicit request (2026-07-11)
 SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test; no implicit permanent deletion API (2026-07-11)
@@ -565,11 +674,15 @@ SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1
 SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/timestamp/capture/profile/observations/events; atomic interruption and daemon `state.get` equality tests (2026-07-11)
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | VERIFIED | typed sink failures never panic, failure injection preserves engine operation, daemon records status `output_error` and emits a live error notification consumed by protocol clients/GUI (2026-07-11)
+SPEC-OUT-005 | VERIFIED | machine-local schema-1 routes provide event filters, rendered-state deduplication, typed JSON and raw-text templates, configurable trailing line feed, append/atomic-replace files, direct bounded commands without a shell, capacity-64 background delivery, shared list/set/enable/remove/test RPC and CLI, GUI enable/test controls, and output/profile/daemon integration tests; configured profile replay publishes through the same output boundary, isolated workspace-4 GUI runs proved both the 13-byte `STAGE-3 : 04\n` file and exact 12-byte no-line-ending variant, and visual acceptance confirms the route section and individual routes are collapsed by default with enabled-count/actionable summaries while expanded Trigger/Sink metadata remains normal-sized (2026-07-18)
+SPEC-OUT-006 | VERIFIED | schema-1 inert recipes are limited/validated/hashed during portable archive import/export; hash-pinned preview has no side effect, install requires an explicit absolute local sink and creates a fresh disabled route with provenance, manual replacement clears provenance, and shared RPC plus GUI browse/edit/preview/install are covered by output/profile/archive/daemon integration tests; packaged examples are collapsed by default; strict Clippy, 117 workspace tests, README claims, and docs pass (2026-07-18)
 SPEC-DET-002 | VERIFIED | four-direction RGB range/mask detector handles padded stride, partial/scaled bars, noise and brightness variation; profile-backed daemon RPC plus replay produces files/state/subscription events (2026-07-11)
-SPEC-REPLAY-001 | VERIFIED | live latest-frame and replay manifest paths both feed the configured detector and `FrameProcessor` temporal-rule boundary; daemon integration tests exercise both (2026-07-11)
+SPEC-REPLAY-001 | VERIFIED | live latest-frame and replay manifest paths both feed the configured detector, derived observations, temporal rules, durable state/events, and profile output routes; daemon integration tests plus an isolated workspace-4 GUI run exercise both, and the GUI permits up to 300 seconds for bounded OCR/image replay completion (2026-07-17)
 SPEC-REPLAY-002 | VERIFIED | identical timestamped synthetic health frames run twice through color detection and temporal rules and yield identical ordered entered/left transitions (2026-07-11)
 SPEC-REPLAY-003 | VERIFIED | schema-v1 bounded synthetic manifest format, detector-specific fixture semantics, validation, and redistributable deterministic integration cases are documented in `docs/replay.md` (2026-07-11)
 SPEC-REPLAY-004 | VERIFIED | engine evaluator and daemon/CLI report precision, recall, duplicates, misses, mean event latency, pass/fail thresholds, stable JSON, and regression exit status 7; tests cover passing known events and duplicate regression (2026-07-11)
+SPEC-REPLAY-005 | VERIFIED | schema-v1 external packages pin a portable profile and SHA-256 inventory; daemon/CLI `suite.evaluate` safely evaluate full frames, positioned partial screenshots, and detector-zone crops through the common detector/derived-observation/event path; typed exact/tolerant assertions, event metrics, category summaries, traversal rejection, and exit status 7 are tested; the ignored local BlazBlue suite passes 33 cases, 50 frames, and 126 observation assertions (2026-07-14)
+SPEC-REPLAY-006 | VERIFIED | opt-in machine-local 70±10-second collection stores exact analyzed frames and full evidence atomically only during active game capture; a 32×18 perceptual comparison identifies the real 10-second static pair at difference 0.008501 below the 0.015 threshold; quotas, novelty signatures, hash verification, review states, conservative batch review, correction, rejection, and checksum-updating promotion are covered by engine/daemon/CLI tests and shared JSON-RPC/GUI controls; 12 corrected live items promoted into the external BlazBlue suite and all pass (2026-07-14)
 SPEC-ARCH-004 | VERIFIED | monotonic `Duration` orders frames/rules; UTC millisecond RFC 3339 external timestamps, per-instance UUID, and increasing event sequence are asserted across files/state/IPC (2026-07-11)
 SPEC-EVENT-004 | VERIFIED | first N-of-M state establishment produces no transition; each daemon creates a UUID instance carried by state and events (2026-07-11)
 SPEC-EVENT-005 | VERIFIED | schema-v1-compatible typed predicates and bounded non-recursive composition validate/round-trip/rekey; boolean/text/stable/initial/updated/all/any engine tests, GUI authoring, multi-element live coordinator, and numeric/OCR/classifier image replay event evidence pass (2026-07-11)
@@ -597,9 +710,10 @@ SPEC-PROD-003 | VERIFIED | capture is portal-mediated and the codebase has no pr
 SPEC-UI-005 | VERIFIED | detector-specific color/template/change forms, preprocessing, validation through commit, draft-aware frozen/live tests, template capture, and original/processed diagnostics are implemented through protocol-v1; frozen region-change acceptance returned baseline plus a valid sample (2026-07-11)
 SPEC-UI-006 | VERIFIED | numeric rule editor explicitly presents observation versus event, enter/leave hysteresis, confidence, N-of-M evidence, cooldown, and current state (2026-07-11)
 SPEC-UI-007 | VERIFIED | always-visible live evidence panel and bounded timeline display capture state/metrics, observations, event states, detector value/confidence/diagnostic, and transition sequence/time; image persistence remains explicit (2026-07-11)
-SPEC-DET-005 | VERIFIED | redistributable English/localized/scale/animation/glow fixtures and reproducible Tesseract 5 versus RapidOCR/ONNX Runtime accuracy/latency/confidence/CPU/memory benchmark select Tesseract; typed native detector, bounded change-triggered refresh, profile validation, daemon/GUI configuration, frozen diagnostics, fixture regression tests, and common-path image replay text event pass (2026-07-11)
+SPEC-DET-005 | VERIFIED | redistributable English/localized/scale/animation/glow fixtures and reproducible Tesseract 5 versus RapidOCR/ONNX Runtime accuracy/latency/confidence/CPU/memory benchmark select Tesseract; typed native detector, bounded change-triggered refresh with binary retry and last-valid retention on transient empty reads, profile validation, daemon/GUI configuration, frozen diagnostics, fixture regression tests, and common-path image replay text event pass; recorded BlazBlue structured-stage replay recognizes group `2` and counters `05` and `10`, composing `STAGE-2 : 10` (2026-07-12)
+SPEC-DET-008 | VERIFIED | generic fixed-layout seven-segment detector validates digit/separator layout, discovers glyph bounds, handles narrow `1` glyphs, emits typed text/confidence/diagnostics, supports GUI/profile/image replay, and decoded live BlazBlue timer `31:44`, `32:04`, `32:07`, and `36:10` exactly at 3840×2160 (2026-07-12)
 SPEC-DET-006 | VERIFIED | generated eight-case noisy/shifted orb-versus-cross HUD-icon dataset and 765-byte ONNX model with manifest/hash; path/size/SHA/labels/dimensions/output/scheduling validation, bounded change cache, CPU `ort` inference, GUI configuration/diagnostics, daemon image replay and text event pass; 80,000-case release benchmark records 100% fixture accuracy, confidence, 0.00333 ms latency, 26 CPU ticks and 26792 KiB peak RSS; clean-prefix installed-daemon replay returns typed labels and precision/recall 1.0 (2026-07-11)
-SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, and connected clients (2026-07-11)
+SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, connected clients, and process-wide daemon/GUI CPU plus RSS memory (2026-07-12)
 SPEC-OBS-003 | VERIFIED | protocol-v1 plan/review/export is shared by CLI and GUI; exact entry/size disclosure, visible privacy confirmation, recursive secret/binding/token redaction, explicit frozen element crops, PNG/name/count/file/total limits, atomic ZIP output, failure cleanup, and daemon/output adversarial tests pass (2026-07-11)
 SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
 SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)

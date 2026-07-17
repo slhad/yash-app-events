@@ -24,6 +24,10 @@ criteria in `SPECS.md`. Do not claim support until those criteria have evidence.
   profile assets requiring their own datasets and evidence.
 - R5 — performance and platform candidates: uncommitted; promote only from measured
   need and a concrete use case.
+- R6 — profile-scoped output routes: complete (2026-07-17). Machine-local event/state
+  routes, JSON templates, file/direct-command sinks, bounded execution, shared controls,
+  GUI verification, portable inert recipe browse/edit/preview/install, archive/provenance
+  safety, and refreshed workspace quality gates pass.
 
 ## R1 — Complete event-rule language
 
@@ -93,6 +97,23 @@ Exit gate:
 - Untrusted models and inputs have explicit validation and resource limits.
 - Classifier failures produce `unknown` or `error`, never fabricated negatives.
 - Installation and packaging of the selected runtime are verified.
+
+## R6 — Profile-scoped output routes
+
+Promote `SPEC-OUT-005` to let each active profile route selected events or rendered
+state changes into integration-specific outputs without coupling integrations to the
+detector engine.
+
+Exit gate:
+
+- Machine-local routes cannot enter portable archives or execute through a shell.
+- File and direct-command sinks support bounded, typed JSON templates.
+- Delivery runs through a bounded daemon worker and failures remain observable/non-fatal.
+- Shared RPC/CLI methods and GUI enable/test controls pass integration tests.
+- Portable recipe files are archive-validated and can only become hash-pinned, disabled
+  local routes after explicit GUI review, editing, preview, and sink selection.
+- A later BlazBlue stage-marker route can call the reviewed local `yash` IPC executable
+  without adding a game-specific sink to this repository.
 
 ## R5 — Candidates requiring promotion
 

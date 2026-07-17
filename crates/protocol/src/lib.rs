@@ -115,6 +115,8 @@ pub struct Status {
     pub last_processing_latency_ms: Option<f64>,
     pub detector_errors: u64,
     pub output_error: Option<String>,
+    pub daemon_cpu_percent: f32,
+    pub daemon_rss_bytes: u64,
 }
 
 /// Server notification, sent without a request identifier.
@@ -153,6 +155,9 @@ pub mod method {
     pub const SHUTDOWN: &str = "system.shutdown";
     pub const PROFILE_LIST: &str = "profile.list";
     pub const PROFILE_GET: &str = "profile.get";
+    pub const PROFILE_REVISIONS: &str = "profile.revisions";
+    pub const PROFILE_REVISION_GET: &str = "profile.revision_get";
+    pub const PROFILE_ROLLBACK: &str = "profile.rollback";
     pub const PROFILE_CREATE: &str = "profile.create";
     pub const PROFILE_COMMIT: &str = "profile.commit";
     pub const PROFILE_DUPLICATE: &str = "profile.duplicate";
@@ -164,6 +169,14 @@ pub mod method {
     pub const PROFILE_ACTIVATE: &str = "profile.activate";
     pub const PROFILE_DRAFT: &str = "profile.draft";
     pub const STATE_GET: &str = "state.get";
+    pub const OUTPUT_LIST: &str = "output.list";
+    pub const OUTPUT_SET: &str = "output.set";
+    pub const OUTPUT_ENABLE: &str = "output.enable";
+    pub const OUTPUT_REMOVE: &str = "output.remove";
+    pub const OUTPUT_TEST: &str = "output.test";
+    pub const OUTPUT_RECIPE_LIST: &str = "output.recipe_list";
+    pub const OUTPUT_RECIPE_PREVIEW: &str = "output.recipe_preview";
+    pub const OUTPUT_RECIPE_INSTALL: &str = "output.recipe_install";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
     pub const REPLAY_SYNTHETIC_HEALTH: &str = "replay.synthetic_health";
@@ -171,10 +184,21 @@ pub mod method {
     pub const DETECTOR_CAPTURE_TEMPLATE: &str = "detector.capture_template";
     pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
     pub const REPLAY_EVALUATE: &str = "replay.evaluate";
+    pub const SUITE_EVALUATE: &str = "suite.evaluate";
+    pub const COLLECTION_POLICY_GET: &str = "collection.policy_get";
+    pub const COLLECTION_POLICY_SET: &str = "collection.policy_set";
+    pub const COLLECTION_STATUS: &str = "collection.status";
+    pub const COLLECTION_ITEMS: &str = "collection.items";
+    pub const COLLECTION_ITEM_GET: &str = "collection.item_get";
+    pub const COLLECTION_REVIEW: &str = "collection.review";
+    pub const COLLECTION_AUTO_REVIEW: &str = "collection.auto_review";
+    pub const COLLECTION_COMPARE: &str = "collection.compare";
     pub const CAPTURE_SELECT: &str = "capture.select";
     pub const CAPTURE_START: &str = "capture.start";
     pub const CAPTURE_STOP: &str = "capture.stop";
     pub const CAPTURE_STATUS: &str = "capture.status";
+    pub const CAPTURE_AUTO_GET: &str = "capture.auto_get";
+    pub const CAPTURE_AUTO_SET: &str = "capture.auto_set";
     pub const CAPTURE_SNAPSHOT: &str = "capture.snapshot";
     pub const PREVIEW_START: &str = "preview.start";
     pub const PREVIEW_STOP: &str = "preview.stop";

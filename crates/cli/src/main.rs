@@ -2,7 +2,9 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use yash_eventsctl::{event_stream, execute, format_result, Cli, Command, EventsCommand};
+use yash_eventsctl::{
+    event_stream, execute, format_result, Cli, Command, EventsCommand, SuiteCommand,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -17,11 +19,16 @@ async fn main() -> ExitCode {
     } else {
         execute(&cli).await.and_then(|value| {
             println!("{}", format_result(&cli.command, &value, cli.json));
-            if matches!(cli.command, Command::Replay { .. })
-                && !value["metrics"]["passed"].as_bool().unwrap_or(false)
-            {
+            let regression_failed = match &cli.command {
+                Command::Replay { .. } => !value["metrics"]["passed"].as_bool().unwrap_or(false),
+                Command::Suite {
+                    command: SuiteCommand::Evaluate { .. },
+                } => !value["passed"].as_bool().unwrap_or(false),
+                _ => false,
+            };
+            if regression_failed {
                 Err(yash_eventsctl::CliError::Replay(
-                    "configured metric thresholds were not met".into(),
+                    "regression expectations were not met".into(),
                 ))
             } else {
                 Ok(())

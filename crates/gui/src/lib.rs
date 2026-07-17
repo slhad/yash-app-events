@@ -11,9 +11,9 @@ use eframe::egui;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
-    AtomicRulePredicate, BarDirection, Detector, DetectorId, Element, ElementId, EventRule,
-    NormalizedRegion, ObservationCondition, PreprocessOperation, Profile, ProfileStore, RuleId,
-    RulePredicate,
+    AtomicRulePredicate, BarDirection, DerivedInput, DerivedObservation, Detector, DetectorId,
+    Element, ElementId, EventRule, NormalizedRegion, ObservationCondition, PreprocessOperation,
+    Profile, ProfileId, ProfileStore, RuleId, RulePredicate,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -36,6 +36,20 @@ enum RequestKind {
     Replay,
     DiagnosticPlan,
     DiagnosticExport,
+    RevisionHistory,
+    Rollback,
+    AutoCapture,
+    CollectionPolicy,
+    CollectionStatus,
+    CollectionItems,
+    CollectionItem,
+    CollectionMutation,
+    OutputRoutes,
+    OutputMutation,
+    OutputTest,
+    OutputRecipeList,
+    OutputRecipePreview,
+    OutputRecipeInstall,
 }
 
 #[derive(Debug)]
@@ -53,6 +67,10 @@ enum Payload {
         value: Value,
         original: PreviewImage,
         processed: PreviewImage,
+    },
+    CollectionInspection {
+        value: Value,
+        image: PreviewImage,
     },
     Error(String),
 }
@@ -199,7 +217,9 @@ impl Worker {
                         let result = match params {
                             Ok(params) => {
                                 let client = client.as_mut().expect("client was initialized");
-                                if request.method == method::CAPTURE_SELECT {
+                                if request.method == method::CAPTURE_SELECT
+                                    || request.kind == RequestKind::Replay
+                                {
                                     client
                                         .call_with_timeout(
                                             request.method,
@@ -236,6 +256,12 @@ impl Worker {
                                         processed,
                                     },
                                     (Err(error), _) | (_, Err(error)) => Payload::Error(error),
+                                }
+                            }
+                            Ok(value) if request.kind == RequestKind::CollectionItem => {
+                                match decode_collection_image(&value) {
+                                    Ok(image) => Payload::CollectionInspection { value, image },
+                                    Err(error) => Payload::Error(error),
                                 }
                             }
                             Ok(value) => Payload::Json(value),
@@ -297,6 +323,7 @@ pub struct App {
     zoom: f32,
     pan: egui::Vec2,
     selected_region: Option<usize>,
+    selected_derived: Option<usize>,
     drawing: bool,
     draw_start: Option<egui::Pos2>,
     drag_origin: Option<NormalizedRegion>,
@@ -317,6 +344,38 @@ pub struct App {
     diagnostic_path: String,
     diagnostic_plan: Value,
     diagnostic_privacy_reviewed: bool,
+    revisions: Vec<Profile>,
+    selected_revision: Option<usize>,
+    rollback_confirm: bool,
+    process_sampler: ProcessSampler,
+    gui_usage: ProcessUsage,
+    auto_capture_enabled: bool,
+    auto_process_match: String,
+    auto_process_running: bool,
+    collection_enabled: bool,
+    collection_dataset_root: String,
+    collection_interval_seconds: u64,
+    collection_jitter_seconds: u64,
+    collection_similarity_threshold: f32,
+    collection_maximum_pending: usize,
+    collection_maximum_bytes: u64,
+    collection_novelty_targets: String,
+    collection_status: Value,
+    collection_items: Vec<Value>,
+    collection_selected: Value,
+    collection_expected_json: String,
+    collection_texture: Option<egui::TextureHandle>,
+    output_routes: Vec<Value>,
+    output_test: Value,
+    output_recipes: Vec<Value>,
+    selected_output_recipe: Option<usize>,
+    output_recipe_editor: String,
+    output_recipe_destination: String,
+    output_recipe_arguments: String,
+    output_recipe_timeout_ms: u64,
+    output_recipe_command: bool,
+    output_recipe_replace: bool,
+    output_recipe_preview: Value,
 }
 
 impl fmt::Debug for App {
@@ -365,6 +424,7 @@ impl App {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             selected_region: None,
+            selected_derived: None,
             drawing: false,
             draw_start: None,
             drag_origin: None,
@@ -385,10 +445,42 @@ impl App {
             diagnostic_path: String::new(),
             diagnostic_plan: json!({}),
             diagnostic_privacy_reviewed: false,
+            revisions: Vec::new(),
+            selected_revision: None,
+            rollback_confirm: false,
+            process_sampler: ProcessSampler::default(),
+            gui_usage: ProcessUsage::default(),
+            auto_capture_enabled: false,
+            auto_process_match: String::new(),
+            auto_process_running: false,
+            collection_enabled: false,
+            collection_dataset_root: String::new(),
+            collection_interval_seconds: 70,
+            collection_jitter_seconds: 10,
+            collection_similarity_threshold: 0.015,
+            collection_maximum_pending: 1_000,
+            collection_maximum_bytes: 2_147_483_648,
+            collection_novelty_targets: String::new(),
+            collection_status: json!({}),
+            collection_items: Vec::new(),
+            collection_selected: json!({}),
+            collection_expected_json: "{}".into(),
+            collection_texture: None,
+            output_routes: Vec::new(),
+            output_test: json!({}),
+            output_recipes: Vec::new(),
+            selected_output_recipe: None,
+            output_recipe_editor: String::new(),
+            output_recipe_destination: String::new(),
+            output_recipe_arguments: "[]".into(),
+            output_recipe_timeout_ms: 5_000,
+            output_recipe_command: false,
+            output_recipe_replace: false,
+            output_recipe_preview: json!({}),
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn drain(&mut self, context: &egui::Context) {
         while let Ok(response) = self.worker.responses.try_recv() {
             match response.payload {
@@ -444,10 +536,36 @@ impl App {
                         ));
                     }
                 }
+                Payload::CollectionInspection { value, image } => {
+                    self.error = None;
+                    self.collection_selected = value;
+                    self.collection_texture =
+                        Some(load_preview_texture(context, "collection-review", &image));
+                    let reviewed =
+                        &self.collection_selected["item"]["review"]["expected_observations"];
+                    let expected = if reviewed.as_object().is_some_and(|map| !map.is_empty()) {
+                        reviewed.clone()
+                    } else {
+                        self.collection_selected["suggested_expected_observations"].clone()
+                    };
+                    self.collection_expected_json =
+                        serde_json::to_string_pretty(&expected).unwrap_or_else(|_| "{}".into());
+                }
                 Payload::Json(value) => {
                     self.error = None;
                     match response.kind {
                         RequestKind::Profiles => self.apply_profiles(value),
+                        RequestKind::RevisionHistory => {
+                            match serde_json::from_value::<Vec<Profile>>(value) {
+                                Ok(revisions) => {
+                                    self.revisions = revisions;
+                                    self.selected_revision = self.revisions.len().checked_sub(2);
+                                }
+                                Err(error) => {
+                                    self.error = Some(format!("invalid revision history: {error}"));
+                                }
+                            }
+                        }
                         RequestKind::Status => self.status = value,
                         RequestKind::State => {
                             let sequence = value["sequence"].as_u64().unwrap_or(0);
@@ -479,6 +597,92 @@ impl App {
                                 Value::Null,
                             );
                         }
+                        RequestKind::Rollback => {
+                            self.rollback_confirm = false;
+                            self.dirty_since = None;
+                            self.worker.send(
+                                RequestKind::Profiles,
+                                method::PROFILE_LIST,
+                                Value::Null,
+                            );
+                            if let Some(profile) = &self.draft {
+                                self.worker.send(
+                                    RequestKind::RevisionHistory,
+                                    method::PROFILE_REVISIONS,
+                                    json!({"profile_id":profile.id}),
+                                );
+                            }
+                        }
+                        RequestKind::AutoCapture => {
+                            self.auto_capture_enabled = value["enabled"].as_bool().unwrap_or(false);
+                            self.auto_process_match =
+                                value["process_match"].as_str().unwrap_or("").to_owned();
+                            self.auto_process_running =
+                                value["process_running"].as_bool().unwrap_or(false);
+                        }
+                        RequestKind::CollectionPolicy => {
+                            let policy = &value["policy"];
+                            self.collection_enabled = policy["enabled"].as_bool().unwrap_or(false);
+                            self.collection_dataset_root =
+                                policy["dataset_root"].as_str().unwrap_or("").to_owned();
+                            self.collection_interval_seconds =
+                                policy["interval_seconds"].as_u64().unwrap_or(70);
+                            self.collection_jitter_seconds =
+                                policy["jitter_seconds"].as_u64().unwrap_or(10);
+                            self.collection_similarity_threshold =
+                                policy["similarity_threshold"].as_f64().unwrap_or(0.015) as f32;
+                            self.collection_maximum_pending = policy["maximum_pending_items"]
+                                .as_u64()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .unwrap_or(1_000);
+                            self.collection_maximum_bytes =
+                                policy["maximum_bytes"].as_u64().unwrap_or(2_147_483_648);
+                            self.collection_novelty_targets = policy["novelty_targets"]
+                                .as_array()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                        }
+                        RequestKind::CollectionStatus => self.collection_status = value,
+                        RequestKind::CollectionItems => {
+                            self.collection_items =
+                                value["items"].as_array().cloned().unwrap_or_default();
+                        }
+                        RequestKind::CollectionMutation => {
+                            self.refresh_collection();
+                        }
+                        RequestKind::OutputRoutes | RequestKind::OutputMutation => {
+                            self.output_routes = value.as_array().cloned().unwrap_or_default();
+                        }
+                        RequestKind::OutputTest => self.output_test = value,
+                        RequestKind::OutputRecipeList => {
+                            self.output_recipes = value.as_array().cloned().unwrap_or_default();
+                            if self
+                                .selected_output_recipe
+                                .is_none_or(|index| index >= self.output_recipes.len())
+                            {
+                                self.selected_output_recipe = None;
+                                if !self.output_recipes.is_empty() {
+                                    self.select_output_recipe(0);
+                                }
+                            }
+                        }
+                        RequestKind::OutputRecipePreview => {
+                            self.output_recipe_preview = value;
+                        }
+                        RequestKind::OutputRecipeInstall => {
+                            self.output_routes =
+                                value["routes"].as_array().cloned().unwrap_or_default();
+                            self.output_recipe_preview = json!({
+                                "installed":value["installed"],
+                                "note":"Installed disabled; test and enable it above after review."
+                            });
+                        }
                         RequestKind::Capture | RequestKind::CaptureSelect => {
                             self.capture_status = value;
                             if response.kind == RequestKind::CaptureSelect {
@@ -492,7 +696,7 @@ impl App {
                             self.preview_enabled = false;
                             self.preview_pending = false;
                         }
-                        RequestKind::PreviewFrame => {}
+                        RequestKind::PreviewFrame | RequestKind::CollectionItem => {}
                         RequestKind::DetectorTest => {
                             self.detector_result = value;
                             self.test_pending = false;
@@ -526,7 +730,19 @@ impl App {
                     .or_else(|| (!self.profiles.is_empty()).then_some(0));
                 if self.dirty_since.is_none() {
                     self.draft = self.selected.map(|index| self.profiles[index].clone());
+                    if self.draft.as_mut().is_some_and(ensure_stage_derived) {
+                        self.mark_dirty();
+                    }
                 }
+                if let Some(profile) = &self.draft {
+                    self.worker.send(
+                        RequestKind::RevisionHistory,
+                        method::PROFILE_REVISIONS,
+                        json!({"profile_id":profile.id}),
+                    );
+                }
+                self.refresh_collection();
+                self.refresh_outputs();
             }
             Err(error) => self.error = Some(format!("invalid profile response: {error}")),
         }
@@ -544,14 +760,62 @@ impl App {
         self.timeline.push_back(entry);
     }
 
+    fn refresh_collection(&self) {
+        let Some(profile) = &self.draft else {
+            return;
+        };
+        for (kind, method_name) in [
+            (RequestKind::CollectionPolicy, method::COLLECTION_POLICY_GET),
+            (RequestKind::CollectionStatus, method::COLLECTION_STATUS),
+            (RequestKind::CollectionItems, method::COLLECTION_ITEMS),
+        ] {
+            self.worker
+                .send(kind, method_name, json!({"profile_id":profile.id}));
+        }
+    }
+
+    fn refresh_outputs(&self) {
+        let Some(profile) = &self.draft else {
+            return;
+        };
+        self.worker.send(
+            RequestKind::OutputRoutes,
+            method::OUTPUT_LIST,
+            json!({"profile_id":profile.id}),
+        );
+        self.worker.send(
+            RequestKind::OutputRecipeList,
+            method::OUTPUT_RECIPE_LIST,
+            json!({"profile_id":profile.id}),
+        );
+    }
+
     fn schedule(&mut self) {
         if self.last_refresh.elapsed() >= Duration::from_secs(2) {
+            self.gui_usage = sample_process_usage(&mut self.process_sampler);
             self.worker
                 .send(RequestKind::Status, method::STATUS, Value::Null);
             self.worker
                 .send(RequestKind::State, method::STATE_GET, Value::Null);
             self.worker
                 .send(RequestKind::Capture, method::CAPTURE_STATUS, Value::Null);
+            self.worker.send(
+                RequestKind::AutoCapture,
+                method::CAPTURE_AUTO_GET,
+                Value::Null,
+            );
+            if let Some(profile) = &self.draft {
+                self.worker.send(
+                    RequestKind::CollectionStatus,
+                    method::COLLECTION_STATUS,
+                    json!({"profile_id":profile.id}),
+                );
+                self.worker.send(
+                    RequestKind::CollectionItems,
+                    method::COLLECTION_ITEMS,
+                    json!({"profile_id":profile.id}),
+                );
+            }
             self.last_refresh = Instant::now();
         }
         if self.preview_enabled
@@ -633,7 +897,21 @@ impl App {
             ui.separator();
             let mut select_index = None;
             for (index,profile) in self.profiles.iter().enumerate() { if ui.selectable_label(self.selected == Some(index),format!("{} · rev {}",profile.name,profile.revision)).clicked() { select_index=Some(index); } }
-            if let Some(index) = select_index { self.selected=Some(index); self.draft=Some(self.profiles[index].clone()); self.dirty_since=None; self.selected_region=None; }
+            if let Some(index) = select_index {
+                self.selected=Some(index);
+                self.draft=Some(self.profiles[index].clone());
+                self.dirty_since=None;
+                self.selected_region=None;
+                self.revisions.clear();
+                self.selected_revision=None;
+                self.rollback_confirm=false;
+                self.output_routes.clear();
+                self.output_recipes.clear();
+                self.selected_output_recipe=None;
+                self.worker.send(RequestKind::RevisionHistory,method::PROFILE_REVISIONS,json!({"profile_id":self.profiles[index].id}));
+                self.worker.send(RequestKind::OutputRoutes,method::OUTPUT_LIST,json!({"profile_id":self.profiles[index].id}));
+                self.worker.send(RequestKind::OutputRecipeList,method::OUTPUT_RECIPE_LIST,json!({"profile_id":self.profiles[index].id}));
+            }
             ui.separator();
             if let Some(profile) = self.draft.clone() {
                 ui.horizontal(|ui| {
@@ -683,6 +961,52 @@ impl App {
                         }
                     }
                 });
+                self.revision_history_ui(ui, &profile);
+            }
+        });
+    }
+
+    fn revision_history_ui(&mut self, ui: &mut egui::Ui, profile: &Profile) {
+        ui.collapsing("Revision history", |ui| {
+            if self.revisions.is_empty() {
+                ui.label("No retained revisions loaded.");
+                if ui.button("Reload history").clicked() {
+                    self.worker.send(RequestKind::RevisionHistory,method::PROFILE_REVISIONS,json!({"profile_id":profile.id}));
+                }
+                return;
+            }
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                for (index, revision) in self.revisions.iter().enumerate().rev() {
+                    let current = revision.revision == profile.revision;
+                    if ui.selectable_label(
+                        self.selected_revision == Some(index),
+                        format!("rev {}{}", revision.revision, if current { " · current" } else { "" }),
+                    ).clicked() {
+                        self.selected_revision = Some(index);
+                        self.rollback_confirm = false;
+                    }
+                }
+            });
+            let Some(revision) = self.selected_revision.and_then(|index| self.revisions.get(index)) else { return; };
+            ui.separator();
+            ui.strong(format!("Compare rev {} → rev {}", revision.revision, profile.revision));
+            ui.label(profile_comparison(revision, profile));
+            let can_rollback = revision.revision != profile.revision && self.dirty_since.is_none();
+            if self.rollback_confirm {
+                ui.colored_label(egui::Color32::YELLOW, format!("This will create revision {} from revision {}. Current revision {} remains in history.", profile.revision.saturating_add(1), revision.revision, profile.revision));
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm rollback").clicked() {
+                        self.worker.send(RequestKind::Rollback,method::PROFILE_ROLLBACK,json!({"profile_id":profile.id,"revision":revision.revision,"expected_revision":profile.revision}));
+                    }
+                    if ui.button("Cancel").clicked() { self.rollback_confirm=false; }
+                });
+            } else {
+                if ui.add_enabled(can_rollback, egui::Button::new(format!("Rollback to rev {}…", revision.revision))).clicked() {
+                    self.rollback_confirm = true;
+                }
+                if self.dirty_since.is_some() {
+                    ui.colored_label(egui::Color32::YELLOW, "Save or revert the current draft before rollback.");
+                }
             }
         });
     }
@@ -712,6 +1036,15 @@ impl App {
                 if ui.button("Stop").clicked() {
                     self.worker
                         .send(RequestKind::Capture, method::CAPTURE_STOP, Value::Null);
+                }
+                ui.separator();
+                ui.label("Game process");
+                let process_changed = ui.text_edit_singleline(&mut self.auto_process_match).lost_focus();
+                let enabled_changed = ui.checkbox(&mut self.auto_capture_enabled, "Auto capture").changed();
+                ui.label(if self.auto_process_running { "running" } else { "stopped" });
+                if (process_changed || enabled_changed) && self.draft.is_some() {
+                    let profile_id = self.draft.as_ref().map(|profile| profile.id);
+                    self.worker.send(RequestKind::AutoCapture, method::CAPTURE_AUTO_SET, json!({"profile_id":profile_id,"enabled":self.auto_capture_enabled,"process_match":self.auto_process_match}));
                 }
                 if ui.checkbox(&mut self.preview_enabled, "Preview").changed() {
                     self.worker.send(
@@ -791,12 +1124,15 @@ impl App {
             });
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn runtime_panel(&mut self, context: &egui::Context) {
-        egui::TopBottomPanel::bottom("runtime_evidence")
+        egui::SidePanel::right("runtime_evidence")
             .resizable(true)
-            .default_height(150.0)
+            .default_width(360.0)
+            .min_width(280.0)
+            .max_width(560.0)
             .show(context, |ui| {
-                ui.horizontal(|ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Live evidence");
                     let active = self.capture_status["active"].as_bool().unwrap_or(false);
                     ui.colored_label(
@@ -813,15 +1149,27 @@ impl App {
                         display_json(&self.capture_status["metrics"]["last_processing_latency_ms"]),
                         self.capture_status["metrics"]["detector_errors"].as_u64().unwrap_or(0),
                     ));
-                });
-                ui.columns(3, |columns| {
-                    columns[0].strong("Observations");
-                    columns[0].label(display_json(&self.state["observations"]));
-                    columns[1].strong("Event states");
-                    columns[1].label(display_json(&self.state["events"]));
-                    columns[2].strong("Latest detector test");
+                    ui.label(format!(
+                        "Daemon {:.1}% CPU · {:.1} MiB RSS\nGUI {:.1}% CPU · {:.1} MiB RSS",
+                        self.status["daemon_cpu_percent"].as_f64().unwrap_or(0.0),
+                        self.status["daemon_rss_bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0,
+                        self.gui_usage.cpu_percent,
+                        self.gui_usage.rss_bytes as f64 / 1_048_576.0,
+                    ));
+                    ui.separator();
+                    ui.strong("Observations");
+                    observations_ui(
+                        ui,
+                        &self.state["observations"],
+                        self.draft.as_ref(),
+                    );
+                    ui.separator();
+                    ui.strong("Event states");
+                    ui.label(display_json(&self.state["events"]));
+                    ui.separator();
+                    ui.strong("Latest detector test");
                     if let Some(observation) = self.detector_result["observations"].as_array().and_then(|items| items.last()) {
-                        columns[2].label(format!(
+                        ui.label(format!(
                             "status: {}\nvalue: {}\nconfidence: {}\ndiagnostic: {}",
                             observation["status"].as_str().unwrap_or("unknown"),
                             display_json(&observation["value"]),
@@ -829,10 +1177,463 @@ impl App {
                             display_json(&observation["diagnostic"]),
                         ));
                     } else {
-                        columns[2].label("No test yet — select a zone and click Test detector");
+                        ui.label("No test yet — select a zone and click Test detector");
                     }
+                    ui.separator();
+                    self.output_routes_ui(ui);
+                    ui.separator();
+                    self.collection_ui(ui);
                 });
             });
+    }
+
+    fn output_routes_ui(&mut self, ui: &mut egui::Ui) {
+        let total_routes = self.output_routes.len();
+        let enabled_routes = self
+            .output_routes
+            .iter()
+            .filter(|route| route["enabled"].as_bool().unwrap_or(false))
+            .count();
+        let summary = if self.draft.is_some() {
+            format!("Output routes — {enabled_routes}/{total_routes} enabled")
+        } else {
+            "Output routes".into()
+        };
+        egui::CollapsingHeader::new(summary)
+            .id_salt("output-routes")
+            .default_open(false)
+            .show(ui, |ui| {
+                let Some(profile_id) = self.draft.as_ref().map(|profile| profile.id) else {
+                    ui.label("Select a profile first");
+                    return;
+                };
+                ui.label("Machine-local routes run in the daemon. Command routes invoke a direct executable without a shell.");
+                if self.output_routes.is_empty() {
+                    ui.label("No routes configured. Add one with `yash-eventsctl output set`. ");
+                }
+                for route in self.output_routes.clone() {
+                    let Some(route_id) = route["id"].as_str() else {
+                        continue;
+                    };
+                    let summary = output_route_summary(&route);
+                    egui::CollapsingHeader::new(summary)
+                        .id_salt(("output-route", route_id))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                        let mut enabled = route["enabled"].as_bool().unwrap_or(false);
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut enabled, "Enabled").changed() {
+                                self.worker.send(
+                                    RequestKind::OutputMutation,
+                                    method::OUTPUT_ENABLE,
+                                    json!({"profile_id":profile_id,"route_id":route_id,"enabled":enabled}),
+                                );
+                            }
+                            if ui.button("Test output").clicked() {
+                                self.worker.send(
+                                    RequestKind::OutputTest,
+                                    method::OUTPUT_TEST,
+                                    json!({"profile_id":profile_id,"route_id":route_id}),
+                                );
+                            }
+                        });
+                        ui.strong("Trigger");
+                        ui.label(
+                            egui::RichText::new(display_json(&route["trigger"])).monospace(),
+                        );
+                        ui.strong("Sink");
+                        ui.label(egui::RichText::new(display_json(&route["sink"])).monospace());
+                        });
+                }
+                if !self.output_test.is_null()
+                    && self.output_test.as_object().is_some_and(|value| !value.is_empty())
+                {
+                    ui.strong("Latest verification");
+                    ui.label(
+                        egui::RichText::new(display_json(&self.output_test)).monospace(),
+                    );
+                }
+                ui.separator();
+                egui::CollapsingHeader::new("Packaged route examples")
+                    .default_open(false)
+                    .show(ui, |ui| self.output_recipe_ui(ui, profile_id));
+            });
+    }
+
+    fn select_output_recipe(&mut self, index: usize) {
+        let Some(entry) = self.output_recipes.get(index).cloned() else {
+            return;
+        };
+        self.selected_output_recipe = Some(index);
+        self.output_recipe_editor = serde_json::to_string_pretty(&json!({
+            "name":entry["recipe"]["name"],
+            "trigger":entry["recipe"]["trigger"],
+            "format":entry["recipe"]["format"]
+        }))
+        .unwrap_or_else(|_| "{}".into());
+        let sink = &entry["recipe"]["suggested_sink"];
+        self.output_recipe_command = sink["kind"] == "command";
+        self.output_recipe_destination.clear();
+        let arguments = sink.get("args").cloned().unwrap_or_else(|| json!([]));
+        self.output_recipe_arguments =
+            serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "[]".into());
+        self.output_recipe_timeout_ms = sink["timeout_ms"].as_u64().unwrap_or(5_000);
+        self.output_recipe_replace = sink["mode"] == "replace";
+        self.output_recipe_preview = json!({});
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn output_recipe_ui(&mut self, ui: &mut egui::Ui, profile_id: ProfileId) {
+        ui.label("Recipes are portable but inert. Preview and edit them, choose a local destination, then install a disabled route.");
+        if self.output_recipes.is_empty() {
+            ui.label("This profile does not package any output recipes.");
+            return;
+        }
+        for (index, entry) in self.output_recipes.clone().iter().enumerate() {
+            let recipe = &entry["recipe"];
+            let installed = self.output_routes.iter().any(|route| {
+                route["source_recipe"]["recipe_id"] == recipe["id"]
+                    && route["source_recipe"]["sha256"] == entry["sha256"]
+            });
+            let label = format!(
+                "{}{}",
+                recipe["name"].as_str().unwrap_or("Unnamed recipe"),
+                if installed { " · installed" } else { "" }
+            );
+            if ui
+                .selectable_label(self.selected_output_recipe == Some(index), label)
+                .clicked()
+            {
+                self.select_output_recipe(index);
+            }
+        }
+        let Some(index) = self.selected_output_recipe else {
+            return;
+        };
+        let Some(entry) = self.output_recipes.get(index).cloned() else {
+            return;
+        };
+        let recipe = &entry["recipe"];
+        ui.group(|ui| {
+            ui.label(recipe["description"].as_str().unwrap_or("No description"));
+            ui.small(format!(
+                "source {} · sha256 {}",
+                entry["path"].as_str().unwrap_or("unknown"),
+                entry["sha256"].as_str().unwrap_or("unknown")
+            ));
+            ui.label(format!(
+                "Suggested sink: {}",
+                display_json(&recipe["suggested_sink"])
+            ));
+            ui.label("Review/edit trigger and disclosed output template");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.output_recipe_editor)
+                    .desired_rows(10)
+                    .code_editor(),
+            );
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.output_recipe_command, false, "File sink");
+                ui.selectable_value(&mut self.output_recipe_command, true, "Command sink");
+            });
+            ui.horizontal(|ui| {
+                ui.label(if self.output_recipe_command {
+                    "Absolute executable"
+                } else {
+                    "Absolute output file"
+                });
+                ui.text_edit_singleline(&mut self.output_recipe_destination);
+            });
+            if self.output_recipe_command {
+                ui.label("Command arguments (JSON string array; no shell)");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.output_recipe_arguments)
+                        .desired_rows(3)
+                        .code_editor(),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.output_recipe_timeout_ms)
+                        .range(1..=30_000)
+                        .suffix(" ms timeout"),
+                );
+            } else {
+                ui.checkbox(
+                    &mut self.output_recipe_replace,
+                    "Atomically replace instead of append",
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Preview output (no side effect)").clicked() {
+                    if let Some(params) = self.output_recipe_draft(profile_id, &entry) {
+                        self.worker.send(
+                            RequestKind::OutputRecipePreview,
+                            method::OUTPUT_RECIPE_PREVIEW,
+                            params,
+                        );
+                    }
+                }
+                if ui.button("Install disabled").clicked() {
+                    self.install_output_recipe(profile_id, &entry);
+                }
+            });
+            if self
+                .output_recipe_preview
+                .as_object()
+                .is_some_and(|value| !value.is_empty())
+            {
+                ui.label(format!(
+                    "Recipe result: {}",
+                    display_json(&self.output_recipe_preview)
+                ));
+            }
+        });
+    }
+
+    fn output_recipe_draft(&mut self, profile_id: ProfileId, entry: &Value) -> Option<Value> {
+        let edited = match serde_json::from_str::<Value>(&self.output_recipe_editor) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                self.error = Some("output recipe edit must be a JSON object".into());
+                return None;
+            }
+            Err(error) => {
+                self.error = Some(format!("invalid output recipe JSON: {error}"));
+                return None;
+            }
+        };
+        Some(json!({
+            "profile_id":profile_id,
+            "recipe_id":entry["recipe"]["id"],
+            "sha256":entry["sha256"],
+            "name":edited["name"],
+            "trigger":edited["trigger"],
+            "format":edited["format"]
+        }))
+    }
+
+    fn install_output_recipe(&mut self, profile_id: ProfileId, entry: &Value) {
+        let Some(mut params) = self.output_recipe_draft(profile_id, entry) else {
+            return;
+        };
+        let destination = PathBuf::from(self.output_recipe_destination.trim());
+        if !destination.is_absolute() {
+            self.error = Some("choose an absolute local executable or output path".into());
+            return;
+        }
+        let sink = if self.output_recipe_command {
+            let args = match serde_json::from_str::<Vec<String>>(&self.output_recipe_arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    self.error = Some(format!(
+                        "command arguments must be a JSON string array: {error}"
+                    ));
+                    return;
+                }
+            };
+            json!({
+                "kind":"command","program":destination,"args":args,
+                "timeout_ms":self.output_recipe_timeout_ms
+            })
+        } else {
+            json!({
+                "kind":"file","path":destination,
+                "mode":if self.output_recipe_replace { "replace" } else { "append" }
+            })
+        };
+        params["sink"] = sink;
+        self.worker.send(
+            RequestKind::OutputRecipeInstall,
+            method::OUTPUT_RECIPE_INSTALL,
+            params,
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn collection_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Passive evidence collector")
+            .default_open(false)
+            .show(ui, |ui| {
+                let Some(profile_id) = self.draft.as_ref().map(|profile| profile.id) else {
+                    ui.label("Select a profile first");
+                    return;
+                };
+                ui.checkbox(&mut self.collection_enabled, "Enabled while game capture is active");
+                ui.horizontal(|ui| {
+                    ui.label("Dataset package");
+                    ui.text_edit_singleline(&mut self.collection_dataset_root);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Interval");
+                    ui.add(
+                        egui::DragValue::new(&mut self.collection_interval_seconds)
+                            .range(10..=86_400)
+                            .suffix(" s"),
+                    );
+                    ui.label("jitter");
+                    ui.add(
+                        egui::DragValue::new(&mut self.collection_jitter_seconds)
+                            .range(0..=3_600)
+                            .suffix(" s"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Duplicate threshold");
+                    ui.add(
+                        egui::DragValue::new(&mut self.collection_similarity_threshold)
+                            .range(0.0..=0.25)
+                            .speed(0.001),
+                    );
+                    ui.label("pending limit");
+                    ui.add(
+                        egui::DragValue::new(&mut self.collection_maximum_pending)
+                            .range(1..=100_000),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Byte limit");
+                    ui.add(
+                        egui::DragValue::new(&mut self.collection_maximum_bytes)
+                            .range(1_048_576..=1_099_511_627_776_u64),
+                    );
+                });
+                ui.label("Value-novelty targets (comma separated; leave empty to compare status/confidence only)");
+                ui.text_edit_singleline(&mut self.collection_novelty_targets);
+                if ui.button("Apply collector policy").clicked() {
+                    let novelty_targets = self
+                        .collection_novelty_targets
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>();
+                    self.worker.send(
+                        RequestKind::CollectionPolicy,
+                        method::COLLECTION_POLICY_SET,
+                        json!({
+                            "profile_id":profile_id,
+                            "policy":{
+                                "enabled":self.collection_enabled,
+                                "dataset_root":self.collection_dataset_root,
+                                "interval_seconds":self.collection_interval_seconds,
+                                "jitter_seconds":self.collection_jitter_seconds,
+                                "similarity_threshold":self.collection_similarity_threshold,
+                                "maximum_pending_items":self.collection_maximum_pending,
+                                "maximum_bytes":self.collection_maximum_bytes,
+                                "novelty_targets":novelty_targets,
+                            }
+                        }),
+                    );
+                }
+                let storage = &self.collection_status["storage"];
+                let runtime = &self.collection_status["runtime"];
+                ui.label(format!(
+                    "pending {} · needs correction {} · accepted {} · rejected {} · promoted {} · {:.1} MiB\nsaved {} · duplicate skips {} · errors {}{}",
+                    storage["pending_items"].as_u64().unwrap_or(0),
+                    storage["needs_correction_items"].as_u64().unwrap_or(0),
+                    storage["accepted_items"].as_u64().unwrap_or(0),
+                    storage["rejected_items"].as_u64().unwrap_or(0),
+                    storage["promoted_items"].as_u64().unwrap_or(0),
+                    storage["bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0,
+                    runtime["saved"].as_u64().unwrap_or(0),
+                    runtime["duplicates"].as_u64().unwrap_or(0),
+                    runtime["errors"].as_u64().unwrap_or(0),
+                    runtime["last_error"]
+                        .as_str()
+                        .map_or(String::new(), |error| format!(" · {error}")),
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh inbox").clicked() {
+                        self.refresh_collection();
+                    }
+                    if ui.button("Auto-review safely").clicked() {
+                        self.worker.send(
+                            RequestKind::CollectionMutation,
+                            method::COLLECTION_AUTO_REVIEW,
+                            json!({"profile_id":profile_id,"promote":false}),
+                        );
+                    }
+                    if ui.button("Auto-review + promote trusted").clicked() {
+                        self.worker.send(
+                            RequestKind::CollectionMutation,
+                            method::COLLECTION_AUTO_REVIEW,
+                            json!({"profile_id":profile_id,"promote":true}),
+                        );
+                    }
+                });
+                ui.separator();
+                ui.strong(format!("Review batch ({})", self.collection_items.len()));
+                for item in self.collection_items.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} · {} · {} obs",
+                            item["created_at"].as_str().unwrap_or("?"),
+                            item["status"].as_str().unwrap_or("?"),
+                            item["observations"].as_u64().unwrap_or(0)
+                        ));
+                        if ui.button("Inspect").clicked() {
+                            self.worker.send(
+                                RequestKind::CollectionItem,
+                                method::COLLECTION_ITEM_GET,
+                                json!({"profile_id":profile_id,"id":item["id"]}),
+                            );
+                        }
+                    });
+                }
+                let selected_id = self.collection_selected["item"]["id"]
+                    .as_str()
+                    .map(str::to_owned);
+                if let Some(selected_id) = selected_id {
+                    ui.separator();
+                    ui.strong(format!("Selected {selected_id}"));
+                    if let Some(texture) = &self.collection_texture {
+                        let available = ui.available_width();
+                        let size = texture.size_vec2();
+                        let scale = (available / size.x).min(1.0);
+                        ui.image((texture.id(), size * scale));
+                    }
+                    ui.label(display_json(
+                        &self.collection_selected["item"]["observations"],
+                    ));
+                    ui.label("Corrected expected observations JSON");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.collection_expected_json)
+                            .desired_rows(8)
+                            .code_editor(),
+                    );
+                    ui.horizontal(|ui| {
+                        for (label, action) in [
+                            ("Accept", "accept"),
+                            ("Correct", "correct"),
+                            ("Reject", "reject"),
+                            ("Promote", "promote"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.send_collection_review(profile_id, &selected_id, action);
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
+    fn send_collection_review(&mut self, profile_id: ProfileId, item_id: &str, action: &str) {
+        let expected = match serde_json::from_str::<Value>(&self.collection_expected_json) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                self.error = Some("expected observations must be a JSON object".into());
+                return;
+            }
+            Err(error) => {
+                self.error = Some(format!("invalid expected-observation JSON: {error}"));
+                return;
+            }
+        };
+        self.worker.send(
+            RequestKind::CollectionMutation,
+            method::COLLECTION_REVIEW,
+            json!({
+                "profile_id":profile_id,"id":item_id,"action":action,
+                "reason":"GUI review","expected_observations":expected
+            }),
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -874,30 +1675,57 @@ impl App {
                     "committed"
                 });
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Zones ({})", profile.elements.len()));
-                for (index, element) in profile.elements.iter().enumerate() {
-                    let detector = match element.detector {
-                        Detector::ColorBar { .. } => "color bar",
-                        Detector::Template { .. } => "template",
-                        Detector::RegionChange { .. } => "region change",
-                        Detector::Ocr { .. } => "OCR",
-                        Detector::Classifier { .. } => "classifier",
-                    };
-                    let label = format!(
-                        "{} · {}{}",
-                        element.name,
-                        detector,
-                        if element.enabled { "" } else { " · disabled" }
-                    );
+            self.layout_compatibility_ui(ui, &profile);
+            ui.strong("Detection hierarchy");
+            for (derived_index, derived) in profile.derived_observations.iter().enumerate() {
+                ui.group(|ui| {
                     if ui
-                        .selectable_label(self.selected_region == Some(index), label)
+                        .selectable_label(
+                            self.selected_derived == Some(derived_index),
+                            format!("{} · structured text · derived observation", derived.name),
+                        )
                         .clicked()
                     {
+                        self.selected_derived = Some(derived_index);
+                        self.selected_region = None;
+                    }
+                    ui.indent(("derived-inputs", derived_index), |ui| {
+                        ui.label("Composed from:");
+                        for input in &derived.inputs {
+                            if let Some((index, element)) = profile
+                                .elements
+                                .iter()
+                                .enumerate()
+                                .find(|(_, element)| element.id == input.element_id)
+                            {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("{} →", input.name));
+                                    if zone_selector(ui, self.selected_region, index, element) {
+                                        self.selected_region = Some(index);
+                                        self.selected_derived = None;
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Independent zones");
+                for (index, element) in
+                    profile.elements.iter().enumerate().filter(|(_, element)| {
+                        !matches!(element.name.as_str(), "Stage group" | "Stage counter")
+                    })
+                {
+                    if zone_selector(ui, self.selected_region, index, element) {
                         self.selected_region = Some(index);
+                        self.selected_derived = None;
                     }
                 }
             });
+            if let Some(index) = self.selected_derived {
+                self.derived_editor(ui, &mut profile, index);
+            }
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.drawing, "Draw region");
                 if ui.button("Duplicate region").clicked() {
@@ -972,6 +1800,180 @@ impl App {
         });
     }
 
+    fn layout_compatibility_ui(&self, ui: &mut egui::Ui, profile: &Profile) {
+        ui.collapsing("Layout compatibility", |ui| {
+            let reference = (
+                profile.layout.reference_width,
+                profile.layout.reference_height,
+            );
+            ui.label(format!(
+                "Profile reference: {}×{} · {}",
+                reference.0,
+                reference.1,
+                aspect_ratio_label(reference.0, reference.1)
+            ));
+            ui.label(format!(
+                "Zones: {} normalized rectangles · automatically scale with capture resolution",
+                profile.elements.len()
+            ));
+            ui.label(format!(
+                "UI scale: {} · language: {}",
+                profile
+                    .layout
+                    .ui_scale
+                    .map_or_else(|| "not specified".into(), |value| format!("{value:.2}")),
+                profile.layout.language.as_deref().unwrap_or("not specified")
+            ));
+            let width = self.capture_status["metrics"]["width"].as_u64();
+            let height = self.capture_status["metrics"]["height"].as_u64();
+            let (Some(width), Some(height)) = (width, height) else {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Current capture unavailable — start capture to check compatibility.",
+                );
+                return;
+            };
+            let (width, height) = (
+                u32::try_from(width).unwrap_or(u32::MAX),
+                u32::try_from(height).unwrap_or(u32::MAX),
+            );
+            ui.label(format!(
+                "Current capture: {width}×{height} · {} · scale {:.3}× / {:.3}×",
+                aspect_ratio_label(width, height),
+                f64::from(width) / f64::from(reference.0.max(1)),
+                f64::from(height) / f64::from(reference.1.max(1)),
+            ));
+            let reference_aspect = f64::from(reference.0) / f64::from(reference.1.max(1));
+            let capture_aspect = f64::from(width) / f64::from(height.max(1));
+            let mismatch = ((capture_aspect / reference_aspect) - 1.0).abs();
+            if mismatch > 0.01 {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!("Aspect mismatch: {:.1}%. Zones may target the wrong pixels when the game is letterboxed, cropped, or uses a different HUD layout.", mismatch * 100.0),
+                );
+            } else if (width, height) == reference {
+                ui.colored_label(egui::Color32::GREEN, "Exact reference resolution and aspect ratio.");
+            } else {
+                ui.colored_label(egui::Color32::GREEN, "Compatible aspect ratio; normalized zones scale automatically. Verify game UI scale if recognition differs.");
+            }
+            ui.small("Portal source/restore data is machine-local and is not exported with the portable profile.");
+        });
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn derived_editor(&mut self, ui: &mut egui::Ui, profile: &mut Profile, index: usize) {
+        ui.separator();
+        ui.heading("Derived observation properties");
+        let Some(derived) = profile.derived_observations.get_mut(index) else {
+            return;
+        };
+        ui.checkbox(&mut derived.enabled, "Enabled");
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            if ui.text_edit_singleline(&mut derived.name).changed() {
+                self.mark_dirty();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Output format");
+            if ui.text_edit_singleline(&mut derived.format).changed() {
+                self.mark_dirty();
+            }
+        });
+        ui.label("Use named placeholders such as {group} and {counter}.");
+        ui.strong("Inputs");
+        for input in &mut derived.inputs {
+            ui.horizontal(|ui| {
+                if ui.text_edit_singleline(&mut input.name).changed() {
+                    self.mark_dirty();
+                }
+                let current = profile
+                    .elements
+                    .iter()
+                    .find(|element| element.id == input.element_id)
+                    .map_or("Missing", |element| element.name.as_str());
+                egui::ComboBox::from_id_salt((derived.id.to_string(), input.name.clone()))
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for element in &profile.elements {
+                            if ui
+                                .selectable_value(&mut input.element_id, element.id, &element.name)
+                                .changed()
+                            {
+                                self.mark_dirty();
+                            }
+                        }
+                    });
+            });
+        }
+        if ui.button("Add input").clicked() {
+            if let Some(element) = profile.elements.first() {
+                derived.inputs.push(DerivedInput {
+                    name: format!("input{}", derived.inputs.len() + 1),
+                    element_id: element.id,
+                });
+                self.mark_dirty();
+            }
+        }
+        let observation = self.state["observations"].get(derived.id.to_string());
+        ui.strong("Live composed value");
+        ui.label(observation.map_or_else(|| "None yet".into(), display_json));
+        let rule_index = profile
+            .rules
+            .iter()
+            .position(|rule| rule.element_id == derived.id);
+        if rule_index.is_none() && ui.button("Add text event rule").clicked() {
+            profile.rules.push(EventRule {
+                id: RuleId::new(),
+                element_id: derived.id,
+                event: "stage_changed".into(),
+                enter_below: 0.2,
+                leave_above: 0.3,
+                minimum_confidence: 0.8,
+                required_samples: 2,
+                sample_window: 3,
+                cooldown_ms: 500,
+                predicate: RulePredicate::TextEquals {
+                    expected: derived.format.clone(),
+                },
+                stable_for_ms: 0,
+                emit_initial: false,
+                update_interval_ms: None,
+            });
+            self.mark_dirty();
+        }
+        if let Some(rule) = rule_index.and_then(|index| profile.rules.get_mut(index)) {
+            ui.strong("Event rule");
+            ui.horizontal(|ui| {
+                ui.label("Event name");
+                if ui.text_edit_singleline(&mut rule.event).changed() {
+                    self.mark_dirty();
+                }
+            });
+            match &mut rule.predicate {
+                RulePredicate::TextEquals { expected } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Text equals");
+                        if ui.text_edit_singleline(expected).changed() {
+                            self.mark_dirty();
+                        }
+                    });
+                }
+                RulePredicate::TextContains { needle } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Text contains");
+                        if ui.text_edit_singleline(needle).changed() {
+                            self.mark_dirty();
+                        }
+                    });
+                }
+                _ => {
+                    ui.label("This value currently uses a non-text predicate.");
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn detector_editor(&mut self, ui: &mut egui::Ui, profile: &mut Profile, index: usize) {
         ui.separator();
@@ -981,6 +1983,7 @@ impl App {
             Detector::Template { .. } => "Template",
             Detector::RegionChange { .. } => "Region change",
             Detector::Ocr { .. } => "OCR",
+            Detector::SevenSegment { .. } => "Seven segment",
             Detector::Classifier { .. } => "Classifier",
         };
         let mut chosen = current;
@@ -991,6 +1994,7 @@ impl App {
                 ui.selectable_value(&mut chosen, "Template", "Template");
                 ui.selectable_value(&mut chosen, "Region change", "Region change");
                 ui.selectable_value(&mut chosen, "OCR", "OCR");
+                ui.selectable_value(&mut chosen, "Seven segment", "Seven segment");
                 ui.selectable_value(&mut chosen, "Classifier", "Classifier");
             });
         if chosen != current {
@@ -1014,6 +2018,15 @@ impl App {
                     character_whitelist: None,
                     change_trigger_threshold: 0.02,
                     maximum_interval_ms: 1_000,
+                    preprocessing: Vec::new(),
+                    empty_value: None,
+                    zero_pad_to: None,
+                },
+                "Seven segment" => Detector::SevenSegment {
+                    id: DetectorId::new(),
+                    digits: 4,
+                    separator_after: Some(2),
+                    threshold: 128,
                     preprocessing: Vec::new(),
                 },
                 "Classifier" => Detector::Classifier {
@@ -1120,6 +2133,7 @@ impl App {
                 character_whitelist,
                 change_trigger_threshold,
                 maximum_interval_ms,
+                zero_pad_to,
                 preprocessing,
                 ..
             } => {
@@ -1148,6 +2162,22 @@ impl App {
                         changed |= ui.text_edit_singleline(whitelist).changed();
                     });
                 }
+                let mut zero_pad_enabled = zero_pad_to.is_some();
+                if ui
+                    .checkbox(
+                        &mut zero_pad_enabled,
+                        "Preserve numeric width with leading zeroes",
+                    )
+                    .changed()
+                {
+                    *zero_pad_to = zero_pad_enabled.then_some(2);
+                    changed = true;
+                }
+                if let Some(width) = zero_pad_to {
+                    changed |= ui
+                        .add(egui::DragValue::new(width).range(1..=16).prefix("width "))
+                        .changed();
+                }
                 changed |= ui
                     .add(
                         egui::Slider::new(change_trigger_threshold, 0.0..=1.0)
@@ -1161,6 +2191,32 @@ impl App {
                             .prefix("refresh at least every ms "),
                     )
                     .changed();
+                preprocessing_editor(ui, preprocessing, &mut changed);
+            }
+            Detector::SevenSegment {
+                digits,
+                separator_after,
+                threshold,
+                preprocessing,
+                ..
+            } => {
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(digits).range(1..=8).prefix("digits "))
+                        .changed();
+                    let mut position = separator_after.unwrap_or(0);
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut position)
+                                .range(0..=digits.saturating_sub(1))
+                                .prefix("separator after "),
+                        )
+                        .changed();
+                    *separator_after = (position != 0).then_some(position);
+                    changed |= ui
+                        .add(egui::DragValue::new(threshold).prefix("brightness threshold "))
+                        .changed();
+                });
                 preprocessing_editor(ui, preprocessing, &mut changed);
             }
             Detector::Classifier {
@@ -1343,6 +2399,13 @@ impl App {
                     rule_changed |= predicate_choice(
                         ui,
                         &mut rule.predicate,
+                        RulePredicateChoice::RapidIncrease,
+                        "Rapid numeric increase",
+                        element_id,
+                    );
+                    rule_changed |= predicate_choice(
+                        ui,
+                        &mut rule.predicate,
                         RulePredicateChoice::All,
                         "All observations",
                         element_id,
@@ -1387,6 +2450,19 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label("Required substring");
                         rule_changed |= ui.text_edit_singleline(needle).changed();
+                    });
+                }
+                RulePredicate::RapidIncrease {
+                    minimum_delta,
+                    within_ms,
+                } => {
+                    ui.horizontal(|ui| {
+                        rule_changed |= ui
+                            .add(egui::DragValue::new(minimum_delta).prefix("increase ≥ "))
+                            .changed();
+                        rule_changed |= ui
+                            .add(egui::DragValue::new(within_ms).suffix(" ms"))
+                            .changed();
                     });
                 }
                 RulePredicate::All { conditions } | RulePredicate::Any { conditions } => {
@@ -1579,8 +2655,8 @@ impl eframe::App for App {
         self.drain(context);
         self.schedule();
         self.topbar(context);
-        self.replay_panel(context);
         self.runtime_panel(context);
+        self.replay_panel(context);
         self.sidebar(context);
         self.editor(context);
         context.request_repaint_after(Duration::from_millis(50));
@@ -1594,6 +2670,416 @@ fn display_json(value: &Value) -> String {
         Value::Object(map) if map.is_empty() => "None yet".into(),
         Value::Array(items) if items.is_empty() => "None yet".into(),
         _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| "unavailable".into()),
+    }
+}
+
+fn output_route_summary(route: &Value) -> String {
+    let name = route["name"].as_str().unwrap_or("Unnamed route");
+    let status = if route["enabled"].as_bool().unwrap_or(false) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let trigger = route["trigger"]["kind"]
+        .as_str()
+        .unwrap_or("unknown")
+        .replace('_', " ");
+    let sink_kind = route["sink"]["kind"].as_str().unwrap_or("unknown");
+    let sink = route["sink"]["mode"].as_str().map_or_else(
+        || sink_kind.to_owned(),
+        |mode| format!("{sink_kind} ({mode})"),
+    );
+    format!("{name} · {status} · {trigger} → {sink}")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessUsage {
+    cpu_percent: f32,
+    rss_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProcessSampler {
+    previous_cpu_ns: Option<u64>,
+    previous_at: Option<Instant>,
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn sample_process_usage(sampler: &mut ProcessSampler) -> ProcessUsage {
+    let cpu_ns = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|value| {
+            let fields = value
+                .rsplit_once(") ")?
+                .1
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            let user = fields.get(11)?.parse::<u64>().ok()?;
+            let system = fields.get(12)?.parse::<u64>().ok()?;
+            Some(user.saturating_add(system).saturating_mul(10_000_000))
+        });
+    let rss_bytes = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|value| {
+            value.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let now = Instant::now();
+    let cpu_percent = cpu_ns
+        .zip(sampler.previous_cpu_ns)
+        .zip(sampler.previous_at)
+        .map_or(0.0, |((current, previous), previous_at)| {
+            let wall_ns = now.duration_since(previous_at).as_nanos().max(1) as f64;
+            ((current.saturating_sub(previous) as f64 / wall_ns) * 100.0) as f32
+        });
+    sampler.previous_cpu_ns = cpu_ns;
+    sampler.previous_at = Some(now);
+    ProcessUsage {
+        cpu_percent,
+        rss_bytes,
+    }
+}
+
+fn observations_ui(ui: &mut egui::Ui, observations: &Value, profile: Option<&Profile>) {
+    let Some(observations) = observations.as_object() else {
+        ui.label(display_json(observations));
+        return;
+    };
+    if observations.is_empty() {
+        ui.label("None yet");
+        return;
+    }
+    let hidden = hidden_observation_components(observations, profile);
+    let mut items: Vec<_> = observations
+        .iter()
+        .filter(|(id, _)| !hidden.contains(*id))
+        .map(|(id, observation)| {
+            let (name, kind) = observation_identity(id, profile);
+            (name, kind, id, observation)
+        })
+        .collect();
+    items.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, kind, element_id, observation) in items {
+        let status = observation["status"].as_str().unwrap_or("unknown");
+        let summary = format!(
+            "{name} · {kind} — {} [{status}]",
+            observation_value_summary(&observation["value"])
+        );
+        egui::CollapsingHeader::new(summary)
+            .id_salt(("live-observation", element_id))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(format!("Value: {}", display_json(&observation["value"])));
+                ui.label(format!("Status: {status}"));
+                ui.label(format!(
+                    "Confidence: {}",
+                    display_json(&observation["confidence"])
+                ));
+                ui.label(format!(
+                    "Timestamp: {} ms",
+                    observation["timestamp_ms"].as_u64().unwrap_or(0)
+                ));
+                ui.monospace(format!("Element ID: {element_id}"));
+                ui.monospace(format!(
+                    "Detector ID: {}",
+                    observation["detector_id"].as_str().unwrap_or("—")
+                ));
+                ui.label(format!(
+                    "Diagnostic: {}",
+                    observation["diagnostic"].as_str().unwrap_or("—")
+                ));
+                if let Some(profile) = profile {
+                    if let Some(element) = profile
+                        .elements
+                        .iter()
+                        .find(|element| element.id.to_string() == *element_id)
+                    {
+                        ui.label(format!(
+                            "Region: x {:.5} · y {:.5} · w {:.5} · h {:.5}",
+                            element.region.x,
+                            element.region.y,
+                            element.region.width,
+                            element.region.height
+                        ));
+                    }
+                    if let Some(derived) = profile
+                        .derived_observations
+                        .iter()
+                        .find(|derived| derived.id.to_string() == *element_id)
+                    {
+                        ui.label(format!("Format: {}", derived.format));
+                        ui.label("Inputs:");
+                        for input in &derived.inputs {
+                            let source = profile
+                                .elements
+                                .iter()
+                                .find(|element| element.id == input.element_id)
+                                .map_or("missing", |element| element.name.as_str());
+                            let value =
+                                observations.get(&input.element_id.to_string()).map_or_else(
+                                    || "—".into(),
+                                    |item| observation_value_summary(&item["value"]),
+                                );
+                            ui.label(format!("  {} → {} — {}", input.name, source, value));
+                        }
+                    }
+                }
+            });
+    }
+}
+
+fn hidden_observation_components(
+    observations: &serde_json::Map<String, Value>,
+    profile: Option<&Profile>,
+) -> Vec<String> {
+    let mut hidden = Vec::new();
+    if let Some(profile) = profile {
+        for derived in &profile.derived_observations {
+            if observations.contains_key(&derived.id.to_string()) {
+                hidden.extend(
+                    derived
+                        .inputs
+                        .iter()
+                        .map(|input| input.element_id.to_string()),
+                );
+            }
+        }
+    }
+    hidden
+}
+
+fn observation_identity(element_id: &str, profile: Option<&Profile>) -> (String, String) {
+    if let Some(element) = profile.and_then(|profile| {
+        profile
+            .elements
+            .iter()
+            .find(|element| element.id.to_string() == element_id)
+    }) {
+        return (
+            element.name.clone(),
+            detector_label(&element.detector).into(),
+        );
+    }
+    if let Some(derived) = profile.and_then(|profile| {
+        profile
+            .derived_observations
+            .iter()
+            .find(|derived| derived.id.to_string() == element_id)
+    }) {
+        return (derived.name.clone(), "structured text".into());
+    }
+    (element_id.into(), "unknown detector".into())
+}
+
+fn observation_value_summary(value: &Value) -> String {
+    let Some(value) = value.get("value") else {
+        return display_json(value);
+    };
+    if let Some(number) = value.as_f64() {
+        return format!("{number:.3}");
+    }
+    if let Some(text) = value.as_str() {
+        return text.into();
+    }
+    display_json(value)
+}
+
+#[cfg(test)]
+fn display_observations(observations: &Value, profile: Option<&Profile>) -> String {
+    let Some(observations) = observations.as_object() else {
+        return display_json(observations);
+    };
+    if observations.is_empty() {
+        return "None yet".into();
+    }
+    let hidden_component_ids = hidden_observation_components(observations, profile);
+    observations
+        .iter()
+        .filter_map(|(element_id, observation)| {
+            if hidden_component_ids.contains(element_id) {
+                return None;
+            }
+            let element = profile.and_then(|profile| {
+                profile
+                    .elements
+                    .iter()
+                    .find(|element| element.id.to_string() == *element_id)
+            });
+            let derived = profile.and_then(|profile| {
+                profile
+                    .derived_observations
+                    .iter()
+                    .find(|derived| derived.id.to_string() == *element_id)
+            });
+            let heading = element.map_or_else(
+                || {
+                    derived.map_or_else(
+                        || element_id.clone(),
+                        |derived| format!("{} · structured text", derived.name),
+                    )
+                },
+                |element| format!("{} · {}", element.name, detector_label(&element.detector)),
+            );
+            Some(format!(
+                "{heading}\nstatus: {}\nvalue: {}\nconfidence: {}\n{}",
+                observation["status"].as_str().unwrap_or("unknown"),
+                display_json(&observation["value"]),
+                display_json(&observation["confidence"]),
+                observation["diagnostic"].as_str().unwrap_or(""),
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn detector_label(detector: &Detector) -> &'static str {
+    match detector {
+        Detector::ColorBar { .. } => "color bar",
+        Detector::Template { .. } => "template",
+        Detector::RegionChange { .. } => "region change",
+        Detector::Ocr { .. } => "OCR",
+        Detector::SevenSegment { .. } => "seven segment",
+        Detector::Classifier { .. } => "classifier",
+    }
+}
+
+fn aspect_ratio_label(width: u32, height: u32) -> String {
+    if width == 0 || height == 0 {
+        return "unknown aspect".into();
+    }
+    let divisor = greatest_common_divisor(width, height);
+    format!("{}:{}", width / divisor, height / divisor)
+}
+
+const fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    if left == 0 {
+        1
+    } else {
+        left
+    }
+}
+
+fn ensure_stage_derived(profile: &mut Profile) -> bool {
+    if !profile.derived_observations.is_empty() {
+        return false;
+    }
+    let group = profile
+        .elements
+        .iter()
+        .find(|element| element.name == "Stage group")
+        .map(|element| element.id);
+    let counter = profile
+        .elements
+        .iter()
+        .find(|element| element.name == "Stage counter")
+        .map(|element| element.id);
+    let (Some(group), Some(counter)) = (group, counter) else {
+        return false;
+    };
+    profile.derived_observations.push(DerivedObservation {
+        id: ElementId::new(),
+        detector_id: DetectorId::new(),
+        name: "Stage".into(),
+        enabled: true,
+        format: "STAGE-{group} : {counter}".into(),
+        inputs: vec![
+            DerivedInput {
+                name: "group".into(),
+                element_id: group,
+            },
+            DerivedInput {
+                name: "counter".into(),
+                element_id: counter,
+            },
+        ],
+    });
+    true
+}
+
+fn zone_selector(
+    ui: &mut egui::Ui,
+    selected_region: Option<usize>,
+    index: usize,
+    element: &Element,
+) -> bool {
+    let label = format!(
+        "{} · {}{}",
+        element.name,
+        detector_label(&element.detector),
+        if element.enabled { "" } else { " · disabled" }
+    );
+    ui.selectable_label(selected_region == Some(index), label)
+        .clicked()
+}
+
+fn profile_comparison(old: &Profile, current: &Profile) -> String {
+    let mut changes = Vec::new();
+    if old.name != current.name {
+        changes.push(format!("Name: {} → {}", old.name, current.name));
+    }
+    if old.game != current.game {
+        changes.push(format!("Game ID: {} → {}", old.game, current.game));
+    }
+    if old.layout != current.layout {
+        changes.push("Reference layout changed".into());
+    }
+    for element in &old.elements {
+        match current
+            .elements
+            .iter()
+            .find(|candidate| candidate.id == element.id)
+        {
+            None => changes.push(format!("Zone removed: {}", element.name)),
+            Some(candidate) if candidate != element => {
+                changes.push(format!("Zone changed: {}", element.name));
+            }
+            Some(_) => {}
+        }
+    }
+    for element in &current.elements {
+        if !old
+            .elements
+            .iter()
+            .any(|candidate| candidate.id == element.id)
+        {
+            changes.push(format!("Zone added: {}", element.name));
+        }
+    }
+    let changed_rules = old
+        .rules
+        .iter()
+        .filter(|rule| {
+            current
+                .rules
+                .iter()
+                .find(|candidate| candidate.id == rule.id)
+                .is_none_or(|candidate| candidate != *rule)
+        })
+        .count()
+        + current
+            .rules
+            .iter()
+            .filter(|rule| !old.rules.iter().any(|candidate| candidate.id == rule.id))
+            .count();
+    if changed_rules > 0 {
+        changes.push(format!("Event rules changed: {changed_rules}"));
+    }
+    if changes.is_empty() {
+        "No content changes.".into()
+    } else {
+        changes.join("\n")
     }
 }
 
@@ -1616,6 +3102,22 @@ fn decode_preview(value: &Value) -> Result<PreviewImage, String> {
                 .ok_or("invalid preview byte")
         })
         .collect::<Result<Vec<_>, _>>()?;
+    decode_png_bytes(bytes)
+}
+
+fn decode_collection_image(value: &Value) -> Result<PreviewImage, String> {
+    let path = value["image_path"]
+        .as_str()
+        .ok_or("collection item omitted image path")?;
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > 32 * 1024 * 1024 {
+        return Err("collection review image exceeds 32 MiB".into());
+    }
+    let image = decode_png_bytes(std::fs::read(path).map_err(|error| error.to_string())?)?;
+    Ok(downscale_preview(image, 960, 540))
+}
+
+fn decode_png_bytes(bytes: Vec<u8>) -> Result<PreviewImage, String> {
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
     let mut output = vec![
@@ -1645,6 +3147,47 @@ fn decode_preview(value: &Value) -> Result<PreviewImage, String> {
         height: usize::try_from(info.height).map_err(|error| error.to_string())?,
         rgba,
     })
+}
+
+fn downscale_preview(
+    image: PreviewImage,
+    maximum_width: usize,
+    maximum_height: usize,
+) -> PreviewImage {
+    if image.width <= maximum_width && image.height <= maximum_height {
+        return image;
+    }
+    let image_width = image.width as u128;
+    let image_height = image.height as u128;
+    let maximum_width = maximum_width as u128;
+    let maximum_height = maximum_height as u128;
+    let (width, height) = if maximum_width * image_height <= maximum_height * image_width {
+        (
+            maximum_width,
+            (image_height * maximum_width / image_width).max(1),
+        )
+    } else {
+        (
+            (image_width * maximum_height / image_height).max(1),
+            maximum_height,
+        )
+    };
+    let width = usize::try_from(width).unwrap_or(usize::MAX);
+    let height = usize::try_from(height).unwrap_or(usize::MAX);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let source_y = y * image.height / height;
+        for x in 0..width {
+            let source_x = x * image.width / width;
+            let offset = (source_y * image.width + source_x) * 4;
+            rgba.extend_from_slice(&image.rgba[offset..offset + 4]);
+        }
+    }
+    PreviewImage {
+        width,
+        height,
+        rgba,
+    }
 }
 
 fn region_rect(
@@ -1741,6 +3284,7 @@ enum RulePredicateChoice {
     Boolean,
     TextEquals,
     TextContains,
+    RapidIncrease,
     All,
     Any,
 }
@@ -1751,6 +3295,7 @@ fn rule_predicate_choice(predicate: &RulePredicate) -> RulePredicateChoice {
         RulePredicate::Boolean { .. } => RulePredicateChoice::Boolean,
         RulePredicate::TextEquals { .. } => RulePredicateChoice::TextEquals,
         RulePredicate::TextContains { .. } => RulePredicateChoice::TextContains,
+        RulePredicate::RapidIncrease { .. } => RulePredicateChoice::RapidIncrease,
         RulePredicate::All { .. } => RulePredicateChoice::All,
         RulePredicate::Any { .. } => RulePredicateChoice::Any,
     }
@@ -1762,6 +3307,7 @@ fn rule_predicate_name(predicate: &RulePredicate) -> &'static str {
         RulePredicateChoice::Boolean => "boolean appearance",
         RulePredicateChoice::TextEquals => "text equals",
         RulePredicateChoice::TextContains => "text contains",
+        RulePredicateChoice::RapidIncrease => "rapid numeric increase",
         RulePredicateChoice::All => "all observations",
         RulePredicateChoice::Any => "any observation",
     }
@@ -1789,6 +3335,10 @@ fn predicate_choice(
             },
             RulePredicateChoice::TextContains => RulePredicate::TextContains {
                 needle: "text".into(),
+            },
+            RulePredicateChoice::RapidIncrease => RulePredicate::RapidIncrease {
+                minimum_delta: 3,
+                within_ms: 5_000,
             },
             RulePredicateChoice::All => RulePredicate::All {
                 conditions: vec![ObservationCondition {
@@ -1991,6 +3541,26 @@ fn default_element(region: NormalizedRegion) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_aspect_ratio_is_human_readable() {
+        assert_eq!(aspect_ratio_label(3840, 2160), "16:9");
+        assert_eq!(aspect_ratio_label(3440, 1440), "43:18");
+        assert_eq!(aspect_ratio_label(0, 0), "unknown aspect");
+    }
+
+    #[test]
+    fn output_route_summary_is_compact_and_actionable() {
+        assert_eq!(
+            output_route_summary(&json!({
+                "name":"Current stage",
+                "enabled":true,
+                "trigger":{"kind":"state_change"},
+                "sink":{"kind":"file","mode":"replace"}
+            })),
+            "Current stage · enabled · state change → file (replace)"
+        );
+    }
     #[test]
     fn region_move_and_resize_remain_normalized() {
         let origin = NormalizedRegion {
@@ -2062,5 +3632,91 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn live_observations_use_profile_zone_names() {
+        let mut profile = Profile::new("Game", "game", 1920, 1080);
+        let mut element = default_element(NormalizedRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+        });
+        element.name = "Stage".into();
+        let element_id = element.id;
+        profile.elements.push(element);
+        let observations = json!({
+            (element_id.to_string()): {
+                "status": "valid",
+                "value": {"type":"string","value":"STAGE-1"},
+                "confidence": 0.9,
+                "diagnostic": "recognized"
+            }
+        });
+
+        let rendered = display_observations(&observations, Some(&profile));
+        assert!(
+            rendered.starts_with("Stage · color bar\nstatus: valid"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("STAGE-1"));
+        assert!(!rendered.contains(&element_id.to_string()));
+    }
+
+    #[test]
+    fn live_observations_compose_structured_stage_name() {
+        let mut profile = Profile::new("Game", "game", 1920, 1080);
+        let mut group = default_element(NormalizedRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+        });
+        group.name = "Stage group".into();
+        let group_id = group.id;
+        let mut counter = group.clone();
+        counter.id = ElementId::new();
+        counter.name = "Stage counter".into();
+        let counter_id = counter.id;
+        profile.elements.extend([group, counter]);
+        assert!(ensure_stage_derived(&mut profile));
+        let derived_id = profile.derived_observations[0].id;
+        let observations = json!({
+            (group_id.to_string()): {"status":"valid","value":{"type":"text","value":"2"}},
+            (counter_id.to_string()): {"status":"valid","value":{"type":"text","value":"10"}},
+            (derived_id.to_string()): {"status":"valid","value":{"type":"text","value":"STAGE-2 : 10"},"confidence":0.9,"diagnostic":"composed from 2 inputs"}
+        });
+
+        let rendered = display_observations(&observations, Some(&profile));
+        assert!(rendered.contains("Stage · structured text\nstatus: valid"));
+        assert!(rendered.contains("STAGE-2 : 10"));
+        assert!(!rendered.contains("Stage group ·"), "{rendered}");
+        assert!(!rendered.contains("Stage counter ·"), "{rendered}");
+    }
+
+    #[test]
+    fn revision_comparison_uses_stable_zone_identity() {
+        let mut old = Profile::new("Game", "game", 1920, 1080);
+        let mut element = default_element(NormalizedRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+        });
+        element.name = "Stage".into();
+        old.elements.push(element);
+        let mut current = old.clone();
+        current.elements[0].name = "Stage counter".into();
+        current.elements.push(default_element(NormalizedRegion {
+            x: 0.2,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+        }));
+
+        let comparison = profile_comparison(&old, &current);
+        assert!(comparison.contains("Zone changed: Stage"));
+        assert!(comparison.contains("Zone added: Region"));
     }
 }

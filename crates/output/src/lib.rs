@@ -11,9 +11,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod diagnostic;
+mod routing;
 pub use diagnostic::{
     export_diagnostic_bundle, plan_diagnostic_bundle, DiagnosticBundle, DiagnosticCrop,
     DiagnosticError, DiagnosticLimits, DiagnosticPlan,
+};
+pub use routing::{
+    execute_route, render_payload, FileMode, OutputFormat, OutputRecipe, OutputRecipeSink,
+    OutputRecipeSource, OutputRoute, OutputRouteError, OutputSink, OutputTrigger, RouteContext,
+    RouteReceipt,
 };
 
 /// Current event and state output schema version.

@@ -3,12 +3,26 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use yash_app_events_output::OutputRecipe;
 
 use crate::{save_profile, ElementId, Profile, ProfileId, RuleId, RulePredicate, StorageError};
 
 const PROFILE_FILE: &str = "profile.json";
 const DRAFT_FILE: &str = "draft.json";
+const OUTPUT_RECIPES_DIRECTORY: &str = "output-recipes";
+const MAXIMUM_OUTPUT_RECIPES: usize = 32;
+const MAXIMUM_OUTPUT_RECIPE_BYTES: u64 = 64 * 1024;
+
+/// Validated portable recipe plus integrity metadata shown during local installation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OutputRecipeEntry {
+    pub path: String,
+    pub sha256: String,
+    pub recipe: OutputRecipe,
+}
 
 /// State-owning profile repository used only by the daemon.
 #[derive(Debug)]
@@ -73,6 +87,64 @@ impl ProfileStore {
         }
         profiles.sort_by_key(|profile| profile.id.to_string());
         Ok(profiles)
+    }
+
+    /// Lists every retained committed revision, including the current profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns parsing, validation, or storage errors.
+    pub fn list_revisions(&self, id: ProfileId) -> Result<Vec<Profile>, StoreError> {
+        let current = self.load(id)?;
+        let history = self.profile_directory(id).join("revisions");
+        let mut revisions = Vec::new();
+        if history.exists() {
+            for entry in fs::read_dir(history)? {
+                let path = entry?.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    revisions.push(crate::load_profile(&path)?);
+                }
+            }
+        }
+        revisions.push(current);
+        revisions.sort_by_key(|profile| profile.revision);
+        revisions.dedup_by_key(|profile| profile.revision);
+        Ok(revisions)
+    }
+
+    /// Loads one retained committed revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RevisionNotFound` when the revision was pruned or never existed.
+    pub fn load_revision(&self, id: ProfileId, revision: u64) -> Result<Profile, StoreError> {
+        let current = self.load(id)?;
+        if current.revision == revision {
+            return Ok(current);
+        }
+        let path = self
+            .profile_directory(id)
+            .join("revisions")
+            .join(format!("{revision}.json"));
+        if !path.is_file() {
+            return Err(StoreError::RevisionNotFound { id, revision });
+        }
+        Ok(crate::load_profile(&path)?)
+    }
+
+    /// Rolls a retained snapshot forward as a new committed revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision conflicts, missing history, validation, or storage errors.
+    pub fn rollback(
+        &self,
+        id: ProfileId,
+        revision: u64,
+        expected_revision: u64,
+    ) -> Result<Profile, StoreError> {
+        let snapshot = self.load_revision(id, revision)?;
+        self.commit(snapshot, expected_revision)
     }
 
     /// Commits a mutation if its expected revision is current.
@@ -143,6 +215,16 @@ impl ProfileStore {
             element.id = ElementId::new();
             element.detector.assign_new_id();
             element_ids.insert(old, element.id);
+        }
+        for derived in &mut duplicate.derived_observations {
+            let old = derived.id;
+            derived.id = ElementId::new();
+            element_ids.insert(old, derived.id);
+            for input in &mut derived.inputs {
+                if let Some(id) = element_ids.get(&input.element_id) {
+                    input.element_id = *id;
+                }
+            }
         }
         for rule in &mut duplicate.rules {
             rule.id = RuleId::new();
@@ -255,6 +337,17 @@ impl ProfileStore {
         &self.profiles
     }
 
+    /// Lists validated inert output recipes carried by one portable profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors for missing profiles, links/non-files, excessive files or sizes,
+    /// malformed JSON, duplicate recipe IDs, or invalid recipe contracts.
+    pub fn output_recipes(&self, id: ProfileId) -> Result<Vec<OutputRecipeEntry>, StoreError> {
+        self.load(id)?;
+        load_output_recipes_from_profile_directory(&self.profile_directory(id))
+    }
+
     fn prune_revisions(&self, history: &Path) -> io::Result<()> {
         let mut revisions: Vec<_> = fs::read_dir(history)?.collect::<Result<_, _>>()?;
         revisions.sort_by_key(|entry| {
@@ -273,6 +366,71 @@ impl ProfileStore {
     }
 }
 
+pub(crate) fn load_output_recipes_from_profile_directory(
+    profile_directory: &Path,
+) -> Result<Vec<OutputRecipeEntry>, StoreError> {
+    let directory = profile_directory.join(OUTPUT_RECIPES_DIRECTORY);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let directory_type = fs::symlink_metadata(&directory)?.file_type();
+    if !directory_type.is_dir() || directory_type.is_symlink() {
+        return Err(StoreError::InvalidOutputRecipe(
+            "output-recipes must be a regular directory".into(),
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut ids = HashSet::new();
+    for entry in fs::read_dir(directory)? {
+        if entries.len() >= MAXIMUM_OUTPUT_RECIPES {
+            return Err(StoreError::InvalidOutputRecipe(
+                "a profile may carry at most 32 output recipes".into(),
+            ));
+        }
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(StoreError::InvalidOutputRecipe(
+                "output recipe entries must be regular files".into(),
+            ));
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            return Err(StoreError::InvalidOutputRecipe(
+                "output recipe files must use the .json extension".into(),
+            ));
+        }
+        let file_name = entry.file_name().into_string().map_err(|_| {
+            StoreError::InvalidOutputRecipe("output recipe filenames must be UTF-8".into())
+        })?;
+        let metadata = entry.metadata()?;
+        if metadata.len() > MAXIMUM_OUTPUT_RECIPE_BYTES {
+            return Err(StoreError::InvalidOutputRecipe(
+                "an output recipe must not exceed 64 KiB".into(),
+            ));
+        }
+        let bytes = fs::read(&path)?;
+        let recipe: OutputRecipe = serde_json::from_slice(&bytes).map_err(|error| {
+            StoreError::InvalidOutputRecipe(format!("{}: {error}", path.display()))
+        })?;
+        recipe.validate().map_err(|error| {
+            StoreError::InvalidOutputRecipe(format!("{}: {error}", path.display()))
+        })?;
+        if !ids.insert(recipe.id) {
+            return Err(StoreError::InvalidOutputRecipe(
+                "output recipe IDs must be unique within a profile".into(),
+            ));
+        }
+        entries.push(OutputRecipeEntry {
+            path: format!("{OUTPUT_RECIPES_DIRECTORY}/{file_name}"),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            recipe,
+        });
+    }
+    entries.sort_by(|left, right| left.recipe.name.cmp(&right.recipe.name));
+    Ok(entries)
+}
+
 fn remap_composition_elements(
     rule: &mut crate::EventRule,
     mut replacement: impl FnMut(ElementId) -> Option<ElementId>,
@@ -282,7 +440,8 @@ fn remap_composition_elements(
         RulePredicate::NumericBelow
         | RulePredicate::Boolean { .. }
         | RulePredicate::TextEquals { .. }
-        | RulePredicate::TextContains { .. } => return,
+        | RulePredicate::TextContains { .. }
+        | RulePredicate::RapidIncrease { .. } => return,
     };
     for condition in conditions {
         if let Some(id) = replacement(condition.element_id) {
@@ -323,6 +482,10 @@ pub enum StoreError {
     RevisionConflict { expected: u64, current: u64 },
     #[error("element {0} was not found")]
     ElementNotFound(ElementId),
+    #[error("profile {id} revision {revision} was not found")]
+    RevisionNotFound { id: ProfileId, revision: u64 },
+    #[error("invalid portable output recipe: {0}")]
+    InvalidOutputRecipe(String),
 }
 
 #[cfg(test)]
@@ -333,6 +496,10 @@ mod tests {
     };
 
     use super::*;
+    use serde_json::json;
+    use yash_app_events_output::{
+        EventState, OutputFormat, OutputRecipe, OutputRecipeSink, OutputTrigger,
+    };
 
     fn populated_profile() -> Profile {
         let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
@@ -375,6 +542,44 @@ mod tests {
     }
 
     #[test]
+    fn portable_output_recipes_are_validated_hashed_and_sorted() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = Profile::new("Recipes", "demo_game", 1920, 1080);
+        store.create(&profile).unwrap();
+        let recipes = store.profile_directory(profile.id).join("output-recipes");
+        fs::create_dir_all(&recipes).unwrap();
+        let recipe = OutputRecipe {
+            schema: 1,
+            id: uuid::Uuid::new_v4(),
+            name: "Stage marker".into(),
+            description: "Inert example".into(),
+            trigger: OutputTrigger::Event {
+                events: vec!["stage_changed".into()],
+                states: vec![EventState::Updated],
+            },
+            format: OutputFormat::JsonTemplate {
+                template: json!({"stage":"{{event.value}}"}),
+            },
+            suggested_sink: OutputRecipeSink::Command {
+                program_name: "yash".into(),
+                args: vec!["ipc".into(), "command".into(), "marker".into()],
+                timeout_ms: 5_000,
+            },
+        };
+        fs::write(
+            recipes.join("yash-stage-marker.json"),
+            serde_json::to_vec_pretty(&recipe).unwrap(),
+        )
+        .unwrap();
+        let entries = store.output_recipes(profile.id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].recipe, recipe);
+        assert_eq!(entries[0].path, "output-recipes/yash-stage-marker.json");
+        assert_eq!(entries[0].sha256.len(), 64);
+    }
+
+    #[test]
     fn stale_commit_reports_current_revision_without_overwrite() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 2);
@@ -390,6 +595,31 @@ mod tests {
             }
         ));
         assert_eq!(store.load(committed.id).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn rollback_preserves_history_and_creates_new_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 10);
+        let profile = populated_profile();
+        let id = profile.id;
+        store.create(&profile).unwrap();
+        let mut first = profile.clone();
+        first.name = "Changed".into();
+        let first = store.commit(first, 0).unwrap();
+
+        let rolled_back = store.rollback(id, 0, first.revision).unwrap();
+        assert_eq!(rolled_back.revision, 2);
+        assert_eq!(rolled_back.name, "Demo");
+        assert_eq!(
+            store
+                .list_revisions(id)
+                .unwrap()
+                .iter()
+                .map(|profile| profile.revision)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]

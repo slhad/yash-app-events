@@ -14,8 +14,9 @@ mod archive;
 mod local;
 mod store;
 pub use archive::{export_profile, import_profile, ArchiveError, ImportLimits, Manifest};
-pub use local::{CaptureBinding, LocalConfig, LocalConfigError, Settings};
-pub use store::{ProfileStore, StoreError};
+pub use local::{CaptureBinding, CollectionPolicy, LocalConfig, LocalConfigError, Settings};
+pub use store::{OutputRecipeEntry, ProfileStore, StoreError};
+pub use yash_app_events_output::OutputRoute;
 
 /// Current portable profile schema version.
 pub const PROFILE_SCHEMA_VERSION: u16 = 1;
@@ -71,6 +72,9 @@ pub struct Profile {
     pub layout: LayoutMetadata,
     /// Configured HUD elements.
     pub elements: Vec<Element>,
+    /// Values composed from named detector observations.
+    #[serde(default)]
+    pub derived_observations: Vec<DerivedObservation>,
     /// Temporal rules consuming element observations.
     pub rules: Vec<EventRule>,
 }
@@ -92,6 +96,7 @@ impl Profile {
                 language: None,
             },
             elements: Vec::new(),
+            derived_observations: Vec::new(),
             rules: Vec::new(),
         }
     }
@@ -124,7 +129,16 @@ impl Profile {
             "elements",
             &mut errors,
         );
-        let element_ids: HashSet<_> = self.elements.iter().map(|element| element.id).collect();
+        let mut element_ids: HashSet<_> = self.elements.iter().map(|element| element.id).collect();
+        for (index, derived) in self.derived_observations.iter().enumerate() {
+            derived.validate(index, &element_ids, &mut errors);
+            if !element_ids.insert(derived.id) {
+                errors.push(ValidationError::new(
+                    format!("derived_observations[{index}].id"),
+                    "must be unique across detector and derived observations",
+                ));
+            }
+        }
         for (index, rule) in self.rules.iter().enumerate() {
             rule.validate(index, &element_ids, &mut errors);
             if !element_ids.contains(&rule.element_id) {
@@ -139,6 +153,63 @@ impl Profile {
             Ok(())
         } else {
             Err(ValidationErrors(errors))
+        }
+    }
+}
+
+/// A daemon-composed text observation with stable identity.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DerivedObservation {
+    pub id: ElementId,
+    pub detector_id: DetectorId,
+    pub name: String,
+    pub enabled: bool,
+    /// Format string containing `{input_name}` placeholders.
+    pub format: String,
+    pub inputs: Vec<DerivedInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DerivedInput {
+    pub name: String,
+    pub element_id: ElementId,
+}
+
+impl DerivedObservation {
+    fn validate(
+        &self,
+        index: usize,
+        element_ids: &HashSet<ElementId>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let base = format!("derived_observations[{index}]");
+        if self.name.trim().is_empty() || self.format.is_empty() || self.format.len() > 512 {
+            errors.push(ValidationError::new(
+                base.clone(),
+                "name and format must be non-empty and format at most 512 bytes",
+            ));
+        }
+        let mut names = HashSet::new();
+        if self.inputs.is_empty() || self.inputs.len() > 16 {
+            errors.push(ValidationError::new(
+                format!("{base}.inputs"),
+                "must contain 1 through 16 inputs",
+            ));
+        }
+        for (input_index, input) in self.inputs.iter().enumerate() {
+            let placeholder = format!("{{{}}}", input.name);
+            if !names.insert(input.name.as_str()) || !self.format.contains(&placeholder) {
+                errors.push(ValidationError::new(
+                    format!("{base}.inputs[{input_index}].name"),
+                    "must be unique and referenced by the format",
+                ));
+            }
+            if !element_ids.contains(&input.element_id) {
+                errors.push(ValidationError::new(
+                    format!("{base}.inputs[{input_index}].element_id"),
+                    "must reference a detector observation",
+                ));
+            }
         }
     }
 }
@@ -244,6 +315,21 @@ pub enum Detector {
         maximum_interval_ms: u64,
         #[serde(default)]
         preprocessing: Vec<PreprocessOperation>,
+        /// Typed text emitted when the optional HUD value is absent.
+        #[serde(default)]
+        empty_value: Option<String>,
+        /// Left-pad non-empty numeric OCR results with zeroes to this width.
+        #[serde(default)]
+        zero_pad_to: Option<u8>,
+    },
+    SevenSegment {
+        id: DetectorId,
+        digits: u8,
+        #[serde(default)]
+        separator_after: Option<u8>,
+        threshold: u8,
+        #[serde(default)]
+        preprocessing: Vec<PreprocessOperation>,
     },
     Classifier {
         id: DetectorId,
@@ -291,6 +377,7 @@ impl Detector {
             | Self::Template { id, .. }
             | Self::RegionChange { id, .. }
             | Self::Ocr { id, .. }
+            | Self::SevenSegment { id, .. }
             | Self::Classifier { id, .. } => {
                 *id = DetectorId::new();
             }
@@ -364,6 +451,7 @@ impl Detector {
                 character_whitelist,
                 change_trigger_threshold,
                 maximum_interval_ms,
+                zero_pad_to,
                 preprocessing,
                 ..
             } => {
@@ -376,6 +464,28 @@ impl Detector {
                     *maximum_interval_ms,
                     errors,
                 );
+                if zero_pad_to.is_some_and(|width| !(1..=16).contains(&width)) {
+                    errors.push(ValidationError::new(
+                        format!("{path}.zero_pad_to"),
+                        "must be between 1 and 16",
+                    ));
+                }
+                validate_preprocessing(path, preprocessing, errors);
+            }
+            Self::SevenSegment {
+                digits,
+                separator_after,
+                preprocessing,
+                ..
+            } => {
+                if !(1..=8).contains(digits)
+                    || separator_after.is_some_and(|position| position == 0 || position >= *digits)
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "seven-segment digits must be 1 through 8 and separator_after must be between digits",
+                    ));
+                }
                 validate_preprocessing(path, preprocessing, errors);
             }
             Self::Classifier {
@@ -574,6 +684,10 @@ pub enum RulePredicate {
     TextContains {
         needle: String,
     },
+    RapidIncrease {
+        minimum_delta: u64,
+        within_ms: u64,
+    },
     All {
         conditions: Vec<ObservationCondition>,
     },
@@ -673,6 +787,14 @@ impl EventRule {
         }
         match &self.predicate {
             RulePredicate::NumericBelow | RulePredicate::Boolean { .. } => {}
+            RulePredicate::RapidIncrease {
+                minimum_delta,
+                within_ms,
+            } => {
+                if *minimum_delta == 0 || !(100..=60_000).contains(within_ms) {
+                    errors.push(ValidationError::new(format!("{base}.predicate"), "rapid increase requires a positive delta and a 100 through 60000 ms window"));
+                }
+            }
             RulePredicate::TextEquals { expected } => {
                 validate_match_text(&format!("{base}.predicate.expected"), expected, errors);
             }

@@ -14,8 +14,16 @@ Implemented controls include:
 - aspect-preserving preview, zoom, pan, draw/select/move/resize/duplicate regions,
   enable state, labels, normalized coordinates, and reference-pixel sizes.
 - numeric, boolean, text, stable-duration, composed, initial, and updated event rules;
-- deterministic, OCR, and portable ONNX classifier configuration and diagnostics;
+- deterministic color/template/change/seven-segment, OCR, and portable ONNX classifier configuration and diagnostics;
 - diagnostic bundle entry/size/privacy review and confirmed export.
+- passive evidence policy/status, an inspectable image/observation batch, editable typed
+  expectations, accept/correct/reject/promote actions, and conservative automatic
+  review through the shared collection JSON-RPC methods.
+- machine-local output route listing, enable/disable controls, trigger/sink inspection,
+  and explicit sample delivery through the shared output JSON-RPC methods.
+- packaged inert output-recipe browsing with provenance/hash disclosure, editable
+  trigger/payload JSON, side-effect-free preview, explicit local sink selection, and
+  disabled installation before the existing test/enable controls.
 
 Preview is a per-connection lease. The daemon downsamples to at most 320×180 and
 returns a compressed PNG from a clone of the latest frame; detector input is unchanged.
