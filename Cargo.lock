@@ -4457,7 +4457,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "yash-app-events"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4470,14 +4470,14 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-capture"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "yash-app-events-capture-pw"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ashpd",
  "futures-util",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-engine"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4502,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-output"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-profile"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4531,7 +4531,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4542,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-events-vision"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "leptess",
  "ort",
@@ -4556,7 +4556,7 @@ dependencies = [
 
 [[package]]
 name = "yash-app-eventsd"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "yash-eventsctl"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
