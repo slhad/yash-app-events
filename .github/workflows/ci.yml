@@ -19,7 +19,8 @@ jobs:
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libtesseract-dev \
-            pkg-config
+            pkg-config \
+            tesseract-ocr-eng
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt,clippy

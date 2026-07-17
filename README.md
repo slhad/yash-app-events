@@ -53,7 +53,7 @@ On Ubuntu, install the native development dependencies with:
 ```bash
 sudo apt-get update
 sudo apt-get install clang libclang-dev libleptonica-dev libpipewire-0.3-dev \
-  libspa-0.2-dev libtesseract-dev pkg-config
+  libspa-0.2-dev libtesseract-dev pkg-config tesseract-ocr-eng
 ```
 
 The current reference build is x86-64 CachyOS/Arch Linux with Hyprland,
