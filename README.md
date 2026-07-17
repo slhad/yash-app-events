@@ -48,6 +48,14 @@ The binary names and protocol-v1 command names are compatibility-sensitive.
 - PipeWire, Wayland, D-Bus, and a working desktop portal development stack.
 - Tesseract 5 and Leptonica development libraries for the OCR backend.
 
+On Ubuntu, install the native development dependencies with:
+
+```bash
+sudo apt-get update
+sudo apt-get install clang libclang-dev libleptonica-dev libpipewire-0.3-dev \
+  libspa-0.2-dev libtesseract-dev pkg-config
+```
+
 The current reference build is x86-64 CachyOS/Arch Linux with Hyprland,
 PipeWire 1.6.6, Wayland client 1.25.0, and Rust 1.95. Install from a checkout:
 

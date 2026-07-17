@@ -9,6 +9,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install Linux development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang \
+            libclang-dev \
+            libleptonica-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libtesseract-dev \
+            pkg-config
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt,clippy
