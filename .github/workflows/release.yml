@@ -1,0 +1,122 @@
+name: Build Linux Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing release tag to build
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag_name || github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Build Linux x86-64 archive
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang \
+            libclang-dev \
+            libleptonica-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libtesseract-dev \
+            pkg-config \
+            tesseract-ocr-eng
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Resolve and validate release metadata
+        id: meta
+        shell: bash
+        run: |
+          tag="${{ inputs.tag_name || github.ref_name }}"
+          version="${tag#v}"
+          manifest_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$tag" != v* || "$version" != "$manifest_version" ]]; then
+            echo "Tag ${tag} does not match Cargo workspace version ${manifest_version}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=yash-app-events-${tag}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        run: cargo build --release --locked --workspace
+
+      - name: Assemble release archive
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          ARCHIVE: ${{ steps.meta.outputs.archive }}
+        shell: bash
+        run: |
+          root="yash-app-events-${RELEASE_TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p \
+            "$root/bin" \
+            "$root/share/applications" \
+            "$root/share/bash-completion/completions" \
+            "$root/share/icons/hicolor/scalable/apps" \
+            "$root/share/man/man1" \
+            "$root/share/systemd/user"
+
+          install -m755 target/release/yash-app-events "$root/bin/yash-app-events"
+          install -m755 target/release/yash-app-eventsd "$root/bin/yash-app-eventsd"
+          install -m755 target/release/yash-eventsctl "$root/bin/yash-eventsctl"
+          find target/release -maxdepth 1 -type f -name 'libonnxruntime.so*' \
+            -exec install -m755 -t "$root/bin" {} +
+
+          install -m644 packaging/applications/io.github.yash_app_events.desktop \
+            "$root/share/applications/io.github.yash_app_events.desktop"
+          install -m644 packaging/completions/yash-eventsctl.bash \
+            "$root/share/bash-completion/completions/yash-eventsctl"
+          install -m644 packaging/icons/io.github.yash_app_events.svg \
+            "$root/share/icons/hicolor/scalable/apps/io.github.yash_app_events.svg"
+          install -m644 packaging/man/yash-app-eventsd.1 \
+            "$root/share/man/man1/yash-app-eventsd.1"
+          install -m644 packaging/man/yash-eventsctl.1 \
+            "$root/share/man/man1/yash-eventsctl.1"
+          install -m644 packaging/systemd/yash-app-eventsd.service \
+            "$root/share/systemd/user/yash-app-eventsd.service"
+          install -m644 README.md LICENSE-APACHE LICENSE-MIT "$root"
+
+          tar -czf "$ARCHIVE" "$root"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yash-app-events-${{ steps.meta.outputs.tag }}-linux-x86_64
+          path: |
+            ${{ steps.meta.outputs.archive }}
+            ${{ steps.meta.outputs.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          files: |
+            ${{ steps.meta.outputs.archive }}
+            ${{ steps.meta.outputs.archive }}.sha256
+          generate_release_notes: true
