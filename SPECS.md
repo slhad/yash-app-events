@@ -231,6 +231,29 @@ Profile import shall defend against archive path traversal, symlinks, excessive 
 
 Profile deletion shall move data into an application-managed trash location. Permanent deletion shall be an explicit separate action.
 
+### SPEC-PROFILE-012 — Public profile catalog
+
+The application shall browse one rolling GitHub release with stable tag `profiles` and
+display title `Profile Catalog`. Profile archives shall use immutable names of the form
+`profile--<game-slug>--<profile-slug>--v<semantic-version>.hudprofile`; catalog documents
+shall be append-only `catalog-v1-rNNNNNN.json` revisions. Publication shall upload new
+packages before the index that references them and shall never overwrite an existing asset.
+
+Catalog access shall be daemon-owned and exposed to GUI and CLI through the same protocol.
+The daemon shall use a fixed repository/release origin, bounded HTTPS timeouts and response
+sizes, strict schema/compatibility validation, atomic XDG cache writes, and package
+size/SHA-256 verification before handing a download to the existing safe profile importer.
+The last valid cached catalog shall remain usable while offline. Installation shall require
+the reviewed catalog revision and package hash, shall reject withdrawn or duplicate versions,
+and shall never activate a profile or authorize an output route automatically.
+
+Catalog source versions shall be reviewable, append-only repository directories. A
+`media_free` source shall reject images, video, audio, binary/undeclared files, symlinks,
+absolute paths, capture bindings, restore tokens, machine-local routes, secrets, credentials,
+and likely email addresses. The generated package shall contain only portable profile content
+and validated inert output recipes. Private regression media may verify a package but shall
+not be published with it.
+
 ## 6. Visual configuration UI
 
 ### SPEC-UI-001 — Toolkit
@@ -656,6 +679,7 @@ SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test;
 SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata (2026-07-11)
 SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
 SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)
+SPEC-PROFILE-012 | IN_PROGRESS | catalog schema/build/cache/download/import implementation and media-free BlazBlue source exist; full workspace, GUI, workflow, and live release verification remain pending (2026-07-18)
 SPEC-ARCH-001 | VERIFIED | daemon exclusively owns profiles, portal session, latest-frame/analysis worker, outputs, and protocol state; GUI/CLI are protocol-v1 clients and render thread performs no I/O (2026-07-11)
 SPEC-IPC-001 | VERIFIED | Tokio Unix-socket integration tests verify documented path configuration, runtime dir 0700, socket 0600, safe stale recovery, and no network listener (2026-07-11)
 SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB message, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)

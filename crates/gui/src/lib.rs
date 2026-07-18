@@ -50,6 +50,9 @@ enum RequestKind {
     OutputRecipeList,
     OutputRecipePreview,
     OutputRecipeInstall,
+    CatalogStatus,
+    CatalogList,
+    CatalogInstall,
 }
 
 #[derive(Debug)]
@@ -219,6 +222,8 @@ impl Worker {
                                 let client = client.as_mut().expect("client was initialized");
                                 if request.method == method::CAPTURE_SELECT
                                     || request.kind == RequestKind::Replay
+                                    || request.method == method::CATALOG_REFRESH
+                                    || request.kind == RequestKind::CatalogInstall
                                 {
                                     client
                                         .call_with_timeout(
@@ -376,6 +381,11 @@ pub struct App {
     output_recipe_command: bool,
     output_recipe_replace: bool,
     output_recipe_preview: Value,
+    catalog_status: Value,
+    catalog: Value,
+    selected_catalog_profile: Option<usize>,
+    catalog_install_reviewed: bool,
+    catalog_pending: bool,
 }
 
 impl fmt::Debug for App {
@@ -398,6 +408,11 @@ impl App {
         let worker = Worker::spawn(socket);
         worker.send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
         worker.send(RequestKind::Status, method::STATUS, Value::Null);
+        worker.send(
+            RequestKind::CatalogStatus,
+            method::CATALOG_STATUS,
+            Value::Null,
+        );
         Self {
             worker,
             profiles: Vec::new(),
@@ -477,6 +492,11 @@ impl App {
             output_recipe_command: false,
             output_recipe_replace: false,
             output_recipe_preview: json!({}),
+            catalog_status: json!({}),
+            catalog: json!({}),
+            selected_catalog_profile: None,
+            catalog_install_reviewed: false,
+            catalog_pending: false,
         }
     }
 
@@ -489,6 +509,12 @@ impl App {
                     self.preview_pending = false;
                     if response.kind == RequestKind::CaptureSelect {
                         self.capture_select_pending = false;
+                    }
+                    if matches!(
+                        response.kind,
+                        RequestKind::CatalogList | RequestKind::CatalogInstall
+                    ) {
+                        self.catalog_pending = false;
                     }
                 }
                 Payload::Preview(image) => {
@@ -682,6 +708,33 @@ impl App {
                                 "installed":value["installed"],
                                 "note":"Installed disabled; test and enable it above after review."
                             });
+                        }
+                        RequestKind::CatalogStatus => self.catalog_status = value,
+                        RequestKind::CatalogList => {
+                            self.catalog_pending = false;
+                            self.catalog_status = json!({
+                                "cached": true,
+                                "revision": value["revision"],
+                                "generated_at": value["generated_at"],
+                                "profile_count": value["profiles"].as_array().map_or(0, Vec::len),
+                            });
+                            self.catalog = value;
+                            self.selected_catalog_profile = None;
+                            self.catalog_install_reviewed = false;
+                        }
+                        RequestKind::CatalogInstall => {
+                            self.catalog_pending = false;
+                            self.catalog_install_reviewed = false;
+                            self.worker.send(
+                                RequestKind::Profiles,
+                                method::PROFILE_LIST,
+                                Value::Null,
+                            );
+                            self.worker.send(
+                                RequestKind::CatalogList,
+                                method::CATALOG_LIST,
+                                Value::Null,
+                            );
                         }
                         RequestKind::Capture | RequestKind::CaptureSelect => {
                             self.capture_status = value;
@@ -886,6 +939,173 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn profile_catalog_ui(&mut self, ui: &mut egui::Ui) {
+        ui.small("Reviewed portable profiles from the single GitHub Profile Catalog release.");
+        let cached = self.catalog_status["cached"].as_bool().unwrap_or(false);
+        let revision = self.catalog_status["revision"].as_u64();
+        ui.horizontal(|ui| {
+            ui.label(if cached {
+                format!("Cached catalog · revision {}", revision.unwrap_or(0))
+            } else {
+                "No validated catalog cached".into()
+            });
+            if cached
+                && ui
+                    .add_enabled(!self.catalog_pending, egui::Button::new("Browse cached"))
+                    .clicked()
+            {
+                self.catalog_pending = true;
+                self.worker
+                    .send(RequestKind::CatalogList, method::CATALOG_LIST, Value::Null);
+            }
+            if ui
+                .add_enabled(!self.catalog_pending, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.catalog_pending = true;
+                self.worker.send(
+                    RequestKind::CatalogList,
+                    method::CATALOG_REFRESH,
+                    Value::Null,
+                );
+            }
+        });
+        if self.catalog_pending {
+            ui.small("Catalog request in progress…");
+        }
+        if let Some(generated) = self.catalog_status["generated_at"].as_str() {
+            ui.small(format!("Last validated publication: {generated}"));
+        }
+        let profiles = self.catalog["profiles"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if profiles.is_empty() {
+            ui.small(
+                "Refresh to discover compatible profiles. Installed profiles keep working offline.",
+            );
+            return;
+        }
+        ui.separator();
+        for (index, profile) in profiles.iter().enumerate() {
+            let installed = profile["installed"].as_bool().unwrap_or(false);
+            let label = format!(
+                "{} · v{}{}",
+                profile["name"].as_str().unwrap_or("Unnamed profile"),
+                profile["version"].as_str().unwrap_or("?"),
+                if installed { " · installed" } else { "" }
+            );
+            if ui
+                .selectable_label(self.selected_catalog_profile == Some(index), label)
+                .clicked()
+            {
+                self.selected_catalog_profile = Some(index);
+                self.catalog_install_reviewed = false;
+            }
+        }
+        let Some(profile) = self
+            .selected_catalog_profile
+            .and_then(|index| profiles.get(index))
+        else {
+            return;
+        };
+        ui.separator();
+        ui.label(profile["description"].as_str().unwrap_or(""));
+        ui.small(format!(
+            "{} · {} bytes · profile schema {}",
+            if profile["media_free"].as_bool().unwrap_or(false) {
+                "media-free"
+            } else {
+                "contains declared assets"
+            },
+            profile["bytes"].as_u64().unwrap_or(0),
+            profile["profile_schema"].as_u64().unwrap_or(0)
+        ));
+        ui.small(format!(
+            "Requires app {} or newer · package {}",
+            profile["minimum_app_version"].as_str().unwrap_or("?"),
+            profile["package"].as_str().unwrap_or("?")
+        ));
+        if let Some(layout) = profile["tested_layouts"]
+            .as_array()
+            .and_then(|items| items.first())
+        {
+            ui.small(format!(
+                "Tested layout: {}×{} · language {}",
+                layout["width"].as_u64().unwrap_or(0),
+                layout["height"].as_u64().unwrap_or(0),
+                layout["language"].as_str().unwrap_or("unspecified")
+            ));
+        }
+        ui.small(format!(
+            "Detectors: {}",
+            profile["detectors"]
+                .as_array()
+                .map(|values| values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default()
+        ));
+        ui.small(format!(
+            "License: {} · Verification: {} ({})",
+            profile["license"].as_str().unwrap_or("unspecified"),
+            profile["verification"]["status"]
+                .as_str()
+                .unwrap_or("unknown"),
+            profile["verification"]["date"]
+                .as_str()
+                .unwrap_or("unknown date")
+        ));
+        ui.small(profile["verification"]["evidence"].as_str().unwrap_or(""));
+        ui.small(format!(
+            "SHA-256: {}",
+            profile["sha256"].as_str().unwrap_or("missing")
+        ));
+        if let Some(recipes) = profile["output_recipes"].as_array() {
+            ui.small(format!(
+                "Inert output recipes: {}",
+                recipes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if profile["installed"].as_bool().unwrap_or(false) {
+            ui.colored_label(
+                egui::Color32::GREEN,
+                "This exact profile version is installed.",
+            );
+            return;
+        }
+        ui.checkbox(
+            &mut self.catalog_install_reviewed,
+            "I reviewed compatibility, provenance, license, and included recipes",
+        );
+        if ui
+            .add_enabled(
+                self.catalog_install_reviewed,
+                egui::Button::new("Download, verify, and install inactive"),
+            )
+            .clicked()
+        {
+            self.catalog_pending = true;
+            self.worker.send(
+                RequestKind::CatalogInstall,
+                method::CATALOG_INSTALL,
+                json!({
+                    "id": profile["id"],
+                    "version": profile["version"],
+                    "catalog_revision": self.catalog["revision"],
+                    "sha256": profile["sha256"],
+                }),
+            );
+        }
+    }
+
     fn sidebar(&mut self, context: &egui::Context) {
         egui::SidePanel::left("profiles").resizable(true).default_width(300.0).show(context,|ui| {
             ui.heading("Profiles");
@@ -894,6 +1114,8 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_name); });
             ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_game); if ui.button("Create").clicked() { let profile = Profile::new(&self.new_name,&self.new_game,1920,1080); self.worker.send(RequestKind::Create,method::PROFILE_CREATE,json!({"profile":profile})); } });
+            ui.separator();
+            ui.collapsing("Profile Catalog", |ui| self.profile_catalog_ui(ui));
             ui.separator();
             let mut select_index = None;
             for (index,profile) in self.profiles.iter().enumerate() { if ui.selectable_label(self.selected == Some(index),format!("{} · rev {}",profile.name,profile.revision)).clicked() { select_index=Some(index); } }

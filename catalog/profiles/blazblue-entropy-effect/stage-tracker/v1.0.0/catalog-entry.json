@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "blazblue-entropy-effect.stage-tracker",
+  "game": "blazblue_entropy_effect",
+  "game_slug": "blazblue-entropy-effect",
+  "profile_slug": "stage-tracker",
+  "name": "BlazBlue Entropy Effect — Stage Tracker",
+  "description": "Media-free OCR and seven-segment profile for the composed current stage value.",
+  "version": "1.0.0",
+  "minimum_app_version": "0.0.1",
+  "media_free": true,
+  "detectors": [
+    "ocr",
+    "seven_segment"
+  ],
+  "tested_layouts": [
+    {
+      "width": 3840,
+      "height": 2160,
+      "language": "eng"
+    }
+  ],
+  "output_recipes": [
+    "Current stage text",
+    "Current stage text (no newline)"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "verification": {
+    "status": "verified",
+    "date": "2026-07-18",
+    "evidence": "Private 33-case, 50-frame BlazBlue replay: 126 typed observation assertions passed. No replay media is distributed."
+  }
+}

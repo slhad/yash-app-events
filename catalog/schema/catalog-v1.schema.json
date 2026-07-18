@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/slhad/yash-app-events/catalog/schema/catalog-v1.schema.json",
+  "title": "Yash App Events profile catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "revision", "generated_at", "profiles"],
+  "properties": {
+    "schema": { "const": 1 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "profiles": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "game", "game_slug", "profile_slug", "profile_id", "name", "description",
+          "version", "package", "bytes", "sha256", "profile_schema", "minimum_app_version",
+          "media_free", "detectors", "tested_layouts", "output_recipes", "license",
+          "verification", "withdrawn"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "game": { "type": "string" },
+          "game_slug": { "type": "string" },
+          "profile_slug": { "type": "string" },
+          "profile_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": { "type": "string", "maxLength": 4096 },
+          "version": { "type": "string" },
+          "package": { "type": "string", "pattern": "^profile--[a-z0-9_-]+--[a-z0-9_-]+--v[0-9]+\\.[0-9]+\\.[0-9]+.*\\.hudprofile$" },
+          "bytes": { "type": "integer", "minimum": 1, "maximum": 134217728 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "profile_schema": { "const": 1 },
+          "minimum_app_version": { "type": "string" },
+          "maximum_app_version": { "type": "string" },
+          "media_free": { "type": "boolean" },
+          "detectors": { "type": "array", "items": { "type": "string" } },
+          "tested_layouts": { "type": "array", "items": { "type": "object" } },
+          "output_recipes": { "type": "array", "items": { "type": "string" } },
+          "license": { "type": "string", "minLength": 1 },
+          "verification": { "type": "object" },
+          "withdrawn": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

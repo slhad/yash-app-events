@@ -24,6 +24,8 @@ Implemented controls include:
 - packaged inert output-recipe browsing with provenance/hash disclosure, editable
   trigger/payload JSON, side-effect-free preview, explicit local sink selection, and
   disabled installation before the existing test/enable controls.
+- collapsed public Profile Catalog browsing with cached/offline status, compatibility,
+  media/provenance/license/verification disclosure, explicit review, and inactive install.
 
 Preview is a per-connection lease. The daemon downsamples to at most 320×180 and
 returns a compressed PNG from a clone of the latest frame; detector input is unchanged.

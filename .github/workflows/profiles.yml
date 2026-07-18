@@ -1,0 +1,125 @@
+name: Publish Profile Catalog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "catalog/profiles/**"
+      - ".github/workflows/profiles.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: profile-catalog-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish immutable profiles
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Refuse removal of published profile sources
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          if git diff --name-only --diff-filter=D HEAD^ HEAD -- catalog/profiles | grep -q .; then
+            echo "Published profile source versions are append-only" >&2
+            exit 1
+          fi
+
+      - name: Validate and build catalog packages
+        run: |
+          cargo run --locked -p yash-app-events-catalog --bin catalog-tool -- validate catalog/profiles
+          cargo run --locked -p yash-app-events-catalog --bin catalog-tool -- build catalog/profiles --output target/profile-catalog
+
+      - name: Review exact media-free archive inventories
+        shell: bash
+        run: |
+          for package in target/profile-catalog/*.hudprofile; do
+            echo "Inventory for $(basename "$package")"
+            unzip -Z1 "$package"
+            if unzip -Z1 "$package" | grep -Eiq '\.(png|jpe?g|webp|gif|mp4|webm|mkv|wav|ogg|mp3)$'; then
+              echo "Media-free profile unexpectedly contains media" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create the single rolling release when absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if ! gh release view profiles >/dev/null 2>&1; then
+            gh release create profiles \
+              --target "$GITHUB_SHA" \
+              --title "Profile Catalog" \
+              --notes "Reviewed portable profiles for Yash App Events. Browse and install these packages through the application." \
+              --latest=false
+          fi
+
+      - name: Upload missing immutable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          for package in target/profile-catalog/*.hudprofile; do
+            name=$(basename "$package")
+            local_digest="sha256:$(sha256sum "$package" | cut -d' ' -f1)"
+            remote_digest=$(gh release view profiles --json assets --jq ".assets[] | select(.name == \"${name}\") | .digest")
+            if [[ -n "$remote_digest" ]]; then
+              if [[ "$remote_digest" != "$local_digest" ]]; then
+                echo "Refusing to replace immutable asset ${name}" >&2
+                exit 1
+              fi
+              echo "Verified existing immutable asset ${name}"
+            else
+              gh release upload profiles "$package"
+            fi
+          done
+
+      - name: Publish the next append-only catalog revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          current=$(gh release view profiles --json assets --jq '.assets[].name' \
+            | sed -n 's/^catalog-v1-r\([0-9][0-9]*\)\.json$/\1/p' \
+            | sort -n \
+            | tail -1)
+          if [[ -n "$current" ]]; then
+            current_name=$(printf 'catalog-v1-r%06d.json' "$((10#$current))")
+            mkdir -p target/profile-catalog/current
+            gh release download profiles --pattern "$current_name" --dir target/profile-catalog/current
+            if diff -u \
+              <(jq --sort-keys '.profiles' "target/profile-catalog/current/$current_name") \
+              <(jq --sort-keys '.' target/profile-catalog/catalog-entries.json); then
+              echo "Catalog contents are unchanged; no new revision is needed"
+              exit 0
+            fi
+          fi
+          revision=$((10#${current:-0} + 1))
+          cargo run --locked -p yash-app-events-catalog --bin catalog-tool -- index \
+            target/profile-catalog/catalog-entries.json \
+            --revision "$revision" \
+            --output target/profile-catalog
+          index=$(printf 'target/profile-catalog/catalog-v1-r%06d.json' "$revision")
+          gh release upload profiles "$index"
+
+      - name: Upload publication evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-catalog-publication
+          path: |
+            target/profile-catalog/*.hudprofile
+            target/profile-catalog/catalog-v1-r*.json
+            target/profile-catalog/catalog-entries.json
+          if-no-files-found: error

@@ -40,11 +40,22 @@ async fn main() -> anyhow::Result<()> {
             |value| Some(value.into()),
         )
         .ok_or_else(|| anyhow::anyhow!("HOME or XDG_STATE_HOME is required"))?;
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map_or_else(
+            || {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .map(|home| home.join(".cache"))
+            },
+            |value| Some(value.into()),
+        )
+        .ok_or_else(|| anyhow::anyhow!("HOME or XDG_CACHE_HOME is required"))?;
     let config = ServerConfig {
         socket_path: std::path::PathBuf::from(runtime).join("yash-app-events/control.sock"),
         data_root: data.join("yash-app-events"),
         config_root: config_home.join("yash-app-events"),
         state_root: state_home.join("yash-app-events"),
+        cache_root: cache_home.join("yash-app-events/profile-catalog"),
         maximum_connections: 64,
     };
     info!(version = env!("CARGO_PKG_VERSION"), socket = %config.socket_path.display(), "daemon starting");

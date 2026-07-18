@@ -9,6 +9,11 @@ Reviewed 2026-07-11 against protocol/profile/capture/output schema version 1.
   paths, link entries, undeclared resources, size/count/expansion excess, checksum
   mismatch, unsupported schemas, invalid profiles, and missing assets. Imported data
   is never executed.
+- Public catalog access is outbound-only and user-triggered. The daemon fixes the GitHub
+  repository/release origin, bounds redirects/timeouts/catalog and package bytes, validates
+  schema/application compatibility, atomically caches only a valid index, and verifies the
+  reviewed package size and SHA-256 before invoking the same untrusted archive importer.
+  Catalog installation never activates a profile or authorizes an inert output recipe.
 - Portable ONNX models are regular profile-relative files capped at 64 MiB and must
   match the profile-declared SHA-256 before ONNX Runtime creates a CPU session. Input
   dimensions, label count, preprocessing, scheduling, and output cardinality are
@@ -38,3 +43,5 @@ Known release limitations: there is no remote control transport or authenticatio
 because no network listener exists. A user with access to the same Unix account can
 read that account's files and connect to its socket. Portal/compositor capture
 indicators and permission revocation are desktop responsibilities.
+GitHub is the initial catalog authenticity trust root: package hashes prevent corruption or
+catalog/package mismatches, but an independent embedded signing key is not yet implemented.
