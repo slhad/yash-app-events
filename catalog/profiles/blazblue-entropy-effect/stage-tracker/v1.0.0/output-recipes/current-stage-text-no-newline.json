@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "6e9f7cf6-eb43-441f-ab51-899d527663fd",
+  "name": "Current stage text (no newline)",
+  "description": "Keep one plain-text file containing exactly the latest composed stage value with no trailing line feed.",
+  "trigger": {
+    "kind": "state_change"
+  },
+  "format": {
+    "kind": "text_template",
+    "template": "{{state.observations.4795edfb-52c5-4bde-916e-c95407ab0777.value}}",
+    "trailing_newline": false
+  },
+  "suggested_sink": {
+    "kind": "file",
+    "mode": "replace",
+    "suggested_filename": "blazblue-stage-no-newline.txt"
+  }
+}

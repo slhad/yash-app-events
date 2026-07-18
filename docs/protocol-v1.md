@@ -15,6 +15,9 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
   `profile.duplicate`, `profile.validate`, `profile.import`, `profile.export`,
   `profile.trash`, `profile.restore`, `profile.activate`
 - `profile.draft` (recoverable, separate from the committed revision)
+- `catalog.status`, `catalog.refresh`, `catalog.list`, and `catalog.install` (fixed-origin,
+  bounded and cached public profile discovery; install requires the reviewed revision/hash
+  and leaves the imported profile inactive)
 - `state.get`, `events.subscribe`, `status.subscribe`
 - `output.list`, `output.set`, `output.enable`, `output.remove`, and `output.test`
   (machine-local profile routes; `test` performs an explicit sample delivery)

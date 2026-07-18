@@ -25,6 +25,7 @@ use uuid::Uuid;
 use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
+use yash_app_events_catalog::{Catalog, CatalogError, CatalogService};
 use yash_app_events_engine::collection::{
     CollectedFrame, CollectionItem, CollectionReason, ReviewRecord, ReviewStatus,
 };
@@ -71,6 +72,7 @@ pub struct ServerConfig {
     pub data_root: PathBuf,
     pub config_root: PathBuf,
     pub state_root: PathBuf,
+    pub cache_root: PathBuf,
     pub maximum_connections: usize,
 }
 
@@ -80,6 +82,7 @@ struct State {
     instance: Uuid,
     profiles: ProfileStore,
     local_config: LocalConfig,
+    catalog: CatalogService,
     connected: AtomicUsize,
     maximum_connections: usize,
     shutdown: Notify,
@@ -187,6 +190,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         instance,
         profiles: ProfileStore::new(config.data_root, 20),
         local_config: LocalConfig::new(config.config_root),
+        catalog: CatalogService::new(config.cache_root)?,
         connected: AtomicUsize::new(0),
         maximum_connections: config.maximum_connections,
         shutdown: Notify::new(),
@@ -447,7 +451,7 @@ async fn dispatch(
             Ok(json!({"version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
         }
         method::CAPABILITIES => Ok(
-            json!({"profiles":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
+            json!({"profiles":true,"profile_catalog":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
         ),
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
@@ -620,6 +624,20 @@ async fn dispatch(
                 .map_err(internal_error)?;
             Ok(json!({"active_profile": params.profile_id}))
         }),
+        method::CATALOG_STATUS => state
+            .catalog
+            .status()
+            .and_then(|status| serde_json::to_value(status).map_err(CatalogError::from))
+            .map_err(catalog_error),
+        method::CATALOG_LIST => catalog_listing(state).map_err(catalog_error),
+        method::CATALOG_REFRESH => match state.catalog.refresh().await {
+            Ok(catalog) => catalog_listing_value(state, &catalog).map_err(catalog_error),
+            Err(error) => Err(catalog_error(error)),
+        },
+        method::CATALOG_INSTALL => match parse::<CatalogInstallParams>(request.params) {
+            Ok(params) => install_catalog_profile(state, params).await,
+            Err(error) => Err(error),
+        },
         method::STATE_GET => Ok(state
             .latest_snapshot
             .lock()
@@ -747,6 +765,103 @@ fn internal_error(error: impl std::fmt::Display) -> RpcError {
         message: "internal error".into(),
         data: Some(json!({"detail": error.to_string()})),
     }
+}
+
+fn catalog_error(error: impl std::fmt::Display) -> RpcError {
+    RpcError {
+        code: error_code::INTERNAL_ERROR,
+        message: "profile catalog operation failed".into(),
+        data: Some(json!({"detail": error.to_string()})),
+    }
+}
+
+fn catalog_listing(state: &State) -> Result<Value, CatalogError> {
+    let catalog = state.catalog.load()?;
+    catalog_listing_value(state, &catalog)
+}
+
+fn catalog_listing_value(state: &State, catalog: &Catalog) -> Result<Value, CatalogError> {
+    let application = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| CatalogError::Invalid("application version is invalid"))?;
+    let profiles = catalog
+        .compatible_profiles(&application)
+        .into_iter()
+        .map(|entry| {
+            let installed = state
+                .profiles
+                .profiles_root()
+                .join(entry.profile_id.to_string())
+                .is_dir();
+            let mut value = serde_json::to_value(entry)?;
+            value["installed"] = json!(installed);
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, CatalogError>>()?;
+    Ok(json!({
+        "schema": catalog.schema,
+        "revision": catalog.revision,
+        "generated_at": catalog.generated_at,
+        "profiles": profiles,
+    }))
+}
+
+async fn install_catalog_profile(
+    state: &State,
+    params: CatalogInstallParams,
+) -> Result<Value, RpcError> {
+    let catalog = state.catalog.load().map_err(catalog_error)?;
+    if catalog.revision != params.catalog_revision {
+        return Err(RpcError {
+            code: error_code::REVISION_CONFLICT,
+            message: "profile catalog changed; review the current entry before installing".into(),
+            data: Some(json!({
+                "expected": params.catalog_revision,
+                "current": catalog.revision,
+            })),
+        });
+    }
+    let entry = catalog
+        .profiles
+        .iter()
+        .find(|entry| entry.id == params.id && entry.version.to_string() == params.version)
+        .ok_or_else(|| {
+            RpcError::new(error_code::INVALID_PARAMS, "catalog profile was not found")
+        })?;
+    if entry.sha256 != params.sha256 {
+        return Err(RpcError::new(
+            error_code::REVISION_CONFLICT,
+            "catalog package changed; review it again before installing",
+        ));
+    }
+    if state
+        .profiles
+        .profiles_root()
+        .join(entry.profile_id.to_string())
+        .exists()
+    {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "catalog profile version is already installed",
+        ));
+    }
+    let package = state
+        .catalog
+        .download_package(entry)
+        .await
+        .map_err(catalog_error)?;
+    let profile = import_profile(
+        &package,
+        state.profiles.profiles_root(),
+        ImportLimits::default(),
+    )
+    .map_err(internal_error)?;
+    Ok(json!({
+        "installed": true,
+        "catalog_id": entry.id,
+        "version": entry.version,
+        "profile": profile,
+        "active": false,
+    }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4184,6 +4299,13 @@ struct PathParam {
     path: PathBuf,
 }
 #[derive(Deserialize)]
+struct CatalogInstallParams {
+    id: String,
+    version: String,
+    catalog_revision: u64,
+    sha256: String,
+}
+#[derive(Deserialize)]
 struct ExportParams {
     profile_id: ProfileId,
     path: PathBuf,
@@ -4372,6 +4494,8 @@ pub enum ServerError {
     Io(#[from] io::Error),
     #[error("daemon JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("profile catalog initialization failed: {0}")]
+    Catalog(#[from] CatalogError),
     #[error("another daemon already owns the control socket")]
     AlreadyRunning,
     #[error("refusing to remove a stale path that is not a Unix socket")]
@@ -4400,6 +4524,7 @@ mod tests {
             data_root: directory.join("data"),
             config_root: directory.join("config"),
             state_root: directory.join("state"),
+            cache_root: directory.join("cache"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config));
@@ -4447,6 +4572,70 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cached_catalog_is_listed_and_install_requires_reviewed_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("cache")).unwrap();
+        fs::write(
+            directory.path().join("cache/catalog.json"),
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "revision": 4,
+                "generated_at": "2026-07-18T00:00:00Z",
+                "profiles": [{
+                    "id": "demo-game.stage-tracker",
+                    "game": "demo_game",
+                    "game_slug": "demo-game",
+                    "profile_slug": "stage-tracker",
+                    "profile_id": "00000000-0000-0000-0000-000000000001",
+                    "name": "Stage tracker",
+                    "description": "Media-free stage tracker",
+                    "version": "1.0.0",
+                    "package": "profile--demo-game--stage-tracker--v1.0.0.hudprofile",
+                    "bytes": 42,
+                    "sha256": "0".repeat(64),
+                    "profile_schema": 1,
+                    "minimum_app_version": "0.0.1",
+                    "media_free": true,
+                    "detectors": ["ocr"],
+                    "tested_layouts": [],
+                    "output_recipes": ["Current stage"],
+                    "license": "MIT",
+                    "verification": {
+                        "status": "verified",
+                        "date": "2026-07-18",
+                        "evidence": "fixture"
+                    },
+                    "withdrawn": false
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (socket, task) = start(directory.path()).await;
+        let mut client = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        handshake(&mut client).await;
+        let status = call(&mut client, 2, method::CATALOG_STATUS, Value::Null).await;
+        assert_eq!(status["result"]["revision"], 4);
+        let list = call(&mut client, 3, method::CATALOG_LIST, Value::Null).await;
+        assert_eq!(list["result"]["profiles"][0]["installed"], false);
+        let install = call(
+            &mut client,
+            4,
+            method::CATALOG_INSTALL,
+            json!({
+                "id": "demo-game.stage-tracker",
+                "version": "1.0.0",
+                "catalog_revision": 3,
+                "sha256": "0".repeat(64),
+            }),
+        )
+        .await;
+        assert_eq!(install["error"]["code"], error_code::REVISION_CONFLICT);
+        call(&mut client, 5, method::SHUTDOWN, Value::Null).await;
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -5150,6 +5339,7 @@ mod tests {
             data_root: directory.path().join("data"),
             config_root: directory.path().join("config"),
             state_root: directory.path().join("state"),
+            cache_root: directory.path().join("cache"),
             maximum_connections: 8,
         };
         let task = tokio::spawn(run(config.clone()));
@@ -5251,6 +5441,7 @@ mod tests {
             instance: Uuid::new_v4(),
             profiles: ProfileStore::new(directory.path().join("data"), 20),
             local_config,
+            catalog: CatalogService::new(directory.path().join("cache")).unwrap(),
             connected: AtomicUsize::new(0),
             maximum_connections: 8,
             shutdown: Notify::new(),
@@ -5376,6 +5567,7 @@ mod tests {
             instance: Uuid::new_v4(),
             profiles: ProfileStore::new(directory.path().join("data"), 20),
             local_config,
+            catalog: CatalogService::new(directory.path().join("cache")).unwrap(),
             connected: AtomicUsize::new(0),
             maximum_connections: 8,
             shutdown: Notify::new(),
@@ -5484,6 +5676,7 @@ mod tests {
             instance: Uuid::new_v4(),
             profiles: ProfileStore::new(directory.path().join("data"), 20),
             local_config,
+            catalog: CatalogService::new(directory.path().join("cache")).unwrap(),
             connected: AtomicUsize::new(0),
             maximum_connections: 8,
             shutdown: Notify::new(),

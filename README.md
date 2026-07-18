@@ -174,6 +174,31 @@ shows their source hash and disclosed output, supports safe preview/editing, req
 to choose an absolute local sink, and installs a new machine-local route disabled. Preview,
 delivery testing, and enabling are three separate actions.
 
+## Public Profile Catalog
+
+The GUI's collapsed **Profile Catalog** browser and the shared CLI can fetch reviewed
+portable profiles from the repository's single rolling GitHub release tagged `profiles`:
+
+```bash
+yash-eventsctl catalog status
+yash-eventsctl catalog refresh
+yash-eventsctl catalog list
+yash-eventsctl catalog install <catalog-id> <version> \
+  --catalog-revision <reviewed-revision> --sha256 <reviewed-package-sha256>
+```
+
+The daemon performs all network, cache, integrity, and profile writes. It contacts only the
+fixed `slhad/yash-app-events` profile release after an explicit browse/refresh/install action,
+keeps the last valid catalog atomically below the XDG cache directory for offline browsing,
+and verifies the declared size and SHA-256 before using the normal hardened profile importer.
+Installation never activates the profile or authorizes its inert output recipes.
+
+Catalog sources are reviewable under `catalog/profiles/`; generated `.hudprofile` packages
+and catalog indexes live only on the release. The initial BlazBlue Entropy Effect Stage
+Tracker contains OCR/seven-segment configuration and two raw-text output recipes, but no
+gameplay image, video, thumbnail, capture binding, local route, or restore token. See
+`catalog/README.md` for the append-only publication layout.
+
 ## Backup, recovery, upgrade, and uninstall
 
 Stop the daemon before a filesystem backup. Portable profiles are below

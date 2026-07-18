@@ -1,4 +1,4 @@
-.TH YASH-EVENTSCTL 1 "July 2026" "yash-app-events 0.1.0"
+.TH YASH-EVENTSCTL 1 "July 2026" "yash-app-events 0.0.1"
 .SH NAME
 yash-eventsctl \- inspect and control yash-app-eventsd
 .SH SYNOPSIS
@@ -6,7 +6,7 @@ yash-eventsctl \- inspect and control yash-app-eventsd
 [--json] [--socket PATH] [--timeout-ms MS] COMMAND
 .SH COMMANDS
 version, status, state, shutdown, profile, events follow, capture, replay MANIFEST,
-suite evaluate PACKAGE, collection policy/status/review/compare, output
+catalog status/refresh/list/install, suite evaluate PACKAGE, collection policy/status/review/compare, output
 list/set/enable/remove/test, diagnostic plan, and diagnostic export.
 .PP
 Diagnostic export requires an exact total returned by diagnostic plan plus the
@@ -14,6 +14,9 @@ Diagnostic export requires an exact total returned by diagnostic plan plus the
 .PP
 Output routes are machine-local and profile-scoped. Direct-command routes require an
 absolute executable, do not invoke a shell, and receive compact JSON on standard input.
+.PP
+Catalog refresh and install use the daemon-owned fixed GitHub Profile Catalog origin.
+Install requires the reviewed catalog revision and SHA-256 and leaves the profile inactive.
 .SH EXIT STATUS
 0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay or suite regression.
 .SH SEE ALSO

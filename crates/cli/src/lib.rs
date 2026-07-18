@@ -42,6 +42,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Browse and install reviewed profiles from the public catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
     /// Follow bounded event notifications until disconnected.
     Events {
         #[command(subcommand)]
@@ -247,6 +252,25 @@ pub enum ProfileCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum CatalogCommand {
+    /// Show whether a validated catalog is cached.
+    Status,
+    /// Fetch and validate the newest catalog revision.
+    Refresh,
+    /// List compatible profiles from the last validated catalog.
+    List,
+    /// Download, verify, and safely import one reviewed package.
+    Install {
+        id: String,
+        version: String,
+        #[arg(long)]
+        catalog_revision: u64,
+        #[arg(long)]
+        sha256: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum EventsCommand {
     Follow,
 }
@@ -310,7 +334,13 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         None
     };
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
-    let timeout_ms = if matches!(cli.command, Command::Suite { .. }) {
+    let timeout_ms = if matches!(
+        cli.command,
+        Command::Suite { .. }
+            | Command::Catalog {
+                command: CatalogCommand::Refresh | CatalogCommand::Install { .. }
+            }
+    ) {
         cli.timeout_ms.max(60_000)
     } else {
         cli.timeout_ms
@@ -411,6 +441,33 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                         .await?
                 }
                 ProfileCommand::Validate { .. } => unreachable!(),
+            },
+            Command::Catalog { command } => match command {
+                CatalogCommand::Status => {
+                    client.call(method::CATALOG_STATUS, Value::Null).await?
+                }
+                CatalogCommand::Refresh => {
+                    client.call(method::CATALOG_REFRESH, Value::Null).await?
+                }
+                CatalogCommand::List => client.call(method::CATALOG_LIST, Value::Null).await?,
+                CatalogCommand::Install {
+                    id,
+                    version,
+                    catalog_revision,
+                    sha256,
+                } => {
+                    client
+                        .call(
+                            method::CATALOG_INSTALL,
+                            json!({
+                                "id": id,
+                                "version": version,
+                                "catalog_revision": catalog_revision,
+                                "sha256": sha256,
+                            }),
+                        )
+                        .await?
+                }
             },
             Command::Capture { command } => execute_capture(&mut client, command).await?,
             Command::Events { .. } => unreachable!(),
@@ -790,6 +847,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_install_requires_reviewed_revision_and_hash() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "catalog",
+            "install",
+            "blazblue-entropy-effect.stage-tracker",
+            "1.0.0",
+            "--catalog-revision",
+            "7",
+            "--sha256",
+            &"a".repeat(64),
+        ])
+        .unwrap();
+        let Command::Catalog {
+            command:
+                CatalogCommand::Install {
+                    catalog_revision,
+                    sha256,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("catalog install command was not parsed");
+        };
+        assert_eq!(catalog_revision, 7);
+        assert_eq!(sha256.len(), 64);
+    }
+
+    #[test]
     fn diagnostic_export_requires_explicit_review_inputs() {
         let cli = Cli::try_parse_from([
             "yash-eventsctl",
@@ -856,6 +942,7 @@ mod tests {
             data_root: directory.join("data"),
             config_root: directory.join("config"),
             state_root: directory.join("state"),
+            cache_root: directory.join("cache"),
             maximum_connections: 8,
         }));
         for _ in 0..100 {

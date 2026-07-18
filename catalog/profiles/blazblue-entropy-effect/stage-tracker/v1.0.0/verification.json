@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "verified_at": "2026-07-18",
+  "profile_source": "media-free",
+  "private_replay": {
+    "cases": 33,
+    "frames": 50,
+    "observation_assertions": 126,
+    "result": "passed"
+  },
+  "distributed_media": false
+}

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "id": "38e84be5-0c20-45d1-a4bb-19d929a291bf",
+  "name": "Current stage text",
+  "description": "Keep one plain-text file containing exactly the latest composed stage value with a trailing line feed.",
+  "trigger": {
+    "kind": "state_change"
+  },
+  "format": {
+    "kind": "text_template",
+    "template": "{{state.observations.4795edfb-52c5-4bde-916e-c95407ab0777.value}}",
+    "trailing_newline": true
+  },
+  "suggested_sink": {
+    "kind": "file",
+    "mode": "replace",
+    "suggested_filename": "blazblue-stage.txt"
+  }
+}

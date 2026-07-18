@@ -373,6 +373,8 @@ Completed after the first usable Linux release (2026-07-11):
   daemon execution, shared CLI/RPC control, and GUI enable/test verification.
 - Portable inert output recipes with archive validation, provenance/hash review,
   side-effect-free GUI preview/editing, explicit local sink selection, and disabled install.
+- Single-release public Profile Catalog with immutable versioned packages, append-only indexes,
+  daemon-owned bounded download/cache/import, shared CLI/RPC control, and collapsed GUI review.
 
 Remaining candidates are deliberately unscheduled:
 

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/slhad/yash-app-events/catalog/schema/source-entry-v1.schema.json",
+  "title": "Yash App Events profile catalog source entry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "id", "game", "game_slug", "profile_slug", "name", "description",
+    "version", "minimum_app_version", "media_free", "detectors", "tested_layouts",
+    "output_recipes", "license", "verification"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9_-]+\\.[a-z0-9_-]+$" },
+    "game": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+    "game_slug": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+    "profile_slug": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "description": { "type": "string", "maxLength": 4096 },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+    "minimum_app_version": { "type": "string" },
+    "maximum_app_version": { "type": "string" },
+    "media_free": { "type": "boolean" },
+    "detectors": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "tested_layouts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["width", "height"],
+        "properties": {
+          "width": { "type": "integer", "minimum": 1 },
+          "height": { "type": "integer", "minimum": 1 },
+          "ui_scale": { "type": "string" },
+          "language": { "type": "string" }
+        }
+      }
+    },
+    "output_recipes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "license": { "type": "string", "minLength": 1 },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "date", "evidence"],
+      "properties": {
+        "status": { "const": "verified" },
+        "date": { "type": "string", "format": "date" },
+        "evidence": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

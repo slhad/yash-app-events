@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "id": "ae765dfd-9ecf-4ac3-a9dd-c8d1c912879b",
+  "revision": 0,
+  "name": "BlazBlue Entropy Effect — Stage Tracker",
+  "game": "blazblue_entropy_effect",
+  "layout": {
+    "reference_width": 3840,
+    "reference_height": 2160,
+    "ui_scale": null,
+    "language": "eng"
+  },
+  "elements": [
+    {
+      "id": "5cdb65a7-67b2-4dd7-ad60-fc61da5422d4",
+      "name": "Stage counter",
+      "enabled": true,
+      "color": "#81c784",
+      "region": {
+        "x": 0.052604165,
+        "y": 0.027777778,
+        "width": 0.009895833,
+        "height": 0.018518519
+      },
+      "detector": {
+        "type": "ocr",
+        "id": "f5b3f5de-7877-4af6-9b74-2e677f3b1edd",
+        "language": "eng",
+        "page_segmentation_mode": 8,
+        "character_whitelist": "0123456789",
+        "change_trigger_threshold": 0.02,
+        "maximum_interval_ms": 1000,
+        "preprocessing": [
+          {
+            "type": "resize",
+            "width": 200,
+            "height": 120
+          }
+        ],
+        "empty_value": null,
+        "zero_pad_to": 2
+      }
+    },
+    {
+      "id": "4a95d80a-70cb-4d0c-ac15-e2b7e8bb5f51",
+      "name": "Stage group",
+      "enabled": true,
+      "color": "#81c784",
+      "region": {
+        "x": 0.042447917,
+        "y": 0.027777778,
+        "width": 0.005729167,
+        "height": 0.018518519
+      },
+      "detector": {
+        "type": "seven_segment",
+        "id": "d41c7687-3025-47b5-8e60-fa69031012a9",
+        "digits": 1,
+        "separator_after": null,
+        "threshold": 128,
+        "preprocessing": [
+          {
+            "type": "threshold",
+            "minimum": 0,
+            "maximum": 127
+          }
+        ]
+      }
+    }
+  ],
+  "derived_observations": [
+    {
+      "id": "4795edfb-52c5-4bde-916e-c95407ab0777",
+      "detector_id": "59bc3696-9d57-44ba-8a22-41caa348c67e",
+      "name": "Stage",
+      "enabled": true,
+      "format": "STAGE-{group} : {counter}",
+      "inputs": [
+        {
+          "name": "group",
+          "element_id": "4a95d80a-70cb-4d0c-ac15-e2b7e8bb5f51"
+        },
+        {
+          "name": "counter",
+          "element_id": "5cdb65a7-67b2-4dd7-ad60-fc61da5422d4"
+        }
+      ]
+    }
+  ],
+  "rules": []
+}

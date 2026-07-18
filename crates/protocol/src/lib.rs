@@ -168,6 +168,10 @@ pub mod method {
     pub const PROFILE_RESTORE: &str = "profile.restore";
     pub const PROFILE_ACTIVATE: &str = "profile.activate";
     pub const PROFILE_DRAFT: &str = "profile.draft";
+    pub const CATALOG_STATUS: &str = "catalog.status";
+    pub const CATALOG_REFRESH: &str = "catalog.refresh";
+    pub const CATALOG_LIST: &str = "catalog.list";
+    pub const CATALOG_INSTALL: &str = "catalog.install";
     pub const STATE_GET: &str = "state.get";
     pub const OUTPUT_LIST: &str = "output.list";
     pub const OUTPUT_SET: &str = "output.set";
