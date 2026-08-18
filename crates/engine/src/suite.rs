@@ -24,6 +24,22 @@ pub struct SuiteFile {
     pub sha256: String,
 }
 
+/// Opt-in wall-clock timings for one regression-suite evaluation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SuiteTimingSummary {
+    pub inventory_ms: u64,
+    pub profile_load_ms: u64,
+    pub total_cases_ms: u64,
+    pub serialization_ms: u64,
+    pub slowest_cases: Vec<SuiteCaseTiming>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SuiteCaseTiming {
+    pub id: String,
+    pub duration_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RegressionCase {
     pub schema: u32,

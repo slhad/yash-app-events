@@ -119,7 +119,12 @@ pub enum OutputCommand {
 #[derive(Debug, Subcommand)]
 pub enum SuiteCommand {
     /// Evaluate every case without installing or modifying the pinned profile.
-    Evaluate { path: PathBuf },
+    Evaluate {
+        path: PathBuf,
+        /// Include phase and slowest-case wall-clock timings in the result.
+        #[arg(long)]
+        timings: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -517,12 +522,15 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                     .await?
             }
             Command::Suite {
-                command: SuiteCommand::Evaluate { path },
+                command: SuiteCommand::Evaluate { path, timings },
             } => {
                 let path = std::fs::canonicalize(path)
                     .map_err(|error| CliError::Replay(format!("cannot open suite: {error}")))?;
                 client
-                    .call(method::SUITE_EVALUATE, json!({"path":path}))
+                    .call(
+                        method::SUITE_EVALUATE,
+                        json!({"path":path,"timings":timings}),
+                    )
                     .await?
             }
             Command::Collection { command } => match command {
@@ -1177,6 +1185,24 @@ mod tests {
             cli.command,
             Command::Suite {
                 command: SuiteCommand::Evaluate { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn external_suite_timings_are_explicitly_opt_in() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "suite",
+            "evaluate",
+            "/tmp/game-suite",
+            "--timings",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Suite {
+                command: SuiteCommand::Evaluate { timings: true, .. }
             }
         ));
     }

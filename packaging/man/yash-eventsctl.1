@@ -6,7 +6,7 @@ yash-eventsctl \- inspect and control yash-app-eventsd
 [--json] [--socket PATH] [--timeout-ms MS] COMMAND
 .SH COMMANDS
 version, status, state, shutdown, profile, events follow, capture, analyze PNG --profile-id UUID, replay MANIFEST,
-catalog status/refresh/list/install, suite evaluate PACKAGE, collection policy/status/review/compare, output
+catalog status/refresh/list/install, suite evaluate PACKAGE [--timings], collection policy/status/review/compare, output
 list/set/enable/remove/test, diagnostic plan, and diagnostic export.
 .PP
 Profile validate and profile pack DIRECTORY ARCHIVE run offline. Pack validates a
@@ -24,6 +24,9 @@ Install requires the reviewed catalog revision and SHA-256 and leaves the profil
 Analyze returns scene-aware spatial JSON with frame dimensions, named element and target
 rectangles, configured safe points, and crop-first AI handoff metadata. It never embeds
 image bytes or generates input.
+.PP
+Suite evaluate omits unstable wall-clock data by default. --timings adds inventory,
+profile-load, total-case, serialization, and ten-slowest-case millisecond diagnostics.
 .SH EXIT STATUS
 0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay or suite regression.
 .SH SEE ALSO

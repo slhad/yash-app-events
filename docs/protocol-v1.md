@@ -89,12 +89,15 @@ candidates, active/uncertain overlays, and evaluated/gated/throttled detector co
 Subscriptions emit `scene_changed` and `overlays_changed` records when that context
 changes; existing observation/event fields remain compatible.
 
-`suite.evaluate` accepts `{"path":"/absolute/or/client-resolved/path"}`. The path may
+`suite.evaluate` accepts `{"path":"/absolute/or/client-resolved/path","timings":false}`;
+`timings` is optional and defaults to false. The path may
 name a package directory or its `suite.json`. The daemon canonicalizes every referenced
 path, verifies its SHA-256 inventory, loads the portable profile without installing it,
 and returns case/frame/assertion/category totals plus per-assertion diagnostics and
 optional replay event metrics. A suite result with `passed: false` is a successful RPC
-response; the CLI maps it to exit status 7.
+response; the CLI maps it to exit status 7. When requested, an additive `timings` object
+reports inventory, profile-load, total-case, and serialization milliseconds plus at
+most ten slowest case IDs. It is omitted by default.
 
 Collection policies are keyed by profile ID and remain machine-local. A policy contains
 an absolute dataset root, enabled flag, interval/jitter, perceptual threshold, item/byte

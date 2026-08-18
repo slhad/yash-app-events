@@ -31,7 +31,8 @@ use yash_app_events_engine::collection::{
 };
 use yash_app_events_engine::suite::{
     ExpectedAiHandoff, ExpectedFrameIdentity, ExpectedObservation, ExpectedScene, ExpectedTarget,
-    ExpectedValue, FramePlacement, RegressionCase, RegressionSuite, SuiteFrame,
+    ExpectedValue, FramePlacement, RegressionCase, RegressionSuite, SuiteCaseTiming, SuiteFrame,
+    SuiteTimingSummary,
 };
 use yash_app_events_engine::{
     evaluate_replay, normalized_to_pixels, recognition_confidence, AnalysisScheduler,
@@ -659,8 +660,8 @@ async fn dispatch(
             .and_then(|params| run_profile_replay(state, &params)),
         method::REPLAY_EVALUATE => parse::<ReplayManifest>(request.params)
             .and_then(|manifest| evaluate_profile_replay(state, &manifest)),
-        method::SUITE_EVALUATE => parse::<PathParam>(request.params)
-            .and_then(|params| evaluate_regression_suite(state, &params.path)),
+        method::SUITE_EVALUATE => parse::<SuiteEvaluateParams>(request.params)
+            .and_then(|params| evaluate_regression_suite(state, &params.path, params.timings)),
         method::COLLECTION_POLICY_GET => parse::<ProfileIdParam>(request.params)
             .and_then(|params| collection_policy_get(state, params.profile_id)),
         method::COLLECTION_POLICY_SET => parse::<CollectionPolicyParams>(request.params)
@@ -1821,7 +1822,12 @@ fn publish_replay_observation(
     Ok(transitions)
 }
 
-fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, RpcError> {
+#[allow(clippy::too_many_lines)]
+fn evaluate_regression_suite(
+    state: &State,
+    requested: &Path,
+    include_timings: bool,
+) -> Result<Value, RpcError> {
     let manifest_path = if requested.is_dir() {
         requested.join("suite.json")
     } else {
@@ -1834,7 +1840,10 @@ fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, R
         .to_path_buf();
     let suite: RegressionSuite = read_suite_document(&manifest_path)?;
     validate_suite_manifest(&suite)?;
+    let inventory_started = Instant::now();
     let inventory = verify_suite_inventory(&root, &suite)?;
+    let inventory_ms = elapsed_millis(inventory_started);
+    let profile_load_started = Instant::now();
     require_in_inventory(&inventory, &suite.profile)?;
     let profile_path = safe_suite_path(&root, &suite.profile)?;
     let profile = load_profile(&profile_path).map_err(internal_error)?;
@@ -1849,13 +1858,17 @@ fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, R
         RpcError::new(error_code::INVALID_PARAMS, "profile has no asset directory")
     })?;
     let aliases = profile_aliases(&profile)?;
+    let profile_load_ms = elapsed_millis(profile_load_started);
     let mut case_results = Vec::new();
     let mut passed_cases = 0_usize;
     let mut total_frames = 0_usize;
     let mut total_assertions = 0_usize;
     let mut passed_assertions = 0_usize;
     let mut categories: HashMap<String, (usize, usize)> = HashMap::new();
+    let all_cases_started = Instant::now();
+    let mut case_timings = Vec::with_capacity(suite.cases.len());
     for case_path in &suite.cases {
+        let evaluation_started = Instant::now();
         require_in_inventory(&inventory, case_path)?;
         let case: RegressionCase = read_suite_document(&safe_suite_path(&root, case_path)?)?;
         validate_suite_case(&case, &inventory)?;
@@ -1879,8 +1892,13 @@ fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, R
             counts.0 += 1;
             counts.1 += usize::from(passed);
         }
+        case_timings.push(SuiteCaseTiming {
+            id: case.id.clone(),
+            duration_ms: elapsed_millis(evaluation_started),
+        });
         case_results.push(result);
     }
+    let total_cases_ms = elapsed_millis(all_cases_started);
     let category_results: serde_json::Map<String, Value> = categories
         .into_iter()
         .map(|(name, (total, passed))| {
@@ -1891,7 +1909,7 @@ fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, R
         })
         .collect();
     let passed = passed_cases == suite.cases.len() && passed_assertions == total_assertions;
-    Ok(json!({
+    let mut response = json!({
         "schema":1,
         "suite":{"id":suite.id,"name":suite.name,"game":suite.game},
         "profile":{"id":profile.id,"name":profile.name,"revision":profile.revision,"path":suite.profile},
@@ -1902,7 +1920,36 @@ fn evaluate_regression_suite(state: &State, requested: &Path) -> Result<Value, R
             "assertions_failed":total_assertions-passed_assertions,"categories":category_results
         },
         "cases":case_results
-    }))
+    });
+    if include_timings {
+        case_timings = slowest_case_timings(case_timings);
+        let serialization_started = Instant::now();
+        serde_json::to_vec(&response).map_err(internal_error)?;
+        let timings = SuiteTimingSummary {
+            inventory_ms,
+            profile_load_ms,
+            total_cases_ms,
+            serialization_ms: elapsed_millis(serialization_started),
+            slowest_cases: case_timings,
+        };
+        response["timings"] = serde_json::to_value(timings).map_err(internal_error)?;
+    }
+    Ok(response)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn slowest_case_timings(mut timings: Vec<SuiteCaseTiming>) -> Vec<SuiteCaseTiming> {
+    timings.sort_by(|left, right| {
+        right
+            .duration_ms
+            .cmp(&left.duration_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    timings.truncate(10);
+    timings
 }
 
 fn validate_suite_manifest(suite: &RegressionSuite) -> Result<(), RpcError> {
@@ -5501,6 +5548,13 @@ struct PathParam {
     path: PathBuf,
 }
 
+#[derive(Deserialize)]
+struct SuiteEvaluateParams {
+    path: PathBuf,
+    #[serde(default)]
+    timings: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct AnalyzeImageParams {
     profile_id: ProfileId,
@@ -7497,6 +7551,24 @@ mod tests {
         assert!(safe_suite_path(package.path(), Path::new("inside.png")).is_ok());
         assert!(safe_suite_path(package.path(), Path::new("../outside.png")).is_err());
         assert!(safe_suite_path(package.path(), Path::new("/tmp/outside.png")).is_err());
+    }
+
+    #[test]
+    fn external_suite_slowest_timings_are_ordered_and_bounded() {
+        let timings = (0_u64..12)
+            .map(|index| SuiteCaseTiming {
+                id: format!("case-{index:02}"),
+                duration_ms: index / 2,
+            })
+            .collect();
+        let slowest = slowest_case_timings(timings);
+        assert_eq!(slowest.len(), 10);
+        assert!(slowest
+            .windows(2)
+            .all(|pair| pair[0].duration_ms >= pair[1].duration_ms));
+        assert_eq!(slowest[0].id, "case-10");
+        assert_eq!(slowest[1].id, "case-11");
+        assert!(!slowest.iter().any(|timing| timing.id == "case-00"));
     }
 
     #[test]

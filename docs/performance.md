@@ -42,3 +42,18 @@ scene-pipeline test uses three enabled detectors and proves that the unknown sce
 evaluates only its one anchor, then the recognized scene evaluates the anchor plus one
 contextual detector while permanently gating the unrelated third detector. Live state
 reports evaluated, gated, and rate-throttled counts for direct profiling.
+
+## External suite phase timings
+
+Use an optimized daemon and request opt-in suite timings without changing evaluation
+semantics:
+
+```bash
+cargo build --release --workspace
+yash-eventsctl --json --timeout-ms 600000 suite evaluate /path/to/package --timings
+```
+
+The result reports millisecond wall times for SHA-256 inventory verification, profile
+load/validation, all case work, and result serialization, followed by at most ten
+slowest case IDs. The ordinary response omits timings for compatibility. Compare
+multiple idle-daemon runs; millisecond values are intentionally not correctness gates.

@@ -124,6 +124,12 @@ per-case and per-category totals, every typed assertion with its actual observat
 optional event metrics, and an overall `passed` flag. Exit status 7 means a regression;
 invalid packages remain JSON-RPC errors.
 
+Add `--timings` to include an opt-in `timings` object with inventory verification,
+profile loading, total case evaluation, and result serialization wall times in
+milliseconds, plus the ten slowest case IDs. Without this flag the stable response
+shape is unchanged. Durations are diagnostic observations, not deterministic test
+values.
+
 To package a reviewed portable profile without connecting to a daemon, run
 `yash-eventsctl --json profile pack /path/to/profile-directory /path/to/profile.hudprofile`.
 Keep private suite media outside that directory: packing includes only the validated

@@ -4,6 +4,11 @@ Status: proposed investigation and implementation plan, based on the Queen Blade
 schema-2 profile reaching the 512-element validation limit and a 202-case external
 suite exceeding a 10-minute daemon RPC deadline on 2026-08-18.
 
+Implementation progress (2026-08-18): the first executable slice now exposes opt-in
+inventory, profile-load, total-case, result-serialization, and ten-slowest-case wall
+timings through `suite evaluate --timings`. Compatibility and ordering/bound tests pass;
+the full 202-case measurement remains required before selecting the next optimization.
+
 `SPECS.md` remains normative. This document does not change profile/protocol contracts
 or authorize raising resource limits; any such change must first update the relevant
 `SPEC-*` requirements and compatibility tests.
