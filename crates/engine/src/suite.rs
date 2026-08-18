@@ -28,6 +28,7 @@ pub struct SuiteFile {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SuiteTimingSummary {
     pub inventory_ms: u64,
+    pub inventory_cache_hit: bool,
     pub profile_load_ms: u64,
     pub total_cases_ms: u64,
     pub serialization_ms: u64,

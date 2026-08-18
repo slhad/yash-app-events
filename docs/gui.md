@@ -33,6 +33,9 @@ Implemented controls include:
   disabled installation before the existing test/enable controls.
 - collapsed public Profile Catalog browsing with cached/offline status, compatibility,
   media/provenance/license/verification disclosure, explicit review, and inactive install.
+- shared 80/90/100% profile-capacity warnings for elements, scenes, overlays, targets,
+  largest layers, and recognition expressions, plus unreachable-element and read-only
+  consolidation guidance matching `profile analyze-capacity`.
 
 The live evidence panel shows ranked scene/overlay context and evaluated, gated, and
 throttled detector counts. Interaction targets are descriptive only: the GUI and daemon

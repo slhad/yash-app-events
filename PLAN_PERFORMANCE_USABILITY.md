@@ -1,13 +1,48 @@
 # Performance, Profiling, Reliability, and Usability Plan
 
-Status: proposed investigation and implementation plan, based on the Queen Blade
-schema-2 profile reaching the 512-element validation limit and a 202-case external
-suite exceeding a 10-minute daemon RPC deadline on 2026-08-18.
+Status: implementation complete; one external-profile regression remains before the
+private complete-suite gate is green. The plan began after the Queen Blade schema-2
+profile reached the 512-element limit and its 202-case suite exceeded a 10-minute
+daemon RPC deadline on 2026-08-18.
 
 Implementation progress (2026-08-18): the first executable slice now exposes opt-in
 inventory, profile-load, total-case, result-serialization, and ten-slowest-case wall
 timings through `suite evaluate --timings`. Compatibility and ordering/bound tests pass;
-the full 202-case measurement remains required before selecting the next optimization.
+the real workload identified detector/OCR case work as dominant (4.85 seconds of a
+5.29-second focused run), while inventory took 296 ms and profile load 10 ms.
+
+Phases 0–6 implementation status (2026-08-18):
+
+- Long suite work runs in a daemon-owned blocking operation with bounded progress,
+  status/result retrieval, cooperative cancellation, structured timeout/cancel context,
+  a five-minute no-progress watchdog, and responsive unrelated control RPCs.
+- Focused case/category/fixture/scene/overlay/element filters, fail-fast, explicit impact
+  reasons, complete-suite reminders, atomic result output, and cold-cache control are
+  implemented. Immutable inventory reuse is bounded and metadata/hash guarded.
+- Inventory hashing streams through 64 KiB. Only one memory-heavy suite operation runs at
+  once; retained results are capped. Case parallelism remains disabled because the measured
+  single-worker workload already exceeded 1.4 GiB RSS, so adding workers would violate the
+  provisional 2 GiB daemon budget before detector memory is reduced.
+- Shared capacity metadata, 80/90/100% warnings, GUI presentation, offline
+  `profile analyze-capacity`, duplicate/unreachable/disabled-only analysis, detector-family
+  counts, and per-scene cost estimates are implemented. Suggestions remain read-only.
+- Generated 128/256/384/512/768/1024 mixed-profile benchmarks are reproducible. The limit
+  remains 512: parse/validation are cheap, but the real 512-element runtime is already too
+  expensive, and raising the count does not address the measured detector/OCR bottleneck.
+- Workspace functional gates, cancellation/progress/hash tests, release benchmark commands,
+  bounded diagnostic timing logs, and timeout/recovery behavior form the operational gate.
+
+Complete-workload evidence: the first observable run finished all 202 cases in
+918.772 seconds (inventory 170 ms, profile load 7 ms, result serialization 107 ms;
+slowest case 6.753 seconds) while control RPCs remained responsive. It exposed 13
+pre-existing regression assertions. A generic JSON-handoff bug was corrected so an
+unknown base scene cannot become JSON-sufficient merely because an overlay matched;
+the focused 19-case rerun then improved from 6/19 to 18/19. The sole remaining failure
+is private-profile data: `server_error` reuses the guild attack-info title/message
+anchors and therefore activates beside the more-specific `guild_battle_attack_info`
+overlay. Three runs reproduce it. This repository does not silently rewrite that
+external profile or its checksummed suite; its owner must correct/review the anchors
+before the complete-suite correctness row can be marked green.
 
 `SPECS.md` remains normative. This document does not change profile/protocol contracts
 or authorize raising resource limits; any such change must first update the relevant

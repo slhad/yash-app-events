@@ -1,7 +1,8 @@
 //! Scriptable CLI and timeout-aware protocol-v1 client.
 
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -124,7 +125,48 @@ pub enum SuiteCommand {
         /// Include phase and slowest-case wall-clock timings in the result.
         #[arg(long)]
         timings: bool,
+        /// Print bounded phase/case progress to stderr in human mode.
+        #[arg(long)]
+        progress: bool,
+        /// Evaluate only this exact case ID; repeat for multiple cases.
+        #[arg(long = "case")]
+        case_ids: Vec<String>,
+        /// Evaluate cases carrying this category; repeatable.
+        #[arg(long)]
+        category: Vec<String>,
+        /// Evaluate cases using this package-relative fixture; repeatable.
+        #[arg(long = "changed-fixture")]
+        fixtures: Vec<PathBuf>,
+        /// Evaluate cases explicitly expecting this scene; repeatable.
+        #[arg(long)]
+        scene: Vec<String>,
+        /// Evaluate cases explicitly expecting this overlay; repeatable.
+        #[arg(long)]
+        overlay: Vec<String>,
+        /// Evaluate cases asserting this element/target alias; repeatable.
+        #[arg(long = "element")]
+        elements: Vec<String>,
+        /// Stop after the first failing selected case.
+        #[arg(long)]
+        fail_fast: bool,
+        /// Return the operation ID immediately for later status/cancel commands.
+        #[arg(long)]
+        detach: bool,
+        /// Bypass immutable inventory caches for a cold correctness run.
+        #[arg(long)]
+        no_cache: bool,
+        /// Atomically write the complete JSON result and print only a receipt.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
+    /// Inspect a running or retained suite operation.
+    Status {
+        operation_id: String,
+        #[arg(long)]
+        result: bool,
+    },
+    /// Cooperatively cancel a suite operation.
+    Cancel { operation_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -267,6 +309,10 @@ pub enum ProfileCommand {
         directory: PathBuf,
         path: PathBuf,
     },
+    /// Report resource usage and read-only consolidation opportunities offline.
+    AnalyzeCapacity {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -342,6 +388,12 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                     "files": manifest.files.len(),
                     "path": path,
                 }));
+            }
+            ProfileCommand::AnalyzeCapacity { path } => {
+                let profile =
+                    load_profile(path).map_err(|error| CliError::Validation(error.to_string()))?;
+                return serde_json::to_value(profile.analyze_capacity())
+                    .map_err(|error| CliError::Validation(error.to_string()));
             }
             _ => {}
         }
@@ -479,7 +531,9 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                         )
                         .await?
                 }
-                ProfileCommand::Validate { .. } | ProfileCommand::Pack { .. } => unreachable!(),
+                ProfileCommand::Validate { .. }
+                | ProfileCommand::Pack { .. }
+                | ProfileCommand::AnalyzeCapacity { .. } => unreachable!(),
             },
             Command::Catalog { command } => match command {
                 CatalogCommand::Status => {
@@ -522,14 +576,113 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                     .await?
             }
             Command::Suite {
-                command: SuiteCommand::Evaluate { path, timings },
+                command:
+                    SuiteCommand::Evaluate {
+                        path,
+                        timings,
+                        progress,
+                        case_ids,
+                        category,
+                        fixtures,
+                        scene,
+                        overlay,
+                        elements,
+                        fail_fast,
+                        detach,
+                        no_cache,
+                        output,
+                    },
             } => {
                 let path = std::fs::canonicalize(path)
                     .map_err(|error| CliError::Replay(format!("cannot open suite: {error}")))?;
+                let operation_started = Instant::now();
+                let started = client
+                    .call(
+                        method::SUITE_START,
+                        json!({
+                            "path":path,"timings":timings,"case_ids":case_ids,
+                            "categories":category,"fixtures":fixtures,"scenes":scene,
+                            "overlays":overlay,"elements":elements,"fail_fast":fail_fast,
+                            "no_cache":no_cache,
+                        }),
+                    )
+                    .await?;
+                if *detach {
+                    started
+                } else {
+                let operation_id = started["operation_id"].as_str().ok_or_else(|| {
+                    CliError::Replay("suite start omitted operation_id".into())
+                })?;
+                let result = loop {
+                    let status = client
+                        .call(
+                            method::SUITE_STATUS,
+                            json!({"operation_id":operation_id,"result":true}),
+                        )
+                        .await?;
+                    if *progress && !cli.json {
+                        eprintln!(
+                            "suite {}: {} {}/{} {}",
+                            status["phase"].as_str().unwrap_or("unknown"),
+                            status["completed"].as_u64().unwrap_or(0),
+                            status["total"].as_u64().unwrap_or(0),
+                            status["current_case"].as_str().unwrap_or(""),
+                            status["elapsed_ms"].as_u64().unwrap_or(0),
+                        );
+                    }
+                    match status["status"].as_str() {
+                        Some("completed") => break status["result"].clone(),
+                        Some("cancelled" | "failed") => {
+                            return Err(CliError::Replay(status["error"].to_string()));
+                        }
+                        _ if operation_started.elapsed() >= Duration::from_millis(timeout_ms) => {
+                            let _ = client
+                                .call(
+                                    method::SUITE_CANCEL,
+                                    json!({"operation_id":operation_id}),
+                                )
+                                .await;
+                            return Err(CliError::OperationTimeout(status.to_string()));
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(250)).await,
+                    }
+                };
+                if let Some(output) = output {
+                    let bytes = serde_json::to_vec_pretty(&result)
+                        .map_err(|error| CliError::Replay(error.to_string()))?;
+                    write_suite_result(output, &bytes)?;
+                    json!({
+                        "passed":result["passed"],
+                        "summary":result["summary"],
+                        "timings":result["timings"],
+                        "output":output,
+                    })
+                } else {
+                    result
+                }
+                }
+            }
+            Command::Suite {
+                command:
+                    SuiteCommand::Status {
+                        operation_id,
+                        result,
+                    },
+            } => {
                 client
                     .call(
-                        method::SUITE_EVALUATE,
-                        json!({"path":path,"timings":timings}),
+                        method::SUITE_STATUS,
+                        json!({"operation_id":operation_id,"result":result}),
+                    )
+                    .await?
+            }
+            Command::Suite {
+                command: SuiteCommand::Cancel { operation_id },
+            } => {
+                client
+                    .call(
+                        method::SUITE_CANCEL,
+                        json!({"operation_id":operation_id}),
                     )
                     .await?
             }
@@ -729,6 +882,21 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     Ok(value)
 }
 
+fn write_suite_result(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)
+        .map_err(|error| CliError::Replay(format!("cannot create suite result: {error}")))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| CliError::Replay(format!("cannot write suite result: {error}")))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| CliError::Replay(format!("cannot install suite result: {error}")))
+}
+
 async fn execute_capture(
     client: &mut UnixRpcClient,
     command: &CaptureCommand,
@@ -873,6 +1041,8 @@ pub enum CliError {
     FollowRequiresStream,
     #[error("replay evaluation failed: {0}")]
     Replay(String),
+    #[error("suite operation timed out: {0}")]
+    OperationTimeout(String),
 }
 
 impl CliError {
@@ -880,7 +1050,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Client(ClientError::Io(_) | ClientError::Disconnected) => 3,
-            Self::Client(ClientError::Timeout) => 6,
+            Self::Client(ClientError::Timeout) | Self::OperationTimeout(_) => 6,
             Self::Validation(_) => 5,
             Self::Replay(_) => 7,
             Self::Client(ClientError::Json(_) | ClientError::Rpc(_))
@@ -1170,6 +1340,10 @@ mod tests {
         assert_eq!(CliError::Client(ClientError::Disconnected).exit_code(), 3);
         assert_eq!(CliError::Validation("bad".into()).exit_code(), 5);
         assert_eq!(CliError::FollowRequiresStream.exit_code(), 4);
+        assert_eq!(
+            CliError::OperationTimeout("phase=cases".into()).exit_code(),
+            6
+        );
     }
 
     #[test]
@@ -1205,6 +1379,62 @@ mod tests {
                 command: SuiteCommand::Evaluate { timings: true, .. }
             }
         ));
+    }
+
+    #[test]
+    fn external_suite_focused_detached_controls_are_scriptable() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "suite",
+            "evaluate",
+            "/tmp/game-suite",
+            "--case",
+            "coin-trial",
+            "--category",
+            "authoring",
+            "--fail-fast",
+            "--detach",
+            "--no-cache",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Suite {
+                command: SuiteCommand::Evaluate {
+                    fail_fast: true,
+                    detach: true,
+                    no_cache: true,
+                    ..
+                }
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "yash-eventsctl",
+            "suite",
+            "status",
+            "00000000-0000-4000-8000-000000000001",
+            "--result",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "yash-eventsctl",
+            "suite",
+            "cancel",
+            "00000000-0000-4000-8000-000000000001",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn suite_result_output_replaces_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.json");
+        std::fs::write(&path, b"old").unwrap();
+        write_suite_result(&path, br#"{"passed":true}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"passed":true}"#);
+        assert!(!path
+            .with_extension(format!("tmp-{}", std::process::id()))
+            .exists());
     }
 
     #[test]

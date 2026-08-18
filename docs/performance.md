@@ -57,3 +57,49 @@ The result reports millisecond wall times for SHA-256 inventory verification, pr
 load/validation, all case work, and result serialization, followed by at most ten
 slowest case IDs. The ordinary response omits timings for compatibility. Compare
 multiple idle-daemon runs; millisecond values are intentionally not correctness gates.
+
+The 202-case Queen Blade workload on 2026-08-18 demonstrated the original failure mode:
+the synchronous daemon exceeded ten minutes, blocked a five-second `status` request, and
+grew beyond 1.4 GiB RSS before the isolated baseline was stopped. Its 12 GiB package
+contains 1,041 pinned files and a 512-element profile. With first-class operations, a
+focused Coin Trial run passed 10/10 assertions in 5.29 seconds: inventory verification
+was 296 ms, profile load 10 ms, serialization below 1 ms, and case work 4.85 seconds.
+This identifies detector/OCR evaluation as the dominant phase. Control `status` remained
+responsive in about 4 ms during the new background operation, and cancellation completed
+at the next case boundary with the active case/phase retained.
+
+The first observable complete operation peaked above 1.64 GiB RSS. Suite execution is
+therefore limited to one operation/worker at a time under a provisional 2 GiB daemon
+budget; case concurrency is intentionally rejected until detector/OCR memory falls.
+
+That operation completed all 202 cases in 918.772 seconds: case work consumed
+918.772 seconds versus 170 ms inventory, 7 ms profile load, and 107 ms serialization;
+the slowest case was 6.753 seconds. It found 13 correctness failures. Twelve unknown-scene
+handoff failures revealed and fixed a generic fail-open condition (an overlay match could
+previously make an unknown base scene JSON-sufficient). The focused rerun passed all 18
+unknown-scene cases. One private-profile failure remains: the `server_error` overlay
+reuses guild attack-info anchors and co-activates with its specific overlay. The tool
+reports this deterministic external-data regression but does not mutate the checksummed
+private package.
+
+Inventory hashing now streams through 64 KiB rather than reading each large package file
+into one allocation. A bounded cache reuses verification only when the package root,
+manifest SHA-256, and every pinned file's path/size/mtime still match; cold runs remain
+available with `--no-cache`.
+
+## Profile capacity decision
+
+Run:
+
+```bash
+cargo run --release -p yash-app-events-profile --example profile_capacity_benchmark
+yash-eventsctl --json profile analyze-capacity /path/to/profile.json
+```
+
+Generated mixed profiles at 128/256/384/512 elements parsed in 0.24/0.33/0.52/0.66 ms
+and validated in 0.05/0.09/0.12/0.19 ms on the reference host. Serialization remained
+below 0.27 ms. Generated 768/1024 documents remained cheap to parse but were correctly
+rejected by the current bound. The real 512-element workload is already dominated by
+runtime detector cost and exceeds one GiB RSS, so the limit remains **512**. Raising it
+would enlarge worst-case runtime and authoring complexity without solving the measured
+bottleneck. Capacity warnings and consolidation analysis are the selected remedy.

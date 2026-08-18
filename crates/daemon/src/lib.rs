@@ -5,9 +5,10 @@ mod routes;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io;
-use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::io::{self, Read as _};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -103,6 +104,47 @@ struct State {
     diagnostic_logs: Mutex<VecDeque<Value>>,
     collector: Mutex<collection::Runtime>,
     output_routes: routes::Router,
+    suite_operations: Mutex<HashMap<Uuid, Arc<SuiteOperation>>>,
+    suite_inventory_cache: Mutex<HashMap<PathBuf, SuiteInventoryCacheEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct SuiteInventoryCacheEntry {
+    manifest_sha256: String,
+    files: Vec<SuiteFileMetadata>,
+    inventory: HashSet<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SuiteFileMetadata {
+    path: PathBuf,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    device: u64,
+    inode: u64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct SuiteOperation {
+    id: Uuid,
+    started: Instant,
+    cancel: AtomicBool,
+    state: Mutex<SuiteOperationState>,
+    notifications: broadcast::Sender<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct SuiteOperationState {
+    status: &'static str,
+    phase: &'static str,
+    completed: usize,
+    total: usize,
+    current_case: Option<String>,
+    result: Option<Value>,
+    error: Option<Value>,
+    last_progress: Instant,
 }
 
 #[derive(Debug)]
@@ -217,6 +259,8 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         })])),
         collector: Mutex::new(collection::Runtime::default()),
         output_routes,
+        suite_operations: Mutex::new(HashMap::new()),
+        suite_inventory_cache: Mutex::new(HashMap::new()),
     });
     let monitor_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -660,8 +704,28 @@ async fn dispatch(
             .and_then(|params| run_profile_replay(state, &params)),
         method::REPLAY_EVALUATE => parse::<ReplayManifest>(request.params)
             .and_then(|manifest| evaluate_profile_replay(state, &manifest)),
-        method::SUITE_EVALUATE => parse::<SuiteEvaluateParams>(request.params)
-            .and_then(|params| evaluate_regression_suite(state, &params.path, params.timings)),
+        method::SUITE_EVALUATE => match parse::<SuiteEvaluateParams>(request.params) {
+            Ok(params) => {
+                let state = Arc::clone(state);
+                match tokio::task::spawn_blocking(move || {
+                    evaluate_regression_suite(&state, &params, None)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(internal_error(error)),
+                }
+            }
+            Err(error) => Err(error),
+        },
+        method::SUITE_START => match parse::<SuiteEvaluateParams>(request.params) {
+            Ok(params) => start_suite_operation(Arc::clone(state), params),
+            Err(error) => Err(error),
+        },
+        method::SUITE_STATUS => parse::<SuiteOperationParams>(request.params)
+            .and_then(|params| suite_operation_status(state, params.operation_id, params.result)),
+        method::SUITE_CANCEL => parse::<SuiteOperationIdParam>(request.params)
+            .and_then(|params| cancel_suite_operation(state, params.operation_id)),
         method::COLLECTION_POLICY_GET => parse::<ProfileIdParam>(request.params)
             .and_then(|params| collection_policy_get(state, params.profile_id)),
         method::COLLECTION_POLICY_SET => parse::<CollectionPolicyParams>(request.params)
@@ -1823,15 +1887,236 @@ fn publish_replay_observation(
 }
 
 #[allow(clippy::too_many_lines)]
+fn start_suite_operation(
+    state: Arc<State>,
+    params: SuiteEvaluateParams,
+) -> Result<Value, RpcError> {
+    let operation = Arc::new(SuiteOperation {
+        id: Uuid::new_v4(),
+        started: Instant::now(),
+        cancel: AtomicBool::new(false),
+        state: Mutex::new(SuiteOperationState {
+            status: "running",
+            phase: "queued",
+            completed: 0,
+            total: 0,
+            current_case: None,
+            result: None,
+            error: None,
+            last_progress: Instant::now(),
+        }),
+        notifications: state.notifications.clone(),
+    });
+    {
+        let mut operations = state
+            .suite_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if operations.values().any(|operation| {
+            operation
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status
+                == "running"
+        }) {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "one suite operation is already running; inspect or cancel it before starting another",
+            ));
+        }
+        if operations.len() >= 4 {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "at most four retained suite operations are allowed; retrieve completed results",
+            ));
+        }
+        operations.insert(operation.id, Arc::clone(&operation));
+    }
+    let operation_id = operation.id;
+    let watchdog_operation = Arc::clone(&operation);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let snapshot = watchdog_operation
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if snapshot.status != "running" {
+                break;
+            }
+            if snapshot.last_progress.elapsed() > Duration::from_secs(300) {
+                watchdog_operation.cancel.store(true, Ordering::Relaxed);
+                let _ = watchdog_operation.notifications.send(json!({
+                    "type":"suite_stall",
+                    "operation_id":watchdog_operation.id,
+                    "phase":snapshot.phase,
+                    "current_case":snapshot.current_case,
+                    "elapsed_ms":elapsed_millis(watchdog_operation.started),
+                    "no_progress_ms":u64::try_from(snapshot.last_progress.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "cancel_requested":true,
+                }));
+                break;
+            }
+        }
+    });
+    tokio::task::spawn_blocking(move || {
+        let result = evaluate_regression_suite(&state, &params, Some(&operation));
+        let mut snapshot = operation
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Ok(result) => {
+                if !result["timings"].is_null() {
+                    let mut logs = state
+                        .diagnostic_logs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if logs.len() == DiagnosticLimits::default().maximum_logs {
+                        logs.pop_front();
+                    }
+                    logs.push_back(json!({
+                        "level":"info",
+                        "message":"suite timing summary",
+                        "suite_id":result["suite"]["id"],
+                        "timings":result["timings"],
+                    }));
+                }
+                snapshot.status = "completed";
+                snapshot.phase = "completed";
+                snapshot.current_case = None;
+                snapshot.result = Some(result);
+            }
+            Err(error) if error.code == error_code::OPERATION_CANCELLED => {
+                snapshot.status = "cancelled";
+                snapshot.phase = "cancelled";
+                snapshot.current_case = None;
+                snapshot.error = serde_json::to_value(error).ok();
+            }
+            Err(error) => {
+                snapshot.status = "failed";
+                snapshot.phase = "failed";
+                snapshot.current_case = None;
+                snapshot.error = serde_json::to_value(error).ok();
+            }
+        }
+    });
+    Ok(json!({"operation_id":operation_id,"status":"running"}))
+}
+
+fn update_suite_progress(
+    operation: Option<&SuiteOperation>,
+    phase: &'static str,
+    completed: usize,
+    total: usize,
+    current_case: Option<&str>,
+) -> Result<(), RpcError> {
+    let Some(operation) = operation else {
+        return Ok(());
+    };
+    if operation.cancel.load(Ordering::Relaxed) {
+        return Err(RpcError::new(
+            error_code::OPERATION_CANCELLED,
+            format!("suite operation cancelled during {phase}"),
+        ));
+    }
+    let mut state = operation
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.phase = phase;
+    state.completed = completed;
+    state.total = total;
+    state.current_case = current_case.map(str::to_owned);
+    state.last_progress = Instant::now();
+    let _ = operation.notifications.send(json!({
+        "type":"suite_progress",
+        "operation_id":operation.id,
+        "phase":phase,
+        "completed":completed,
+        "total":total,
+        "current_case":current_case,
+        "elapsed_ms":elapsed_millis(operation.started),
+    }));
+    Ok(())
+}
+
+fn suite_operation_status(
+    state: &State,
+    operation_id: Uuid,
+    include_result: bool,
+) -> Result<Value, RpcError> {
+    let operation = state
+        .suite_operations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&operation_id)
+        .cloned()
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "unknown suite operation"))?;
+    let snapshot = operation
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut value = json!({
+        "operation_id":operation.id,
+        "status":snapshot.status,
+        "phase":snapshot.phase,
+        "completed":snapshot.completed,
+        "total":snapshot.total,
+        "current_case":snapshot.current_case,
+        "elapsed_ms":elapsed_millis(operation.started),
+        "stalled":snapshot.status == "running" && snapshot.last_progress.elapsed() > Duration::from_secs(120),
+        "no_progress_ms":u64::try_from(snapshot.last_progress.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "error":snapshot.error,
+    });
+    if include_result && matches!(snapshot.status, "completed" | "cancelled" | "failed") {
+        if snapshot.status == "completed" {
+            value["result"] = snapshot.result.unwrap_or(Value::Null);
+        }
+        state
+            .suite_operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&operation_id);
+    }
+    Ok(value)
+}
+
+fn cancel_suite_operation(state: &State, operation_id: Uuid) -> Result<Value, RpcError> {
+    let operation = state
+        .suite_operations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&operation_id)
+        .cloned()
+        .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "unknown suite operation"))?;
+    let status = operation
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status;
+    let accepted = status == "running";
+    if accepted {
+        operation.cancel.store(true, Ordering::Relaxed);
+    }
+    Ok(json!({"operation_id":operation_id,"cancel_requested":accepted,"status":status}))
+}
+
+#[allow(clippy::too_many_lines)]
 fn evaluate_regression_suite(
     state: &State,
-    requested: &Path,
-    include_timings: bool,
+    options: &SuiteEvaluateParams,
+    operation: Option<&SuiteOperation>,
 ) -> Result<Value, RpcError> {
+    let requested = &options.path;
+    update_suite_progress(operation, "manifest", 0, 1, None)?;
     let manifest_path = if requested.is_dir() {
         requested.join("suite.json")
     } else {
-        requested.to_path_buf()
+        requested.clone()
     };
     let manifest_path = fs::canonicalize(&manifest_path).map_err(internal_error)?;
     let root = manifest_path
@@ -1841,9 +2126,17 @@ fn evaluate_regression_suite(
     let suite: RegressionSuite = read_suite_document(&manifest_path)?;
     validate_suite_manifest(&suite)?;
     let inventory_started = Instant::now();
-    let inventory = verify_suite_inventory(&root, &suite)?;
+    let (inventory, inventory_cache_hit) = verify_suite_inventory(
+        state,
+        &root,
+        &manifest_path,
+        &suite,
+        operation,
+        !options.no_cache,
+    )?;
     let inventory_ms = elapsed_millis(inventory_started);
     let profile_load_started = Instant::now();
+    update_suite_progress(operation, "profile_load", 0, 1, None)?;
     require_in_inventory(&inventory, &suite.profile)?;
     let profile_path = safe_suite_path(&root, &suite.profile)?;
     let profile = load_profile(&profile_path).map_err(internal_error)?;
@@ -1867,13 +2160,33 @@ fn evaluate_regression_suite(
     let mut categories: HashMap<String, (usize, usize)> = HashMap::new();
     let all_cases_started = Instant::now();
     let mut case_timings = Vec::with_capacity(suite.cases.len());
-    for case_path in &suite.cases {
+    for (case_index, case_path) in suite.cases.iter().enumerate() {
         let evaluation_started = Instant::now();
         require_in_inventory(&inventory, case_path)?;
         let case: RegressionCase = read_suite_document(&safe_suite_path(&root, case_path)?)?;
+        let Some(selection_reasons) = suite_case_selection(options, &case) else {
+            continue;
+        };
+        update_suite_progress(
+            operation,
+            "cases",
+            case_index,
+            suite.cases.len(),
+            Some(&case.id),
+        )?;
         validate_suite_case(&case, &inventory)?;
-        let result =
-            evaluate_suite_case(state, &root, &profile, profile_directory, &aliases, &case)?;
+        let mut result = evaluate_suite_case(
+            state,
+            &root,
+            &profile,
+            profile_directory,
+            &aliases,
+            &case,
+            options.timings,
+        )?;
+        if suite_filters_active(options) {
+            result["selection_reasons"] = json!(selection_reasons);
+        }
         let passed = result["passed"].as_bool().unwrap_or(false);
         passed_cases += usize::from(passed);
         let assertions = result["assertions"]
@@ -1897,8 +2210,18 @@ fn evaluate_regression_suite(
             duration_ms: elapsed_millis(evaluation_started),
         });
         case_results.push(result);
+        if options.fail_fast && !passed {
+            break;
+        }
     }
     let total_cases_ms = elapsed_millis(all_cases_started);
+    update_suite_progress(
+        operation,
+        "serialization",
+        suite.cases.len(),
+        suite.cases.len(),
+        None,
+    )?;
     let category_results: serde_json::Map<String, Value> = categories
         .into_iter()
         .map(|(name, (total, passed))| {
@@ -1908,25 +2231,41 @@ fn evaluate_regression_suite(
             )
         })
         .collect();
-    let passed = passed_cases == suite.cases.len() && passed_assertions == total_assertions;
+    if case_results.is_empty() {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "suite filters selected no cases",
+        ));
+    }
+    let selected_cases = case_results.len();
+    let passed = passed_cases == selected_cases && passed_assertions == total_assertions;
     let mut response = json!({
         "schema":1,
         "suite":{"id":suite.id,"name":suite.name,"game":suite.game},
         "profile":{"id":profile.id,"name":profile.name,"revision":profile.revision,"path":suite.profile},
         "passed":passed,
         "summary":{
-            "cases":suite.cases.len(),"cases_passed":passed_cases,"cases_failed":suite.cases.len()-passed_cases,
+            "cases":selected_cases,"cases_passed":passed_cases,"cases_failed":selected_cases-passed_cases,
             "frames":total_frames,"assertions":total_assertions,"assertions_passed":passed_assertions,
             "assertions_failed":total_assertions-passed_assertions,"categories":category_results
         },
         "cases":case_results
     });
-    if include_timings {
+    if suite_filters_active(options) || options.fail_fast {
+        response["summary"]["suite_cases"] = json!(suite.cases.len());
+        response["selection"] = json!({
+            "focused":suite_filters_active(options),
+            "fail_fast":options.fail_fast,
+            "complete_suite_command":format!("yash-eventsctl --json suite evaluate {}", requested.display()),
+        });
+    }
+    if options.timings {
         case_timings = slowest_case_timings(case_timings);
         let serialization_started = Instant::now();
         serde_json::to_vec(&response).map_err(internal_error)?;
         let timings = SuiteTimingSummary {
             inventory_ms,
+            inventory_cache_hit,
             profile_load_ms,
             total_cases_ms,
             serialization_ms: elapsed_millis(serialization_started),
@@ -1935,6 +2274,70 @@ fn evaluate_regression_suite(
         response["timings"] = serde_json::to_value(timings).map_err(internal_error)?;
     }
     Ok(response)
+}
+
+fn suite_filters_active(options: &SuiteEvaluateParams) -> bool {
+    !options.case_ids.is_empty()
+        || !options.categories.is_empty()
+        || !options.fixtures.is_empty()
+        || !options.scenes.is_empty()
+        || !options.overlays.is_empty()
+        || !options.elements.is_empty()
+}
+
+fn suite_case_selection(
+    options: &SuiteEvaluateParams,
+    case: &RegressionCase,
+) -> Option<Vec<String>> {
+    if !suite_filters_active(options) {
+        return Some(vec!["complete_suite".into()]);
+    }
+    let mut reasons = Vec::new();
+    if options.case_ids.iter().any(|id| id == &case.id) {
+        reasons.push(format!("case_id:{}", case.id));
+    }
+    for category in &options.categories {
+        if case.categories.contains(category) {
+            reasons.push(format!("category:{category}"));
+        }
+    }
+    for fixture in &options.fixtures {
+        if case.source_media.as_ref() == Some(fixture)
+            || case.frames.iter().any(|frame| &frame.image == fixture)
+        {
+            reasons.push(format!("fixture:{}", fixture.display()));
+        }
+    }
+    for scene in &options.scenes {
+        if case.frames.iter().any(|frame| {
+            frame
+                .expected_scene
+                .as_ref()
+                .and_then(|expected| expected.name.as_ref())
+                == Some(scene)
+        }) {
+            reasons.push(format!("scene:{scene}"));
+        }
+    }
+    for overlay in &options.overlays {
+        if case.frames.iter().any(|frame| {
+            frame
+                .expected_overlays
+                .as_ref()
+                .is_some_and(|expected| expected.contains(overlay))
+        }) {
+            reasons.push(format!("overlay:{overlay}"));
+        }
+    }
+    for element in &options.elements {
+        if case.frames.iter().any(|frame| {
+            frame.expected_observations.contains_key(element)
+                || frame.expected_targets.contains_key(element)
+        }) {
+            reasons.push(format!("element:{element}"));
+        }
+    }
+    (!reasons.is_empty()).then_some(reasons)
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -2036,11 +2439,29 @@ fn validate_suite_case(
 }
 
 fn verify_suite_inventory(
+    state: &State,
     root: &Path,
+    manifest_path: &Path,
     suite: &RegressionSuite,
-) -> Result<HashSet<PathBuf>, RpcError> {
+    operation: Option<&SuiteOperation>,
+    use_cache: bool,
+) -> Result<(HashSet<PathBuf>, bool), RpcError> {
+    let manifest_sha256 = hash_suite_file(manifest_path)?;
+    let file_metadata = suite_inventory_metadata(root, suite)?;
+    if use_cache {
+        let cache = state
+            .suite_inventory_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.get(root) {
+            if entry.manifest_sha256 == manifest_sha256 && entry.files == file_metadata {
+                return Ok((entry.inventory.clone(), true));
+            }
+        }
+    }
     let mut inventory = HashSet::new();
-    for entry in &suite.files {
+    for (index, entry) in suite.files.iter().enumerate() {
+        update_suite_progress(operation, "inventory", index, suite.files.len(), None)?;
         if entry.sha256.len() != 64 || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(RpcError::new(
                 error_code::INVALID_PARAMS,
@@ -2054,8 +2475,7 @@ fn verify_suite_inventory(
             ));
         }
         let path = safe_suite_path(root, &entry.path)?;
-        let bytes = fs::read(path).map_err(internal_error)?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = hash_suite_file(&path)?;
         if actual != entry.sha256.to_ascii_lowercase() {
             return Err(RpcError::new(
                 error_code::INVALID_PARAMS,
@@ -2063,7 +2483,63 @@ fn verify_suite_inventory(
             ));
         }
     }
-    Ok(inventory)
+    if use_cache {
+        let mut cache = state
+            .suite_inventory_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= 4 && !cache.contains_key(root) {
+            if let Some(key) = cache.keys().next().cloned() {
+                cache.remove(&key);
+            }
+        }
+        cache.insert(
+            root.to_path_buf(),
+            SuiteInventoryCacheEntry {
+                manifest_sha256,
+                files: file_metadata,
+                inventory: inventory.clone(),
+            },
+        );
+    }
+    Ok((inventory, false))
+}
+
+fn suite_inventory_metadata(
+    root: &Path,
+    suite: &RegressionSuite,
+) -> Result<Vec<SuiteFileMetadata>, RpcError> {
+    suite
+        .files
+        .iter()
+        .map(|entry| {
+            let path = safe_suite_path(root, &entry.path)?;
+            let metadata = fs::metadata(path).map_err(internal_error)?;
+            Ok(SuiteFileMetadata {
+                path: entry.path.clone(),
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            })
+        })
+        .collect()
+}
+
+fn hash_suite_file(path: &Path) -> Result<String, RpcError> {
+    let mut file = fs::File::open(path).map_err(internal_error)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(internal_error)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn require_in_inventory(inventory: &HashSet<PathBuf>, path: &Path) -> Result<(), RpcError> {
@@ -2163,6 +2639,7 @@ fn evaluate_suite_case(
     profile_directory: &Path,
     aliases: &HashMap<String, ElementId>,
     case: &RegressionCase,
+    include_diagnostics: bool,
 ) -> Result<Value, RpcError> {
     let analysis_fps = state
         .local_config
@@ -2176,6 +2653,18 @@ fn evaluate_suite_case(
     let mut spatial_assertion_results = Vec::new();
     let mut frame_results = Vec::new();
     let mut passed_assertions = 0_usize;
+    let mut evaluated_detectors = 0_usize;
+    let mut gated_detectors = 0_usize;
+    let mut throttled_detectors = 0_usize;
+    let mut ocr_calls = 0_usize;
+    let mut template_comparisons = 0_usize;
+    let mut decoded_image_bytes = 0_usize;
+    let mut spatial_detector_evaluations = 0_usize;
+    let detectors_by_element = profile
+        .elements
+        .iter()
+        .map(|element| (element.id, &element.detector))
+        .collect::<HashMap<_, _>>();
     for (sequence, sample) in case.frames.iter().enumerate() {
         let spatial_analysis = if sample.has_spatial_assertions() {
             let image_path = safe_suite_path(root, &sample.image)?;
@@ -2189,7 +2678,29 @@ fn evaluate_suite_case(
             None
         };
         let frame = prepare_suite_frame(root, profile, aliases, sample, sequence)?;
-        for processed in pipeline.process_scene_aware(&frame) {
+        decoded_image_bytes = decoded_image_bytes.saturating_add(frame.data.len());
+        if spatial_analysis.is_some() {
+            decoded_image_bytes = decoded_image_bytes.saturating_add(frame.data.len());
+            spatial_detector_evaluations = spatial_detector_evaluations.saturating_add(
+                spatial_analysis
+                    .as_ref()
+                    .and_then(|analysis| analysis["analysis"]["evaluated_detectors"].as_u64())
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0),
+            );
+        }
+        let processed_frame = pipeline.process_scene_aware(&frame);
+        evaluated_detectors = evaluated_detectors.saturating_add(pipeline.last_evaluated_detectors);
+        gated_detectors = gated_detectors.saturating_add(pipeline.last_gated_detectors);
+        throttled_detectors = throttled_detectors.saturating_add(pipeline.last_throttled_detectors);
+        for processed in processed_frame {
+            match detectors_by_element.get(&processed.observation.element_id) {
+                Some(ProfileDetector::Ocr { .. }) => ocr_calls = ocr_calls.saturating_add(1),
+                Some(ProfileDetector::Template { templates, .. }) => {
+                    template_comparisons = template_comparisons.saturating_add(templates.len());
+                }
+                _ => {}
+            }
             transitions.extend(
                 pipeline
                     .rules
@@ -2280,14 +2791,26 @@ fn evaluate_suite_case(
     let assertions = assertion_results.len() + spatial_assertion_results.len();
     let events_passed = event_metrics.as_ref().is_none_or(|metrics| metrics.passed);
     let passed = passed_assertions == assertions && events_passed;
-    Ok(json!({
+    let mut result = json!({
         "id":case.id,"purpose":case.purpose,"categories":case.categories,"passed":passed,
         "frames":case.frames.len(),"assertions":assertions,"assertions_passed":passed_assertions,
         "assertions_failed":assertions-passed_assertions,"observation_results":assertion_results,
         "spatial_results":spatial_assertion_results,
         "frame_results":frame_results,
         "events_checked":case.check_events,"event_metrics":event_metrics,"events":transitions
-    }))
+    });
+    if include_diagnostics {
+        result["work"] = json!({
+            "evaluated_detectors":evaluated_detectors,
+            "gated_detectors":gated_detectors,
+            "throttled_detectors":throttled_detectors,
+            "ocr_calls":ocr_calls,
+            "template_comparisons":template_comparisons,
+            "decoded_image_bytes":decoded_image_bytes,
+            "spatial_detector_evaluations":spatial_detector_evaluations,
+        });
+    }
+    Ok(result)
 }
 
 fn spatial_assertions(
@@ -3219,7 +3742,7 @@ fn handoff_decision(
         "layout_incompatible"
     } else if resolution.ambiguous {
         "scene_ambiguous"
-    } else if has_scene_model && resolution.scene.is_none() && resolution.overlays.is_empty() {
+    } else if has_scene_model && resolution.scene.is_none() {
         "scene_unknown"
     } else if overlay_uncertain {
         "overlay_uncertain"
@@ -5553,6 +6076,34 @@ struct SuiteEvaluateParams {
     path: PathBuf,
     #[serde(default)]
     timings: bool,
+    #[serde(default)]
+    case_ids: Vec<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    fixtures: Vec<PathBuf>,
+    #[serde(default)]
+    scenes: Vec<String>,
+    #[serde(default)]
+    overlays: Vec<String>,
+    #[serde(default)]
+    elements: Vec<String>,
+    #[serde(default)]
+    fail_fast: bool,
+    #[serde(default)]
+    no_cache: bool,
+}
+
+#[derive(Deserialize)]
+struct SuiteOperationIdParam {
+    operation_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct SuiteOperationParams {
+    operation_id: Uuid,
+    #[serde(default)]
+    result: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6718,7 +7269,9 @@ mod tests {
                 name: "modal".into(),
                 confidence: 1.0,
             });
-        assert!(handoff_decision(true, true, &resolution, false, &[]).json_sufficient);
+        let overlay_without_scene = handoff_decision(true, true, &resolution, false, &[]);
+        assert_eq!(overlay_without_scene.reason, "scene_unknown");
+        assert!(overlay_without_scene.full_frame_recommended);
         resolution.overlays.clear();
         resolution.ambiguous = true;
         assert_eq!(
@@ -6926,6 +7479,8 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            suite_operations: Mutex::new(HashMap::new()),
+            suite_inventory_cache: Mutex::new(HashMap::new()),
         };
         state
             .local_config
@@ -7206,6 +7761,8 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            suite_operations: Mutex::new(HashMap::new()),
+            suite_inventory_cache: Mutex::new(HashMap::new()),
         };
         state
             .local_config
@@ -7315,6 +7872,8 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            suite_operations: Mutex::new(HashMap::new()),
+            suite_inventory_cache: Mutex::new(HashMap::new()),
         });
         state
             .local_config
@@ -7551,6 +8110,49 @@ mod tests {
         assert!(safe_suite_path(package.path(), Path::new("inside.png")).is_ok());
         assert!(safe_suite_path(package.path(), Path::new("../outside.png")).is_err());
         assert!(safe_suite_path(package.path(), Path::new("/tmp/outside.png")).is_err());
+    }
+
+    #[test]
+    fn suite_progress_is_bounded_and_cancellation_is_cooperative() {
+        let (notifications, mut receiver) = broadcast::channel(2);
+        let operation = SuiteOperation {
+            id: Uuid::new_v4(),
+            started: Instant::now(),
+            cancel: AtomicBool::new(false),
+            state: Mutex::new(SuiteOperationState {
+                status: "running",
+                phase: "queued",
+                completed: 0,
+                total: 0,
+                current_case: None,
+                result: None,
+                error: None,
+                last_progress: Instant::now(),
+            }),
+            notifications,
+        };
+        update_suite_progress(Some(&operation), "cases", 2, 10, Some("case-2")).unwrap();
+        let notification = receiver.try_recv().unwrap();
+        assert_eq!(notification["type"], "suite_progress");
+        assert_eq!(notification["completed"], 2);
+        assert_eq!(notification["current_case"], "case-2");
+        operation.cancel.store(true, Ordering::Relaxed);
+        let error =
+            update_suite_progress(Some(&operation), "cases", 3, 10, Some("case-3")).unwrap_err();
+        assert_eq!(error.code, error_code::OPERATION_CANCELLED);
+        assert!(error.message.contains("cases"));
+    }
+
+    #[test]
+    fn suite_file_hashing_streams_stable_sha256() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.bin");
+        fs::write(&path, vec![0x5a; 200_000]).unwrap();
+        assert_eq!(
+            hash_suite_file(&path).unwrap(),
+            hash_suite_file(&path).unwrap()
+        );
+        assert_eq!(hash_suite_file(&path).unwrap().len(), 64);
     }
 
     #[test]

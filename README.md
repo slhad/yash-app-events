@@ -125,6 +125,8 @@ yash-eventsctl state --json
 yash-eventsctl --json analyze /path/to/frame.png --profile-id <profile-uuid>
 yash-eventsctl --json replay ./manifest.json
 yash-eventsctl --json suite evaluate /path/to/blazblue-entropy-effect
+yash-eventsctl --json suite evaluate /path/to/package --case exact-case-id --timings
+yash-eventsctl --json profile analyze-capacity /path/to/profile.json
 yash-eventsctl collection policy-set <profile-uuid> /path/to/blazblue-entropy-effect --enabled true
 yash-eventsctl --json collection auto-review <profile-uuid>
 yash-eventsctl collection review <profile-uuid> <item-id> correct --expected ./expected.json

@@ -27,6 +27,13 @@ image bytes or generates input.
 .PP
 Suite evaluate omits unstable wall-clock data by default. --timings adds inventory,
 profile-load, total-case, serialization, and ten-slowest-case millisecond diagnostics.
+Use --progress, --detach, suite status, and suite cancel for long operations. Repeatable
+--case/--category/--changed-fixture/--scene/--overlay/--element filters and --fail-fast
+support authoring; --no-cache forces cold verification and --output atomically stores JSON.
+.PP
+Profile analyze-capacity PROFILE runs offline and reports shared limits, 80/90/100 percent
+warnings, expensive detector families, unreachable/disabled-only elements, duplicate
+configurations, per-scene cost estimates, and read-only consolidation suggestions.
 .SH EXIT STATUS
 0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay or suite regression.
 .SH SEE ALSO

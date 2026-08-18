@@ -1914,6 +1914,7 @@ impl App {
                 });
             });
             self.layout_compatibility_ui(ui, &profile);
+            Self::capacity_ui(ui, &profile);
             self.scene_model_editor(ui, &mut profile);
             ui.strong("Detection hierarchy");
             for (derived_index, derived) in profile.derived_observations.iter().enumerate() {
@@ -2371,6 +2372,46 @@ impl App {
                 ui.colored_label(egui::Color32::GREEN, "Compatible aspect ratio; normalized zones scale automatically. Verify game UI scale if recognition differs.");
             }
             ui.small("Portal source/restore data is machine-local and is not exported with the portable profile.");
+        });
+    }
+
+    fn capacity_ui(ui: &mut egui::Ui, profile: &Profile) {
+        let report = profile.analyze_capacity();
+        ui.collapsing("Profile capacity", |ui| {
+            for (name, usage) in [
+                ("Detector elements", &report.elements),
+                ("Scenes", &report.scenes),
+                ("Overlays", &report.overlays),
+                ("Interaction targets", &report.interaction_targets),
+            ] {
+                let text = format!(
+                    "{name}: {}/{} ({:.1}%)",
+                    usage.used, usage.maximum, usage.percent
+                );
+                if usage.warning.is_some() {
+                    ui.colored_label(egui::Color32::YELLOW, text);
+                } else {
+                    ui.label(text);
+                }
+            }
+            ui.label(format!(
+                "Largest layer: {} elements, {} targets · recognition conditions: {}",
+                report.largest_layer_elements,
+                report.largest_layer_targets,
+                report.recognition_conditions,
+            ));
+            if !report.unreachable_elements.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "{} unreachable elements; inspect `profile analyze-capacity` before adding more.",
+                        report.unreachable_elements.len()
+                    ),
+                );
+            }
+            for suggestion in report.suggestions.iter().take(3) {
+                ui.small(format!("• {suggestion}"));
+            }
         });
     }
 

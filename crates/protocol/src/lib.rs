@@ -190,6 +190,9 @@ pub mod method {
     pub const REPLAY_PROFILE_DETECTOR: &str = "replay.profile_detector";
     pub const REPLAY_EVALUATE: &str = "replay.evaluate";
     pub const SUITE_EVALUATE: &str = "suite.evaluate";
+    pub const SUITE_START: &str = "suite.start";
+    pub const SUITE_STATUS: &str = "suite.status";
+    pub const SUITE_CANCEL: &str = "suite.cancel";
     pub const COLLECTION_POLICY_GET: &str = "collection.policy_get";
     pub const COLLECTION_POLICY_SET: &str = "collection.policy_set";
     pub const COLLECTION_STATUS: &str = "collection.status";
@@ -224,6 +227,7 @@ pub mod error_code {
     pub const INCOMPATIBLE_VERSION: i32 = -32002;
     pub const REVISION_CONFLICT: i32 = -32009;
     pub const SUBSCRIPTION_LAGGED: i32 = -32010;
+    pub const OPERATION_CANCELLED: i32 = -32011;
 }
 
 #[cfg(test)]

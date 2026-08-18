@@ -99,6 +99,15 @@ response; the CLI maps it to exit status 7. When requested, an additive `timings
 reports inventory, profile-load, total-case, and serialization milliseconds plus at
 most ten slowest case IDs. It is omitted by default.
 
+Long evaluations should use additive `suite.start`, `suite.status`, and `suite.cancel`.
+`suite.start` accepts the evaluate parameters and returns an operation UUID immediately.
+`suite.status` accepts `operation_id` plus optional `result`; it reports status, phase,
+completed/total cases or files, current case, elapsed milliseconds, and a structured
+terminal error. Requesting a completed result consumes the retained operation. Progress
+is also emitted as bounded `suite_progress` notifications. `suite.cancel` is cooperative
+and returns whether cancellation was accepted. At most four unconsumed operations are
+retained.
+
 Collection policies are keyed by profile ID and remain machine-local. A policy contains
 an absolute dataset root, enabled flag, interval/jitter, perceptual threshold, item/byte
 quotas, and novelty-target names. Collection runs only on an active capture and stores

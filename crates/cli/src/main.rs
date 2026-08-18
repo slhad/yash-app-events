@@ -22,7 +22,7 @@ async fn main() -> ExitCode {
             let regression_failed = match &cli.command {
                 Command::Replay { .. } => !value["metrics"]["passed"].as_bool().unwrap_or(false),
                 Command::Suite {
-                    command: SuiteCommand::Evaluate { .. },
+                    command: SuiteCommand::Evaluate { detach: false, .. },
                 } => !value["passed"].as_bool().unwrap_or(false),
                 _ => false,
             };

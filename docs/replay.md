@@ -130,6 +130,20 @@ milliseconds, plus the ten slowest case IDs. Without this flag the stable respon
 shape is unchanged. Durations are diagnostic observations, not deterministic test
 values.
 
+Suite evaluation is daemon-owned and runs outside the async control executor. The CLI
+starts an operation and polls it; `--progress` prints bounded phase/case updates in human
+mode, while `--detach` returns an operation ID for `suite status <id>` and
+`suite cancel <id>`. Cancellation is cooperative at inventory and case boundaries.
+`--output <path>` atomically stores the complete JSON result and prints a compact receipt.
+
+Focused authoring filters are repeatable: `--case`, `--category`, `--changed-fixture`,
+`--scene`, `--overlay`, and `--element`. `--fail-fast` stops at the first failing selected
+case. Every selected case carries machine-readable `selection_reasons`, and every focused
+result prints the complete-suite command still required for release/install confidence.
+Immutable inventory verification is cached only while manifest hash and every pinned
+file's path, size, and modification time remain unchanged; `--no-cache` forces a cold
+hash-verification path.
+
 To package a reviewed portable profile without connecting to a daemon, run
 `yash-eventsctl --json profile pack /path/to/profile-directory /path/to/profile.hudprofile`.
 Keep private suite media outside that directory: packing includes only the validated

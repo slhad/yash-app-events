@@ -1,6 +1,6 @@
 //! Portable profile schemas, validation, migration, and durable local storage.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write as _};
@@ -29,6 +29,61 @@ const MAXIMUM_LAYER_ELEMENTS: usize = 256;
 const MAXIMUM_INTERACTION_TARGETS: usize = 256;
 const MAXIMUM_TOTAL_INTERACTION_TARGETS: usize = 512;
 const MAXIMUM_RECOGNITION_CONDITIONS: usize = 32;
+
+/// Shared validated profile resource limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ProfileLimits {
+    pub elements: usize,
+    pub scenes: usize,
+    pub overlays: usize,
+    pub elements_per_layer: usize,
+    pub interaction_targets_per_layer: usize,
+    pub interaction_targets_total: usize,
+    pub recognition_conditions: usize,
+}
+
+impl Default for ProfileLimits {
+    fn default() -> Self {
+        Self {
+            elements: MAXIMUM_ELEMENTS,
+            scenes: MAXIMUM_SCENES,
+            overlays: MAXIMUM_OVERLAYS,
+            elements_per_layer: MAXIMUM_LAYER_ELEMENTS,
+            interaction_targets_per_layer: MAXIMUM_INTERACTION_TARGETS,
+            interaction_targets_total: MAXIMUM_TOTAL_INTERACTION_TARGETS,
+            recognition_conditions: MAXIMUM_RECOGNITION_CONDITIONS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CapacityUsage {
+    pub used: usize,
+    pub maximum: usize,
+    pub percent: f64,
+    pub warning: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileCapacityReport {
+    pub limits: ProfileLimits,
+    pub elements: CapacityUsage,
+    pub scenes: CapacityUsage,
+    pub overlays: CapacityUsage,
+    pub interaction_targets: CapacityUsage,
+    pub largest_layer_element_usage: CapacityUsage,
+    pub largest_layer_target_usage: CapacityUsage,
+    pub largest_recognition_usage: CapacityUsage,
+    pub largest_layer_elements: usize,
+    pub largest_layer_targets: usize,
+    pub recognition_conditions: usize,
+    pub detector_families: BTreeMap<String, usize>,
+    pub unreachable_elements: Vec<String>,
+    pub disabled_layer_only_elements: Vec<String>,
+    pub duplicate_detector_groups: Vec<Vec<String>>,
+    pub estimated_cost_by_scene: BTreeMap<String, u64>,
+    pub suggestions: Vec<String>,
+}
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -66,6 +121,62 @@ opaque_id!(RuleId);
 opaque_id!(SceneId);
 opaque_id!(OverlayId);
 opaque_id!(InteractionTargetId);
+
+fn capacity_usage(used: usize, maximum: usize) -> CapacityUsage {
+    #[allow(clippy::cast_precision_loss)]
+    let percent = used as f64 * 100.0 / maximum as f64;
+    let warning = if used >= maximum {
+        Some("limit_reached")
+    } else if used * 100 >= maximum * 90 {
+        Some("ninety_percent")
+    } else if used * 100 >= maximum * 80 {
+        Some("eighty_percent")
+    } else {
+        None
+    };
+    CapacityUsage {
+        used,
+        maximum,
+        percent,
+        warning,
+    }
+}
+
+fn recognition_conditions(expression: &RecognitionExpression) -> &[RecognitionCondition] {
+    match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    }
+}
+
+fn detector_family(detector: &Detector) -> &'static str {
+    match detector {
+        Detector::ColorBar { .. } => "color_bar",
+        Detector::Template { .. } => "template",
+        Detector::RegionChange { .. } => "region_change",
+        Detector::Ocr { .. } => "ocr",
+        Detector::SevenSegment { .. } => "seven_segment",
+        Detector::Classifier { .. } => "classifier",
+    }
+}
+
+fn detector_cost(detector: &Detector) -> u64 {
+    match detector {
+        Detector::ColorBar { .. } | Detector::RegionChange { .. } => 1,
+        Detector::Template { templates, .. } => u64::try_from(templates.len()).unwrap_or(u64::MAX),
+        Detector::SevenSegment { .. } => 3,
+        Detector::Ocr { .. } | Detector::Classifier { .. } => 20,
+    }
+}
+
+fn detector_signature(element: &Element) -> String {
+    let mut detector = serde_json::to_value(&element.detector).unwrap_or_default();
+    if let Some(object) = detector.as_object_mut() {
+        object.remove("id");
+    }
+    serde_json::to_string(&(element.region, detector)).unwrap_or_default()
+}
 
 /// Current portable profile document.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -126,6 +237,188 @@ impl Profile {
         }
     }
 
+    /// Reports bounded profile usage and read-only consolidation opportunities.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn analyze_capacity(&self) -> ProfileCapacityReport {
+        let limits = ProfileLimits::default();
+        let all_layers = self
+            .scenes
+            .iter()
+            .map(|scene| {
+                (
+                    &scene.element_ids,
+                    &scene.interaction_targets,
+                    scene.enabled,
+                )
+            })
+            .chain(self.overlays.iter().map(|overlay| {
+                (
+                    &overlay.element_ids,
+                    &overlay.interaction_targets,
+                    overlay.enabled,
+                )
+            }))
+            .collect::<Vec<_>>();
+        let largest_layer_elements = all_layers
+            .iter()
+            .map(|(elements, _, _)| elements.len())
+            .max()
+            .unwrap_or(0);
+        let largest_layer_targets = all_layers
+            .iter()
+            .map(|(_, targets, _)| targets.len())
+            .max()
+            .unwrap_or(0);
+        let interaction_targets = all_layers
+            .iter()
+            .map(|(_, targets, _)| targets.len())
+            .sum::<usize>();
+        let recognition_condition_count = self
+            .scenes
+            .iter()
+            .map(|scene| recognition_conditions(&scene.recognition).len())
+            .chain(
+                self.overlays
+                    .iter()
+                    .map(|overlay| recognition_conditions(&overlay.recognition).len()),
+            )
+            .sum();
+        let largest_recognition_conditions = self
+            .scenes
+            .iter()
+            .map(|scene| recognition_conditions(&scene.recognition).len())
+            .chain(
+                self.overlays
+                    .iter()
+                    .map(|overlay| recognition_conditions(&overlay.recognition).len()),
+            )
+            .max()
+            .unwrap_or(0);
+        let mut referenced = self.global_elements.iter().copied().collect::<HashSet<_>>();
+        let mut enabled_referenced = referenced.clone();
+        for scene in &self.scenes {
+            referenced.extend(scene.element_ids.iter().copied());
+            referenced.extend(
+                recognition_conditions(&scene.recognition)
+                    .iter()
+                    .map(|condition| condition.element_id),
+            );
+            if scene.enabled {
+                enabled_referenced.extend(scene.element_ids.iter().copied());
+            }
+        }
+        for overlay in &self.overlays {
+            referenced.extend(overlay.element_ids.iter().copied());
+            referenced.extend(
+                recognition_conditions(&overlay.recognition)
+                    .iter()
+                    .map(|condition| condition.element_id),
+            );
+            if overlay.enabled {
+                enabled_referenced.extend(overlay.element_ids.iter().copied());
+            }
+        }
+        let unreachable_elements = self
+            .elements
+            .iter()
+            .filter(|element| !referenced.contains(&element.id))
+            .map(|element| element.name.clone())
+            .collect::<Vec<_>>();
+        let disabled_layer_only_elements = self
+            .elements
+            .iter()
+            .filter(|element| {
+                referenced.contains(&element.id) && !enabled_referenced.contains(&element.id)
+            })
+            .map(|element| element.name.clone())
+            .collect::<Vec<_>>();
+        let mut families = BTreeMap::new();
+        let mut duplicate_candidates: HashMap<String, Vec<String>> = HashMap::new();
+        for element in &self.elements {
+            *families
+                .entry(detector_family(&element.detector).to_owned())
+                .or_insert(0) += 1;
+            duplicate_candidates
+                .entry(detector_signature(element))
+                .or_default()
+                .push(element.name.clone());
+        }
+        let mut duplicate_detector_groups = duplicate_candidates
+            .into_values()
+            .filter(|elements| elements.len() > 1)
+            .collect::<Vec<_>>();
+        duplicate_detector_groups.sort_by(|left, right| left[0].cmp(&right[0]));
+        let elements_by_id = self
+            .elements
+            .iter()
+            .map(|element| (element.id, element))
+            .collect::<HashMap<_, _>>();
+        let estimated_cost_by_scene = self
+            .scenes
+            .iter()
+            .map(|scene| {
+                let ids = self
+                    .global_elements
+                    .iter()
+                    .chain(scene.element_ids.iter())
+                    .copied()
+                    .collect::<HashSet<_>>();
+                let cost = ids
+                    .iter()
+                    .filter_map(|id| elements_by_id.get(id))
+                    .map(|element| detector_cost(&element.detector))
+                    .sum();
+                (scene.name.clone(), cost)
+            })
+            .collect();
+        let mut suggestions = Vec::new();
+        if !unreachable_elements.is_empty() {
+            suggestions.push("remove or assign unreachable detector elements".into());
+        }
+        if !duplicate_detector_groups.is_empty() {
+            suggestions.push(
+                "review duplicate regions/configurations and consolidate stable references".into(),
+            );
+        }
+        if self.elements.len() * 100 >= limits.elements * 80 {
+            suggestions.push(
+                "prefer shared anchors, contextual elements, derived observations, and multi-template detectors before adding elements".into(),
+            );
+        }
+        ProfileCapacityReport {
+            limits,
+            elements: capacity_usage(self.elements.len(), limits.elements),
+            scenes: capacity_usage(self.scenes.len(), limits.scenes),
+            overlays: capacity_usage(self.overlays.len(), limits.overlays),
+            interaction_targets: capacity_usage(
+                interaction_targets,
+                limits.interaction_targets_total,
+            ),
+            largest_layer_element_usage: capacity_usage(
+                largest_layer_elements,
+                limits.elements_per_layer,
+            ),
+            largest_layer_target_usage: capacity_usage(
+                largest_layer_targets,
+                limits.interaction_targets_per_layer,
+            ),
+            largest_recognition_usage: capacity_usage(
+                largest_recognition_conditions,
+                limits.recognition_conditions,
+            ),
+            largest_layer_elements,
+            largest_layer_targets,
+            recognition_conditions: recognition_condition_count,
+            detector_families: families,
+            unreachable_elements,
+            disabled_layer_only_elements,
+            duplicate_detector_groups,
+            estimated_cost_by_scene,
+            suggestions,
+        }
+    }
+
     /// Validates all external-contract invariants.
     ///
     /// # Errors
@@ -149,7 +442,11 @@ impl Profile {
         if self.elements.len() > MAXIMUM_ELEMENTS {
             errors.push(ValidationError::new(
                 "elements",
-                "contains more than 512 detector elements",
+                format!(
+                    "{}/{} detector elements requested; the 512/512 capacity limit is reached; run `profile analyze-capacity` before adding another element",
+                    self.elements.len(),
+                    MAXIMUM_ELEMENTS,
+                ),
             ));
         }
         for (index, element) in self.elements.iter().enumerate() {
@@ -1746,6 +2043,57 @@ mod tests {
         assert_eq!(target.name, "play_button");
         assert_eq!(target.interaction_point, Some(InteractionPoint::Center));
         assert!(target.required_for_json);
+    }
+
+    #[test]
+    fn capacity_analysis_warns_and_finds_read_only_consolidation_candidates() {
+        let mut profile = load_profile(Path::new("tests/fixtures/profile-v2.json")).unwrap();
+        let template = profile.elements[0].clone();
+        while profile.elements.len() < 410 {
+            let mut duplicate = template.clone();
+            duplicate.id = ElementId::new();
+            duplicate.detector = match duplicate.detector {
+                Detector::Template {
+                    templates,
+                    masks,
+                    threshold,
+                    preprocessing,
+                    ..
+                } => Detector::Template {
+                    id: DetectorId::new(),
+                    templates,
+                    masks,
+                    threshold,
+                    preprocessing,
+                },
+                detector => detector,
+            };
+            duplicate.name = format!("duplicate-{}", profile.elements.len());
+            profile.elements.push(duplicate);
+        }
+        let report = profile.analyze_capacity();
+        assert_eq!(report.elements.used, 410);
+        assert_eq!(report.elements.maximum, 512);
+        assert_eq!(report.elements.warning, Some("eighty_percent"));
+        assert_eq!(report.unreachable_elements.len(), 409);
+        assert_eq!(report.duplicate_detector_groups[0].len(), 410);
+        assert!(report
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("consolidate")));
+
+        while profile.elements.len() <= 512 {
+            let mut extra = template.clone();
+            extra.id = ElementId::new();
+            extra.name = format!("overflow-{}", profile.elements.len());
+            profile.elements.push(extra);
+        }
+        let errors = profile.validate().unwrap_err();
+        assert!(errors.0.iter().any(|error| {
+            error.path == "elements"
+                && error.message.contains("513/512")
+                && error.message.contains("analyze-capacity")
+        }));
     }
 
     #[test]
