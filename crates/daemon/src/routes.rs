@@ -217,6 +217,7 @@ mod tests {
                     active_profile: Some(profile_id.to_string()),
                     observations: json!({}),
                     events: json!({}),
+                    context: Value::Null,
                 },
             )
             .unwrap();

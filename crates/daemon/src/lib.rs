@@ -30,13 +30,15 @@ use yash_app_events_engine::collection::{
     CollectedFrame, CollectionItem, CollectionReason, ReviewRecord, ReviewStatus,
 };
 use yash_app_events_engine::suite::{
-    ExpectedObservation, ExpectedValue, FramePlacement, RegressionCase, RegressionSuite, SuiteFrame,
+    ExpectedAiHandoff, ExpectedFrameIdentity, ExpectedObservation, ExpectedScene, ExpectedTarget,
+    ExpectedValue, FramePlacement, RegressionCase, RegressionSuite, SuiteFrame,
 };
 use yash_app_events_engine::{
-    evaluate_replay, normalized_to_pixels, AnalysisScheduler, CompositeRule, CompositeRuleConfig,
-    FrameProcessor, NoopRule, NumericRule, NumericRuleConfig, Observation, ObservationRule,
-    ObservationValue, ProcessedFrame, ReplayManifest, ReplayRegression, TemporalRule,
-    TemporalRuleConfig, Transition, TransitionState, ValuePredicate,
+    evaluate_replay, normalized_to_pixels, recognition_confidence, AnalysisScheduler,
+    CompositeRule, CompositeRuleConfig, FrameProcessor, NoopRule, NumericRule, NumericRuleConfig,
+    Observation, ObservationRule, ObservationValue, ProcessedFrame, ReplayManifest,
+    ReplayRegression, SceneResolution, SceneResolver, TemporalRule, TemporalRuleConfig, Transition,
+    TransitionState, ValuePredicate,
 };
 use yash_app_events_output::{
     execute_route, export_diagnostic_bundle, plan_diagnostic_bundle, render_payload,
@@ -49,7 +51,8 @@ use yash_app_events_output::{FileMode, OutputRecipe, OutputRecipeSink};
 use yash_app_events_profile::{
     export_profile, import_profile, load_profile, BarDirection, CollectionPolicy,
     Detector as ProfileDetector, DetectorId, ElementId, ImportLimits, LocalConfig,
-    NormalizedRegion, Profile, ProfileId, ProfileStore, RuleId, RulePredicate, StoreError,
+    NormalizedRegion, OcrExpectedFormat, OverlayId, Profile, ProfileId, ProfileStore, RuleId,
+    RulePredicate, SceneId, StoreError,
 };
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
@@ -181,6 +184,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         active_profile: None,
         observations: json!({}),
         events: json!({}),
+        context: Value::Null,
     })?;
     let output_routes = routes::Router::spawn(
         LocalConfig::new(config.config_root.clone()),
@@ -451,7 +455,7 @@ async fn dispatch(
             Ok(json!({"version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
         }
         method::CAPABILITIES => Ok(
-            json!({"profiles":true,"profile_catalog":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
+            json!({"profiles":true,"profile_catalog":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"image_analysis":{"json_first":true,"crop_escalation":true},"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
         ),
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
@@ -643,6 +647,8 @@ async fn dispatch(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()),
+        method::ANALYZE_IMAGE => parse::<AnalyzeImageParams>(request.params)
+            .and_then(|params| analyze_image(state, &params)),
         method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(request.params)
             .and_then(|params| run_synthetic_health(state, params)),
         method::DETECTOR_TEST => parse::<DetectorTestParams>(request.params)
@@ -971,6 +977,61 @@ fn publish_replay<D: VisionDetector>(
 struct PublicationState {
     observations: serde_json::Map<String, Value>,
     event_states: serde_json::Map<String, Value>,
+    context: Value,
+}
+
+fn publish_context_transition(
+    state: &State,
+    profile_id: &str,
+    game: &str,
+    previous_scene: Option<SceneId>,
+    previous_overlays: &HashSet<OverlayId>,
+    resolution: &SceneResolution,
+    timestamp: DateTime<Utc>,
+) -> Result<(), RpcError> {
+    let mut previous_overlay_ids = previous_overlays
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    previous_overlay_ids.sort();
+    let sequence = state
+        .sequence
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let record = EventRecord {
+        schema: 1,
+        daemon_instance: state.instance,
+        sequence,
+        timestamp: EventRecord::timestamp_rfc3339(timestamp),
+        profile_id: profile_id.to_owned(),
+        game: game.to_owned(),
+        event: if previous_scene == resolution.scene.as_ref().map(|scene| scene.id) {
+            "overlays_changed".into()
+        } else {
+            "scene_changed".into()
+        },
+        state: EventState::Updated,
+        value: json!({
+            "previous_scene_id": previous_scene,
+            "scene": resolution.scene,
+            "previous_overlay_ids": previous_overlay_ids,
+            "overlays": resolution.overlays,
+            "ambiguous": resolution.ambiguous,
+        }),
+        confidence: resolution
+            .scene
+            .as_ref()
+            .map_or(0.0, |scene| f64::from(scene.confidence)),
+    };
+    state
+        .output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .append_event(&record)
+        .map_err(internal_error)?;
+    let value = serde_json::to_value(record).map_err(internal_error)?;
+    let _ = state.notifications.send(value);
+    Ok(())
 }
 
 fn publish_processed(
@@ -1038,6 +1099,7 @@ fn publish_processed(
         active_profile: Some(profile_id.to_owned()),
         observations: Value::Object(publication.observations.clone()),
         events: Value::Object(publication.event_states.clone()),
+        context: publication.context.clone(),
     };
     let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
     if let Err(error) = state
@@ -1572,6 +1634,7 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<Value, RpcError> {
     let sample_count = manifest.values.len() + manifest.image_frames.len();
     if manifest.schema != 1
@@ -1605,9 +1668,11 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
         .single()
         .ok_or_else(|| internal_error("invalid replay epoch"))?;
     let capture = json!({"active":false,"source":"replay"});
+    let replay_profile_id = pipeline.profile_id.clone();
+    let replay_game = pipeline.game.clone();
     let replay_context = ReplayPublicationContext {
-        profile_id: &pipeline.profile_id,
-        game: &pipeline.game,
+        profile_id: &replay_profile_id,
+        game: &replay_game,
         capture: &capture,
     };
     let mut publication = PublicationState::default();
@@ -1620,10 +1685,50 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
     let mut observations = Vec::new();
     let mut transitions = Vec::new();
     for frame in ReplaySource::new(frames) {
-        for processor in &mut pipeline.processors {
-            let Some(processed) = processor.process(&frame) else {
-                continue;
-            };
+        let processed_frames = pipeline.process_scene_aware(&frame);
+        publication.context = json!({
+            "scene":pipeline.scene_resolution.scene,
+            "overlays":pipeline.scene_resolution.overlays,
+            "ambiguous":pipeline.scene_resolution.ambiguous,
+            "candidates":pipeline.scene_resolution.candidates,
+            "overlay_candidates":pipeline.scene_resolution.overlay_candidates,
+            "detectors":{
+                "evaluated":pipeline.last_evaluated_detectors,
+                "gated":pipeline.last_gated_detectors,
+                "throttled":pipeline.last_throttled_detectors,
+            },
+        });
+        let current_scene = pipeline
+            .scene_resolution
+            .scene
+            .as_ref()
+            .map(|scene| scene.id);
+        let current_overlays = pipeline
+            .scene_resolution
+            .overlays
+            .iter()
+            .map(|overlay| overlay.id)
+            .collect::<HashSet<_>>();
+        if current_scene != pipeline.published_scene
+            || current_overlays != pipeline.published_overlays
+        {
+            let timestamp = start
+                + TimeDelta::milliseconds(
+                    i64::try_from(frame.timestamp.as_millis()).unwrap_or(i64::MAX),
+                );
+            publish_context_transition(
+                state,
+                &pipeline.profile_id,
+                &pipeline.game,
+                pipeline.published_scene,
+                &pipeline.published_overlays,
+                &pipeline.scene_resolution,
+                timestamp,
+            )?;
+            pipeline.published_scene = current_scene;
+            pipeline.published_overlays = current_overlays;
+        }
+        for processed in processed_frames {
             let observation_timestamp_ms = processed.observation.timestamp_ms;
             let timestamp = start
                 + TimeDelta::milliseconds(
@@ -1835,9 +1940,43 @@ fn validate_suite_case(
     if let Some(source) = &case.source_media {
         require_in_inventory(inventory, source)?;
     }
+    if let Some(provenance) = &case.provenance {
+        if provenance.source.trim().is_empty()
+            || provenance.original_width == 0
+            || provenance.original_height == 0
+            || provenance.original_sha256.len() != 64
+            || !provenance
+                .original_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || provenance.review_state.trim().is_empty()
+            || !provenance.no_account_secret
+        {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "suite provenance requires a source, dimensions, SHA-256, review state, and an affirmative no-account-secret review",
+            ));
+        }
+    }
     let mut previous = None;
     for frame in &case.frames {
         require_in_inventory(inventory, &frame.image)?;
+        if frame.has_spatial_assertions() && !matches!(frame.placement, FramePlacement::FullFrame) {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "scene, overlay, target, frame, and ai_handoff assertions require a full-frame fixture",
+            ));
+        }
+        if let Some(expected) = &frame.expected_frame {
+            if expected.sha256.len() != 64
+                || !expected.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "expected frame SHA-256 must contain 64 hexadecimal characters",
+                ));
+            }
+        }
         if previous.is_some_and(|timestamp| frame.timestamp_ms < timestamp) {
             return Err(RpcError::new(
                 error_code::INVALID_PARAMS,
@@ -1969,6 +2108,7 @@ fn suite_alias(name: &str) -> String {
     alias
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate_suite_case(
     state: &State,
     root: &Path,
@@ -1986,14 +2126,23 @@ fn evaluate_suite_case(
     let mut latest: HashMap<ElementId, Observation> = HashMap::new();
     let mut transitions = Vec::new();
     let mut assertion_results = Vec::new();
+    let mut spatial_assertion_results = Vec::new();
     let mut frame_results = Vec::new();
     let mut passed_assertions = 0_usize;
     for (sequence, sample) in case.frames.iter().enumerate() {
+        let spatial_analysis = if sample.has_spatial_assertions() {
+            let image_path = safe_suite_path(root, &sample.image)?;
+            Some(analyze_image_with_profile(
+                profile,
+                profile_directory,
+                &image_path,
+                120_000,
+            )?)
+        } else {
+            None
+        };
         let frame = prepare_suite_frame(root, profile, aliases, sample, sequence)?;
-        for processor in &mut pipeline.processors {
-            let Some(processed) = processor.process(&frame) else {
-                continue;
-            };
+        for processed in pipeline.process_scene_aware(&frame) {
             transitions.extend(
                 pipeline
                     .rules
@@ -2039,6 +2188,12 @@ fn evaluate_suite_case(
                 "passed":passed,"reason":reason,"expected":expected,"actual":actual
             }));
         }
+        if let Some(analysis) = &spatial_analysis {
+            for result in spatial_assertions(profile, sample, analysis, sequence) {
+                passed_assertions += usize::from(result["passed"].as_bool().unwrap_or(false));
+                spatial_assertion_results.push(result);
+            }
+        }
         let observed: serde_json::Map<String, Value> = profile
             .elements
             .iter()
@@ -2058,20 +2213,272 @@ fn evaluate_suite_case(
             .collect();
         frame_results.push(json!({
             "frame":sequence,"timestamp_ms":sample.timestamp_ms,"image":sample.image,
-            "observations":observed
+            "observations":observed,
+            "spatial_analysis":spatial_analysis,
+            "context":{
+                "scene":pipeline.scene_resolution.scene,
+                "overlays":pipeline.scene_resolution.overlays,
+                "ambiguous":pipeline.scene_resolution.ambiguous,
+                "candidates":pipeline.scene_resolution.candidates,
+                "overlay_candidates":pipeline.scene_resolution.overlay_candidates,
+                "detectors":{
+                    "evaluated":pipeline.last_evaluated_detectors,
+                    "gated":pipeline.last_gated_detectors,
+                    "throttled":pipeline.last_throttled_detectors,
+                },
+            }
         }));
     }
     let event_metrics = suite_event_metrics(case, &transitions);
-    let assertions = assertion_results.len();
+    let assertions = assertion_results.len() + spatial_assertion_results.len();
     let events_passed = event_metrics.as_ref().is_none_or(|metrics| metrics.passed);
     let passed = passed_assertions == assertions && events_passed;
     Ok(json!({
         "id":case.id,"purpose":case.purpose,"categories":case.categories,"passed":passed,
         "frames":case.frames.len(),"assertions":assertions,"assertions_passed":passed_assertions,
         "assertions_failed":assertions-passed_assertions,"observation_results":assertion_results,
+        "spatial_results":spatial_assertion_results,
         "frame_results":frame_results,
         "events_checked":case.check_events,"event_metrics":event_metrics,"events":transitions
     }))
+}
+
+fn spatial_assertions(
+    profile: &Profile,
+    sample: &SuiteFrame,
+    analysis: &Value,
+    frame_index: usize,
+) -> Vec<Value> {
+    let mut results = Vec::new();
+    if let Some(expected) = &sample.expected_frame {
+        let actual = &analysis["frame"];
+        let passed = expected_frame_matches(expected, actual);
+        results.push(spatial_assertion_result(
+            frame_index,
+            "frame_identity",
+            passed,
+            serde_json::to_value(expected).unwrap_or(Value::Null),
+            actual.clone(),
+        ));
+    }
+    if let Some(expected) = &sample.expected_scene {
+        let actual = &analysis["scene"];
+        let passed = expected_scene_matches(expected, actual);
+        results.push(spatial_assertion_result(
+            frame_index,
+            "scene",
+            passed,
+            serde_json::to_value(expected).unwrap_or(Value::Null),
+            actual.clone(),
+        ));
+    }
+    if let Some(expected) = &sample.expected_overlays {
+        let actual = &analysis["overlays"];
+        let mut actual_names = actual
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|overlay| overlay["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let mut expected_names = expected.clone();
+        actual_names.sort();
+        expected_names.sort();
+        results.push(spatial_assertion_result(
+            frame_index,
+            "overlays",
+            actual_names == expected_names,
+            json!(expected_names),
+            json!(actual_names),
+        ));
+    }
+    for (name, expected) in &sample.expected_targets {
+        let actual = analysis["interaction_targets"]
+            .as_array()
+            .and_then(|targets| targets.iter().find(|target| target["name"] == *name));
+        let passed = expected_target_matches(profile, expected, actual);
+        results.push(spatial_assertion_result(
+            frame_index,
+            &format!("target:{name}"),
+            passed,
+            serde_json::to_value(expected).unwrap_or(Value::Null),
+            actual.cloned().unwrap_or(Value::Null),
+        ));
+    }
+    if let Some(expected) = &sample.expected_ai_handoff {
+        let actual = &analysis["ai_handoff"];
+        let passed = expected_handoff_matches(expected, actual);
+        results.push(spatial_assertion_result(
+            frame_index,
+            "ai_handoff",
+            passed,
+            serde_json::to_value(expected).unwrap_or(Value::Null),
+            actual.clone(),
+        ));
+    }
+    results
+}
+
+fn spatial_assertion_result(
+    frame: usize,
+    target: &str,
+    passed: bool,
+    expected: Value,
+    actual: Value,
+) -> Value {
+    let mut result = json!({
+        "frame":frame,
+        "target":target,
+        "passed":passed,
+        "reason":if passed { "matched" } else { "spatial analysis mismatch" },
+    });
+    result["expected"] = expected;
+    result["actual"] = actual;
+    result
+}
+
+fn expected_frame_matches(expected: &ExpectedFrameIdentity, actual: &Value) -> bool {
+    actual["width"].as_u64() == Some(u64::from(expected.width))
+        && actual["height"].as_u64() == Some(u64::from(expected.height))
+        && actual["sha256"]
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&expected.sha256))
+        && actual["layout_compatible"].as_bool() == Some(expected.layout_compatible)
+        && actual["coordinate_system"] == "top_left_origin"
+}
+
+fn expected_scene_matches(expected: &ExpectedScene, actual: &Value) -> bool {
+    if actual["status"] != expected.status {
+        return false;
+    }
+    if expected
+        .name
+        .as_ref()
+        .is_some_and(|name| actual["name"] != *name)
+    {
+        return false;
+    }
+    expected.minimum_confidence.is_none_or(|minimum| {
+        actual["confidence"]
+            .as_f64()
+            .is_some_and(|confidence| confidence >= f64::from(minimum))
+    })
+}
+
+fn expected_target_matches(
+    profile: &Profile,
+    expected: &ExpectedTarget,
+    actual: Option<&Value>,
+) -> bool {
+    if expected.visibility == "absent" {
+        return actual.is_none();
+    }
+    let Some(actual) = actual else {
+        return false;
+    };
+    if actual["visibility"] != expected.visibility {
+        return false;
+    }
+    if let Some(scene_name) = &expected.scene {
+        let Some(scene) = profile
+            .scenes
+            .iter()
+            .find(|scene| scene.name == *scene_name)
+        else {
+            return false;
+        };
+        if actual["scene_id"] != scene.id.to_string() {
+            return false;
+        }
+    }
+    if let Some(overlay_name) = &expected.overlay {
+        let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.name == *overlay_name)
+        else {
+            return false;
+        };
+        if actual["overlay_id"] != overlay.id.to_string() {
+            return false;
+        }
+    }
+    if expected
+        .role
+        .as_ref()
+        .is_some_and(|role| actual["role"] != *role)
+    {
+        return false;
+    }
+    if expected
+        .caution_class
+        .as_ref()
+        .is_some_and(|class| actual["interaction"]["caution_class"] != *class)
+    {
+        return false;
+    }
+    if let Some(rectangle) = expected.rectangle {
+        if !pixel_rectangle_matches(
+            rectangle,
+            &actual["region"]["pixels"],
+            expected.pixel_tolerance,
+        ) {
+            return false;
+        }
+    }
+    if let Some(point) = expected.safe_point {
+        if !pixel_component_matches(
+            point.x,
+            actual["interaction"]["point_pixels"]["x"].as_u64(),
+            expected.pixel_tolerance,
+        ) || !pixel_component_matches(
+            point.y,
+            actual["interaction"]["point_pixels"]["y"].as_u64(),
+            expected.pixel_tolerance,
+        ) {
+            return false;
+        }
+    }
+    expected.caution_contains.as_ref().is_none_or(|needle| {
+        actual["interaction"]["caution"]
+            .as_str()
+            .is_some_and(|caution| caution.contains(needle))
+    })
+}
+
+fn pixel_rectangle_matches(
+    expected: yash_app_events_engine::suite::PixelRectangle,
+    actual: &Value,
+    tolerance: u32,
+) -> bool {
+    pixel_component_matches(expected.x, actual["x"].as_u64(), tolerance)
+        && pixel_component_matches(expected.y, actual["y"].as_u64(), tolerance)
+        && pixel_component_matches(expected.width, actual["width"].as_u64(), tolerance)
+        && pixel_component_matches(expected.height, actual["height"].as_u64(), tolerance)
+}
+
+fn pixel_component_matches(expected: u32, actual: Option<u64>, tolerance: u32) -> bool {
+    actual
+        .and_then(|value| u32::try_from(value).ok())
+        .is_some_and(|value| value.abs_diff(expected) <= tolerance)
+}
+
+fn expected_handoff_matches(expected: &ExpectedAiHandoff, actual: &Value) -> bool {
+    let reason_matches = match &expected.reason {
+        Some(reason) => actual["reason"] == *reason,
+        None => actual["reason"].is_null(),
+    };
+    let crop_names = actual["suggested_crops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|crop| crop["name"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    actual["json_sufficient"].as_bool() == Some(expected.json_sufficient)
+        && actual["visual_review_recommended"].as_bool() == Some(expected.visual_review_recommended)
+        && actual["full_frame_recommended"].as_bool() == Some(expected.full_frame_recommended)
+        && actual["image_bytes_included"].as_bool() == Some(false)
+        && reason_matches
+        && crop_names == expected.suggested_crop_names
 }
 
 fn suite_event_metrics(
@@ -2144,8 +2551,15 @@ fn prepare_suite_frame(
     sequence: usize,
 ) -> Result<Arc<Frame>, RpcError> {
     let image = decode_suite_png(&safe_suite_path(root, &sample.image)?)?;
-    let width = profile.layout.reference_width;
-    let height = profile.layout.reference_height;
+    let reference_width = profile.layout.reference_width;
+    let reference_height = profile.layout.reference_height;
+    let spatial_full_frame =
+        matches!(sample.placement, FramePlacement::FullFrame) && sample.expected_frame.is_some();
+    let (width, height) = if spatial_full_frame {
+        (image.width, image.height)
+    } else {
+        (reference_width, reference_height)
+    };
     let mut canvas = vec![
         0_u8;
         usize::try_from(width)
@@ -2155,7 +2569,7 @@ fn prepare_suite_frame(
     ];
     match &sample.placement {
         FramePlacement::FullFrame => {
-            if image.width != width || image.height != height {
+            if !spatial_full_frame && (image.width != width || image.height != height) {
                 return Err(RpcError::new(
                     error_code::INVALID_PARAMS,
                     "full-frame fixture must match the profile reference resolution",
@@ -2231,7 +2645,7 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
     if fs::metadata(path).map_err(internal_error)?.len() > 16 * 1024 * 1024 {
         return Err(RpcError::new(
             error_code::INVALID_PARAMS,
-            "suite PNG exceeds 16 MiB",
+            "PNG exceeds 16 MiB",
         ));
     }
     let mut decoder = png::Decoder::new(std::io::BufReader::new(
@@ -2242,10 +2656,7 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
     let mut output = vec![
         0;
         reader.output_buffer_size().ok_or_else(|| {
-            RpcError::new(
-                error_code::INVALID_PARAMS,
-                "suite PNG exceeds decoder limits",
-            )
+            RpcError::new(error_code::INVALID_PARAMS, "PNG exceeds decoder limits")
         })?
     ];
     let info = reader.next_frame(&mut output).map_err(internal_error)?;
@@ -2255,10 +2666,7 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
         || info.height > 4_096
         || info.bit_depth != png::BitDepth::Eight
     {
-        return Err(RpcError::new(
-            error_code::INVALID_PARAMS,
-            "unsupported suite PNG",
-        ));
+        return Err(RpcError::new(error_code::INVALID_PARAMS, "unsupported PNG"));
     }
     let data = &output[..info.buffer_size()];
     let pixels = match info.color_type {
@@ -2278,7 +2686,7 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
         png::ColorType::Indexed => {
             return Err(RpcError::new(
                 error_code::INVALID_PARAMS,
-                "suite PNG must be grayscale, RGB, or RGBA",
+                "PNG must be grayscale, RGB, or RGBA",
             ))
         }
     };
@@ -2287,6 +2695,637 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
         height: info.height,
         pixels,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_image(state: &State, params: &AnalyzeImageParams) -> Result<Value, RpcError> {
+    if !(100..=120_000).contains(&params.timeout_ms) {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "timeout_ms must be within 100..=120000",
+        ));
+    }
+    let profile = state
+        .profiles
+        .load(params.profile_id)
+        .map_err(store_error)?;
+    let directory = state.profiles.profile_directory(profile.id);
+    analyze_image_with_profile(&profile, &directory, &params.path, params.timeout_ms)
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_image_with_profile(
+    profile: &Profile,
+    directory: &Path,
+    path: &Path,
+    timeout_ms: u64,
+) -> Result<Value, RpcError> {
+    let started = Instant::now();
+    let image = decode_suite_png(path)?;
+    let frame = Frame::new(
+        0,
+        Duration::ZERO,
+        FrameLayout {
+            width: image.width,
+            height: image.height,
+            row_stride: usize::try_from(image.width)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4),
+            format: PixelFormat::Rgba8,
+        },
+        Some("one-shot-png".into()),
+        Arc::from(image.pixels),
+    )
+    .map_err(internal_error)?;
+    let mut pipeline = build_profile_pipeline(profile.clone(), directory, 10)?;
+    let mut processed = Vec::new();
+    let mut observations = HashMap::new();
+    for (element_id, processor) in pipeline.processor_ids.iter().zip(&mut pipeline.processors) {
+        if pipeline.scene_model_enabled && !pipeline.anchor_ids.contains(element_id) {
+            continue;
+        }
+        if started.elapsed() > Duration::from_millis(timeout_ms) {
+            return Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                "image analysis timed out",
+            ));
+        }
+        if let Some(item) = processor.process(&frame) {
+            observations.insert(item.observation.element_id, item.observation.clone());
+            processed.push(item);
+        }
+    }
+    let samples = profile
+        .scenes
+        .iter()
+        .map(|scene| scene.required_samples)
+        .chain(
+            profile
+                .overlays
+                .iter()
+                .map(|overlay| overlay.required_samples),
+        )
+        .max()
+        .unwrap_or(1);
+    let mut resolver = SceneResolver::new(profile.scenes.clone(), profile.overlays.clone());
+    let mut resolution = SceneResolution {
+        scene: None,
+        overlays: Vec::new(),
+        ambiguous: false,
+        candidates: Vec::new(),
+        overlay_candidates: Vec::new(),
+    };
+    for _ in 0..samples {
+        resolution = resolver.resolve(&observations);
+    }
+    let active_element_ids = active_element_ids(profile, &resolution);
+    if pipeline.scene_model_enabled {
+        for (element_id, processor) in pipeline.processor_ids.iter().zip(&mut pipeline.processors) {
+            if pipeline.anchor_ids.contains(element_id) || !active_element_ids.contains(element_id)
+            {
+                continue;
+            }
+            if started.elapsed() > Duration::from_millis(timeout_ms) {
+                return Err(RpcError::new(
+                    error_code::INTERNAL_ERROR,
+                    "image analysis timed out",
+                ));
+            }
+            if let Some(item) = processor.process(&frame) {
+                observations.insert(item.observation.element_id, item.observation.clone());
+                processed.push(item);
+            }
+        }
+    }
+    let mut serialized_observations = observations
+        .iter()
+        .map(|(id, observation)| {
+            (
+                id.to_string(),
+                serde_json::to_value(observation).unwrap_or(Value::Null),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut derived_observations = Vec::new();
+    for derived in &pipeline.derived {
+        if let Some(observation) = compose_observation(derived, &serialized_observations, 0) {
+            serialized_observations.insert(
+                observation.element_id.to_string(),
+                serde_json::to_value(&observation).map_err(internal_error)?,
+            );
+            observations.insert(observation.element_id, observation.clone());
+            derived_observations.push(json!({
+                "id":derived.id,
+                "name":derived.name,
+                "status":observation.status,
+                "value":observation.value,
+                "confidence":observation.confidence,
+                "diagnostic":observation.diagnostic,
+            }));
+        }
+    }
+    let required_element_ids = required_element_ids(profile, &resolution);
+    let mut elements = Vec::new();
+    let mut valid_elements = 0_usize;
+    let mut missing_required_elements = Vec::new();
+    let mut suggested_crops = Vec::new();
+    let mut retry_requests = Vec::new();
+    for element in profile
+        .elements
+        .iter()
+        .filter(|element| element.enabled && active_element_ids.contains(&element.id))
+    {
+        let pixels = normalized_to_pixels(element.region, frame.width, frame.height)
+            .map_err(internal_error)?;
+        let observation = observations.get(&element.id);
+        let scene_id = resolution.scene.as_ref().and_then(|active| {
+            profile
+                .scenes
+                .iter()
+                .find(|scene| scene.id == active.id && scene.element_ids.contains(&element.id))
+                .map(|scene| scene.id)
+        });
+        let overlay_ids = resolution
+            .overlays
+            .iter()
+            .filter_map(|active| {
+                profile
+                    .overlays
+                    .iter()
+                    .find(|overlay| {
+                        overlay.id == active.id && overlay.element_ids.contains(&element.id)
+                    })
+                    .map(|overlay| overlay.id)
+            })
+            .collect::<Vec<_>>();
+        let mut status = observation.map_or("missing", |value| match value.status {
+            yash_app_events_engine::ObservationStatus::Valid => "valid",
+            yash_app_events_engine::ObservationStatus::Unknown => "unknown",
+            yash_app_events_engine::ObservationStatus::Error => "error",
+        });
+        if let Some(request) = observation_retry_request(element, observation) {
+            status = "unknown";
+            retry_requests.push(request);
+        }
+        if status == "valid" {
+            valid_elements = valid_elements.saturating_add(1);
+        } else if required_element_ids.contains(&element.id) {
+            missing_required_elements.push(element.name.clone());
+            suggested_crops.push(json!({
+                "reason": format!("{} is {status}", element.name),
+                "element_id": element.id,
+                "name": element.name,
+                "rect_pixels": pixel_region_json(pixels),
+            }));
+        }
+        elements.push(json!({
+            "id": element.id,
+            "name": element.name,
+            "role":"observation",
+            "scene_id":scene_id,
+            "overlay_ids":overlay_ids,
+            "visibility":if status == "valid" { "visible" } else { "unknown" },
+            "region":{"normalized":element.region,"pixels":pixel_region_json(pixels)},
+            "observation":{
+                "status":status,
+                "value":observation.map(|value| &value.value),
+                "confidence":observation.and_then(|value| value.confidence),
+                "diagnostic":observation.map_or("not scheduled", |value| value.diagnostic.as_str()),
+            },
+        }));
+    }
+
+    let interaction_targets = active_interaction_targets(profile, &resolution)
+        .into_iter()
+        .filter_map(|target| {
+            let pixels = normalized_to_pixels(target.region, frame.width, frame.height)
+                .map_err(internal_error);
+            let pixels = match pixels {
+                Ok(pixels) => pixels,
+                Err(error) => return Some(Err(error)),
+            };
+            let visibility_confidence = target
+                .visibility
+                .as_ref()
+                .map(|expression| recognition_confidence(expression, &observations));
+            if visibility_confidence == Some(Some(0.0)) {
+                return None;
+            }
+            let scene_id = resolution.scene.as_ref().and_then(|active| {
+                profile
+                    .scenes
+                    .iter()
+                    .find(|scene| {
+                        scene.id == active.id
+                            && scene
+                                .interaction_targets
+                                .iter()
+                                .any(|candidate| candidate.id == target.id)
+                    })
+                    .map(|scene| scene.id)
+            });
+            let overlay_id = resolution.overlays.iter().find_map(|active| {
+                profile
+                    .overlays
+                    .iter()
+                    .find(|overlay| {
+                        overlay.id == active.id
+                            && overlay
+                                .interaction_targets
+                                .iter()
+                                .any(|candidate| candidate.id == target.id)
+                    })
+                    .map(|overlay| overlay.id)
+            });
+            if visibility_confidence == Some(None) {
+                if target.required_for_json {
+                    missing_required_elements.push(target.name.clone());
+                    suggested_crops.push(json!({
+                        "reason":"target visibility is unresolved",
+                        "name":target.name,
+                        "target_id":target.id,
+                        "rect_pixels":pixel_region_json(pixels),
+                    }));
+                }
+                return None;
+            }
+            let point = target.interaction_point.map(|point| {
+                let (x, y, source) = match point {
+                    yash_app_events_profile::InteractionPoint::Explicit { x, y } => {
+                        (x, y, "explicit")
+                    }
+                    yash_app_events_profile::InteractionPoint::Center => (
+                        target.region.x + target.region.width / 2.0,
+                        target.region.y + target.region.height / 2.0,
+                        "center",
+                    ),
+                };
+                json!({
+                    "source": source,
+                    "normalized": {"x":x,"y":y},
+                    "pixels": normalized_point_to_pixels(x, y, frame.width, frame.height),
+                })
+            });
+            Some(Ok(json!({
+                "id": target.id,
+                "name": target.name,
+                "role": target.role,
+                "scene_id":scene_id,
+                "overlay_id":overlay_id,
+                "visibility":"visible",
+                "confidence":visibility_confidence.flatten(),
+                "region":{"normalized":target.region,"pixels":pixel_region_json(pixels)},
+                "interaction": {
+                    "kind":"click",
+                    "configured":point.is_some(),
+                    "point_normalized":point.as_ref().map(|value| &value["normalized"]),
+                    "point_pixels":point.as_ref().map(|value| &value["pixels"]),
+                    "source":point.as_ref().map(|value| &value["source"]),
+                    "caution_class":target.caution_class,
+                    "caution":target.caution,
+                },
+                "required_for_json": target.required_for_json,
+            })))
+        })
+        .collect::<Result<Vec<_>, RpcError>>()?;
+
+    if resolution.ambiguous || (!profile.scenes.is_empty() && resolution.scene.is_none()) {
+        suggested_crops.extend(anchor_crops(profile, frame.width, frame.height)?);
+    }
+    // A lower-confidence candidate that is close to its own threshold is
+    // actionable uncertainty only when it could materially compete with the
+    // already-resolved overlay. Specialized higher-confidence overlays are
+    // allowed to suppress their generic fallbacks without forcing a crop-first
+    // handoff for the same target.
+    let strongest_active_overlay = resolution
+        .overlays
+        .iter()
+        .map(|overlay| overlay.confidence)
+        .max_by(f32::total_cmp);
+    let overlay_uncertain = resolution.overlay_candidates.iter().any(|candidate| {
+        let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == candidate.id)
+        else {
+            return false;
+        };
+        let close_to_threshold = candidate.confidence >= overlay.minimum_confidence * 0.8;
+        let materially_competes =
+            strongest_active_overlay.is_some_and(|active| active - candidate.confidence < 0.10);
+        !candidate.eligible && close_to_threshold && materially_competes
+    });
+    if overlay_uncertain {
+        suggested_crops.extend(anchor_crops(profile, frame.width, frame.height)?);
+    }
+    suggested_crops.truncate(8);
+    #[allow(clippy::cast_precision_loss)]
+    let coverage = if elements.is_empty() {
+        1.0
+    } else {
+        valid_elements as f64 / elements.len() as f64
+    };
+    let bytes = fs::read(path).map_err(internal_error)?;
+    let frame_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let layout_compatible = layout_is_compatible(profile, frame.width, frame.height);
+    if !layout_compatible {
+        suggested_crops.clear();
+    }
+    let handoff = handoff_decision(
+        layout_compatible,
+        !profile.scenes.is_empty(),
+        &resolution,
+        overlay_uncertain,
+        &missing_required_elements,
+    );
+    let derived_count = derived_observations.len();
+    let gated_count = pipeline.processors.len().saturating_sub(processed.len());
+    let scene_value = resolution.scene.as_ref().map_or_else(
+        || {
+            json!({
+                "status":if resolution.ambiguous { "ambiguous" } else { "unknown" },
+                "confidence":Value::Null,
+                "candidates":resolution.candidates,
+            })
+        },
+        |scene| {
+            json!({
+                "id":scene.id,
+                "name":scene.name,
+                "status":"recognized",
+                "confidence":scene.confidence,
+                "candidates":resolution.candidates,
+            })
+        },
+    );
+    let handoff_reason = if handoff.json_sufficient {
+        Value::Null
+    } else {
+        json!(handoff.reason)
+    };
+    Ok(json!({
+        "schema": 1,
+        "profile_id":profile.id,
+        "profile_revision":profile.revision,
+        "profile": {"id":profile.id,"name":profile.name,"revision":profile.revision,"schema":profile.schema},
+        "frame": {"width":frame.width,"height":frame.height,"pixel_format":"rgba8","coordinate_system":"top_left_origin","sha256":frame_sha256,"layout_compatible":layout_compatible},
+        "scene": scene_value,
+        "overlays": resolution.overlays,
+        "overlay_candidates": resolution.overlay_candidates,
+        "scene_ambiguous": resolution.ambiguous,
+        "elements": elements,
+        "derived_observations": derived_observations,
+        "interaction_targets": interaction_targets,
+        "analysis": {
+            "evaluated_detectors":processed.len(),
+            "gated_detectors":gated_count,
+            "derived_observations":derived_count,
+            "elapsed_ms":u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+        "ai_handoff": {
+            "json_sufficient": handoff.json_sufficient,
+            "visual_review_recommended": !handoff.json_sufficient,
+            "reason": handoff_reason,
+            "coverage": coverage,
+            "missing_required_elements": missing_required_elements,
+            "suggested_crops": suggested_crops,
+            "retry": {
+                "recommended": !retry_requests.is_empty(),
+                "requests": retry_requests,
+            },
+            "full_frame_recommended": handoff.full_frame_recommended,
+            "image_bytes_included": false,
+        },
+        "diagnostics":[],
+    }))
+}
+
+fn observation_retry_request(
+    element: &yash_app_events_profile::Element,
+    observation: Option<&Observation>,
+) -> Option<Value> {
+    let ProfileDetector::Ocr {
+        retry: Some(retry), ..
+    } = &element.detector
+    else {
+        return None;
+    };
+    let valid = observation.is_some_and(|observation| {
+        observation.status == yash_app_events_engine::ObservationStatus::Valid
+            && match (&retry.expected_format, &observation.value) {
+                (OcrExpectedFormat::HhMmSs, ObservationValue::Text(value)) => is_hh_mm_ss(value),
+                _ => false,
+            }
+    });
+    (!valid).then(|| {
+        json!({
+            "element_id": element.id,
+            "name": element.name,
+            "after_ms": retry.after_ms,
+            "maximum_attempts": retry.maximum_attempts,
+            "reason": "transient_occlusion_or_malformed_text",
+        })
+    })
+}
+
+fn is_hh_mm_ss(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 8
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit())
+        && value[3..5].parse::<u8>().is_ok_and(|minutes| minutes < 60)
+        && value[6..8].parse::<u8>().is_ok_and(|seconds| seconds < 60)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HandoffDecision {
+    json_sufficient: bool,
+    reason: &'static str,
+    full_frame_recommended: bool,
+}
+
+fn layout_is_compatible(profile: &Profile, width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let frame_aspect = f64::from(width) / f64::from(height);
+    let reference_aspect =
+        f64::from(profile.layout.reference_width) / f64::from(profile.layout.reference_height);
+    let aspect_compatible = ((frame_aspect - reference_aspect) / reference_aspect).abs() <= 0.05;
+    let dimensions_compatible = !profile.layout.require_reference_dimensions
+        || (width == profile.layout.reference_width && height == profile.layout.reference_height);
+    aspect_compatible && dimensions_compatible
+}
+
+fn handoff_decision(
+    layout_compatible: bool,
+    has_scene_model: bool,
+    resolution: &SceneResolution,
+    overlay_uncertain: bool,
+    missing_required_elements: &[String],
+) -> HandoffDecision {
+    let reason = if !layout_compatible {
+        "layout_incompatible"
+    } else if resolution.ambiguous {
+        "scene_ambiguous"
+    } else if has_scene_model && resolution.scene.is_none() && resolution.overlays.is_empty() {
+        "scene_unknown"
+    } else if overlay_uncertain {
+        "overlay_uncertain"
+    } else if !missing_required_elements.is_empty() {
+        "required_elements_unresolved"
+    } else {
+        "json_complete"
+    };
+    HandoffDecision {
+        json_sufficient: reason == "json_complete",
+        reason,
+        full_frame_recommended: matches!(reason, "layout_incompatible" | "scene_unknown"),
+    }
+}
+
+fn active_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSet<ElementId> {
+    if profile.scenes.is_empty() && profile.overlays.is_empty() {
+        return profile.elements.iter().map(|element| element.id).collect();
+    }
+    let mut ids = profile
+        .global_elements
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    for expression in profile
+        .scenes
+        .iter()
+        .map(|scene| &scene.recognition)
+        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+    {
+        let conditions = match expression {
+            yash_app_events_profile::RecognitionExpression::All { conditions }
+            | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
+        };
+        ids.extend(conditions.iter().map(|condition| condition.element_id));
+    }
+    if let Some(active) = &resolution.scene {
+        if let Some(scene) = profile.scenes.iter().find(|scene| scene.id == active.id) {
+            ids.extend(scene.element_ids.iter().copied());
+        }
+    }
+    for active in &resolution.overlays {
+        if let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == active.id)
+        {
+            ids.extend(overlay.element_ids.iter().copied());
+        }
+    }
+    for target in active_interaction_targets(profile, resolution) {
+        if let Some(visibility) = &target.visibility {
+            let conditions = match visibility {
+                yash_app_events_profile::RecognitionExpression::All { conditions }
+                | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
+            };
+            ids.extend(conditions.iter().map(|condition| condition.element_id));
+        }
+    }
+    ids
+}
+
+fn required_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSet<ElementId> {
+    let mut ids = HashSet::new();
+    if let Some(active) = &resolution.scene {
+        if let Some(scene) = profile.scenes.iter().find(|scene| scene.id == active.id) {
+            ids.extend(scene.required_element_ids.iter().copied());
+        }
+    }
+    for active in &resolution.overlays {
+        if let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == active.id)
+        {
+            ids.extend(overlay.required_element_ids.iter().copied());
+        }
+    }
+    ids
+}
+
+fn active_interaction_targets<'a>(
+    profile: &'a Profile,
+    resolution: &SceneResolution,
+) -> Vec<&'a yash_app_events_profile::InteractionTarget> {
+    let mut targets = Vec::new();
+    let scene_blocked = resolution.overlays.iter().any(|active| {
+        profile
+            .overlays
+            .iter()
+            .any(|overlay| overlay.id == active.id && overlay.blocks_scene_targets)
+    });
+    if !scene_blocked {
+        if let Some(active) = &resolution.scene {
+            if let Some(scene) = profile.scenes.iter().find(|scene| scene.id == active.id) {
+                targets.extend(&scene.interaction_targets);
+            }
+        }
+    }
+    for active in &resolution.overlays {
+        if let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == active.id)
+        {
+            targets.extend(&overlay.interaction_targets);
+        }
+    }
+    targets
+}
+
+fn anchor_crops(profile: &Profile, width: u32, height: u32) -> Result<Vec<Value>, RpcError> {
+    let anchor_ids = profile
+        .scenes
+        .iter()
+        .map(|scene| &scene.recognition)
+        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+        .flat_map(|expression| match expression {
+            yash_app_events_profile::RecognitionExpression::All { conditions }
+            | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
+        })
+        .map(|condition| condition.element_id)
+        .collect::<HashSet<_>>();
+    profile
+        .elements
+        .iter()
+        .filter(|element| anchor_ids.contains(&element.id))
+        .map(|element| {
+            let pixels =
+                normalized_to_pixels(element.region, width, height).map_err(internal_error)?;
+            Ok(json!({
+                "reason":"resolve_scene_ambiguity",
+                "element_id":element.id,
+                "name":element.name,
+                "rect_pixels":pixel_region_json(pixels),
+            }))
+        })
+        .collect()
+}
+
+fn pixel_region_json(region: yash_app_events_engine::PixelRegion) -> Value {
+    json!({"x":region.x,"y":region.y,"width":region.width,"height":region.height})
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn normalized_point_to_pixels(x: f32, y: f32, width: u32, height: u32) -> Value {
+    let pixel_x = (f64::from(x) * f64::from(width))
+        .floor()
+        .clamp(0.0, f64::from(width.saturating_sub(1))) as u32;
+    let pixel_y = (f64::from(y) * f64::from(height))
+        .floor()
+        .clamp(0.0, f64::from(height.saturating_sub(1))) as u32;
+    json!({"x":pixel_x,"y":pixel_y})
 }
 
 fn blit_scaled(
@@ -3361,6 +4400,20 @@ fn process_running(needle: &str) -> bool {
 #[derive(Debug)]
 struct LivePipeline {
     processors: Vec<FrameProcessor<ConfiguredDetector, NoopRule>>,
+    processor_ids: Vec<ElementId>,
+    anchor_ids: HashSet<ElementId>,
+    scene_elements: HashMap<SceneId, HashSet<ElementId>>,
+    overlay_elements: HashMap<OverlayId, HashSet<ElementId>>,
+    scene_resolver: SceneResolver,
+    scene_model_enabled: bool,
+    latest_anchors: HashMap<ElementId, Observation>,
+    scene_resolution: SceneResolution,
+    scene_resolution_initialized: bool,
+    published_scene: Option<SceneId>,
+    published_overlays: HashSet<OverlayId>,
+    last_evaluated_detectors: usize,
+    last_gated_detectors: usize,
+    last_throttled_detectors: usize,
     rules: Vec<CoordinatedRule>,
     derived: Vec<yash_app_events_profile::DerivedObservation>,
     initial_events: Vec<String>,
@@ -3370,6 +4423,69 @@ struct LivePipeline {
     profile_sha256: String,
     collection_aliases: HashMap<ElementId, String>,
     collection_policy: CollectionPolicy,
+}
+
+impl LivePipeline {
+    fn process_scene_aware(&mut self, frame: &Frame) -> Vec<ProcessedFrame> {
+        if !self.scene_model_enabled {
+            let processed = self
+                .processors
+                .iter_mut()
+                .filter_map(|processor| processor.process(frame))
+                .collect::<Vec<_>>();
+            self.last_evaluated_detectors = processed.len();
+            self.last_gated_detectors = 0;
+            self.last_throttled_detectors = self.processors.len().saturating_sub(processed.len());
+            return processed;
+        }
+
+        let mut processed = Vec::new();
+        let mut anchors_updated = false;
+        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
+            if !self.anchor_ids.contains(element_id) {
+                continue;
+            }
+            if let Some(item) = processor.process(frame) {
+                self.latest_anchors
+                    .insert(item.observation.element_id, item.observation.clone());
+                processed.push(item);
+                anchors_updated = true;
+            }
+        }
+        if anchors_updated || !self.scene_resolution_initialized {
+            self.scene_resolution = self.scene_resolver.resolve(&self.latest_anchors);
+            self.scene_resolution_initialized = true;
+        }
+
+        let mut active = self.anchor_ids.clone();
+        if let Some(scene) = &self.scene_resolution.scene {
+            if let Some(elements) = self.scene_elements.get(&scene.id) {
+                active.extend(elements);
+            }
+        }
+        for overlay in &self.scene_resolution.overlays {
+            if let Some(elements) = self.overlay_elements.get(&overlay.id) {
+                active.extend(elements);
+            }
+        }
+        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
+            if self.anchor_ids.contains(element_id) || !active.contains(element_id) {
+                continue;
+            }
+            if let Some(item) = processor.process(frame) {
+                processed.push(item);
+            }
+        }
+        let eligible_detectors = self
+            .processor_ids
+            .iter()
+            .filter(|element_id| active.contains(element_id))
+            .count();
+        self.last_evaluated_detectors = processed.len();
+        self.last_gated_detectors = self.processors.len().saturating_sub(eligible_detectors);
+        self.last_throttled_detectors = eligible_detectors.saturating_sub(processed.len());
+        processed
+    }
 }
 
 #[derive(Debug)]
@@ -3462,6 +4578,7 @@ fn build_live_pipeline(state: &State, profile_id: ProfileId) -> Result<LivePipel
     Ok(pipeline)
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_profile_pipeline(
     profile: Profile,
     directory: &Path,
@@ -3480,6 +4597,12 @@ fn build_profile_pipeline(
                 .map(|derived| (derived.id, suite_alias(&derived.name))),
         )
         .collect();
+    let processor_ids = profile
+        .elements
+        .iter()
+        .filter(|element| element.enabled)
+        .map(|element| element.id)
+        .collect::<Vec<_>>();
     let processors = profile
         .elements
         .iter()
@@ -3501,6 +4624,41 @@ fn build_profile_pipeline(
             "active profile has no enabled element",
         ));
     }
+    let recognition_ids = profile
+        .scenes
+        .iter()
+        .map(|scene| &scene.recognition)
+        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+        .flat_map(|expression| match expression {
+            yash_app_events_profile::RecognitionExpression::All { conditions }
+            | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
+        })
+        .map(|condition| condition.element_id);
+    let anchor_ids = profile
+        .global_elements
+        .iter()
+        .copied()
+        .chain(recognition_ids)
+        .collect::<HashSet<_>>();
+    let scene_elements = profile
+        .scenes
+        .iter()
+        .map(|scene| (scene.id, scene.element_ids.iter().copied().collect()))
+        .collect();
+    let overlay_elements = profile
+        .overlays
+        .iter()
+        .map(|overlay| (overlay.id, overlay.element_ids.iter().copied().collect()))
+        .collect();
+    let scene_model_enabled = !profile.scenes.is_empty() || !profile.overlays.is_empty();
+    let scene_resolver = SceneResolver::new(profile.scenes.clone(), profile.overlays.clone());
+    let scene_resolution = SceneResolution {
+        scene: None,
+        overlays: Vec::new(),
+        ambiguous: false,
+        candidates: Vec::new(),
+        overlay_candidates: Vec::new(),
+    };
     let rules = profile
         .rules
         .iter()
@@ -3508,6 +4666,20 @@ fn build_profile_pipeline(
         .collect::<Result<Vec<_>, RpcError>>()?;
     Ok(LivePipeline {
         processors,
+        processor_ids,
+        anchor_ids,
+        scene_elements,
+        overlay_elements,
+        scene_resolver,
+        scene_model_enabled,
+        latest_anchors: HashMap::new(),
+        scene_resolution,
+        scene_resolution_initialized: false,
+        published_scene: None,
+        published_overlays: HashSet::new(),
+        last_evaluated_detectors: 0,
+        last_gated_detectors: 0,
+        last_throttled_detectors: 0,
         rules,
         derived: profile
             .derived_observations
@@ -3635,6 +4807,7 @@ fn build_coordinated_rule(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
     let (stop, mut stopped) = oneshot::channel();
     *state
@@ -3670,8 +4843,37 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
                     let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
                     let mut collection_observations = BTreeMap::new();
                     let mut collection_transitions = Vec::new();
-                    for processor in &mut pipeline.processors {
-                        let Some(processed) = processor.process(&frame) else { continue; };
+                    let processed_frames = pipeline.process_scene_aware(&frame);
+                    publication.context = json!({
+                        "scene": pipeline.scene_resolution.scene,
+                        "overlays": pipeline.scene_resolution.overlays,
+                        "ambiguous": pipeline.scene_resolution.ambiguous,
+                        "candidates": pipeline.scene_resolution.candidates,
+                        "overlay_candidates": pipeline.scene_resolution.overlay_candidates,
+                        "detectors": {
+                            "evaluated":pipeline.last_evaluated_detectors,
+                            "gated":pipeline.last_gated_detectors,
+                            "throttled":pipeline.last_throttled_detectors,
+                        },
+                    });
+                    let current_scene = pipeline.scene_resolution.scene.as_ref().map(|scene| scene.id);
+                    let current_overlays = pipeline.scene_resolution.overlays.iter().map(|overlay| overlay.id).collect::<HashSet<_>>();
+                    if current_scene != pipeline.published_scene || current_overlays != pipeline.published_overlays {
+                        if let Err(error) = publish_context_transition(
+                            &task_state,
+                            &pipeline.profile_id,
+                            &pipeline.game,
+                            pipeline.published_scene,
+                            &pipeline.published_overlays,
+                            &pipeline.scene_resolution,
+                            Utc::now(),
+                        ) {
+                            set_output_error(&task_state, &format!("{}: {}", error.code, error.message));
+                        }
+                        pipeline.published_scene = current_scene;
+                        pipeline.published_overlays = current_overlays;
+                    }
+                    for processed in processed_frames {
                         if let Some(alias) = pipeline.collection_aliases.get(&processed.observation.element_id) {
                             collection_observations.insert(alias.clone(), processed.observation.clone());
                         }
@@ -4297,6 +5499,18 @@ struct DuplicateParams {
 #[derive(Deserialize)]
 struct PathParam {
     path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyzeImageParams {
+    profile_id: ProfileId,
+    path: PathBuf,
+    #[serde(default = "default_analysis_timeout_ms")]
+    timeout_ms: u64,
+}
+
+const fn default_analysis_timeout_ms() -> u64 {
+    5_000
 }
 #[derive(Deserialize)]
 struct CatalogInstallParams {
@@ -5431,10 +6645,207 @@ mod tests {
     }
 
     #[test]
+    fn json_handoff_reasons_are_deterministic_and_crop_first() {
+        let mut resolution = SceneResolution {
+            scene: None,
+            overlays: Vec::new(),
+            ambiguous: false,
+            candidates: Vec::new(),
+            overlay_candidates: Vec::new(),
+        };
+        assert_eq!(
+            handoff_decision(true, true, &resolution, false, &[]).reason,
+            "scene_unknown"
+        );
+        resolution
+            .overlays
+            .push(yash_app_events_engine::ResolvedOverlay {
+                id: yash_app_events_profile::OverlayId::new(),
+                name: "modal".into(),
+                confidence: 1.0,
+            });
+        assert!(handoff_decision(true, true, &resolution, false, &[]).json_sufficient);
+        resolution.overlays.clear();
+        resolution.ambiguous = true;
+        assert_eq!(
+            handoff_decision(true, true, &resolution, false, &[]).reason,
+            "scene_ambiguous"
+        );
+        resolution.ambiguous = false;
+        assert_eq!(
+            handoff_decision(true, false, &resolution, true, &[]).reason,
+            "overlay_uncertain"
+        );
+        let missing = vec!["confirm_button".into()];
+        let missing_decision = handoff_decision(true, false, &resolution, false, &missing);
+        assert_eq!(missing_decision.reason, "required_elements_unresolved");
+        assert!(!missing_decision.full_frame_recommended);
+        let layout = handoff_decision(false, false, &resolution, false, &missing);
+        assert_eq!(layout.reason, "layout_incompatible");
+        assert!(layout.full_frame_recommended);
+        assert!(handoff_decision(true, false, &resolution, false, &[]).json_sufficient);
+    }
+
+    #[test]
+    fn strict_reference_dimensions_reject_same_aspect_resizes() {
+        let mut profile = Profile::new("Strict", "queen_blade", 558, 992);
+        assert!(layout_is_compatible(&profile, 900, 1_600));
+        profile.layout.require_reference_dimensions = true;
+        assert!(layout_is_compatible(&profile, 558, 992));
+        assert!(!layout_is_compatible(&profile, 900, 1_600));
+        assert!(!layout_is_compatible(&profile, 0, 992));
+    }
+
+    #[test]
+    fn blocking_overlay_returns_only_overlay_targets() {
+        let mut profile = Profile::new("Overlay", "queen_blade", 558, 992);
+        let scene_id = yash_app_events_profile::SceneId::new();
+        let overlay_id = yash_app_events_profile::OverlayId::new();
+        let make_target = |name: &str| yash_app_events_profile::InteractionTarget {
+            id: yash_app_events_profile::InteractionTargetId::new(),
+            name: name.into(),
+            role: yash_app_events_profile::InteractionRole::Navigation,
+            region: full_frame_region(),
+            interaction_point: Some(yash_app_events_profile::InteractionPoint::Center),
+            visibility: None,
+            required_for_json: true,
+            caution_class: Some(yash_app_events_profile::InteractionCaution::Navigation),
+            caution: None,
+        };
+        profile.scenes.push(yash_app_events_profile::Scene {
+            id: scene_id,
+            name: "home".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: yash_app_events_profile::RecognitionExpression::All {
+                conditions: Vec::new(),
+            },
+            minimum_confidence: 1.0,
+            ambiguity_margin: 0.1,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: vec![make_target("underlay")],
+            transition_hints: Vec::new(),
+        });
+        profile.overlays.push(yash_app_events_profile::Overlay {
+            id: overlay_id,
+            name: "modal".into(),
+            description: String::new(),
+            enabled: true,
+            blocks_scene_targets: true,
+            priority: 0,
+            recognition: yash_app_events_profile::RecognitionExpression::All {
+                conditions: Vec::new(),
+            },
+            minimum_confidence: 1.0,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: vec![make_target("dismiss")],
+        });
+        let resolution = SceneResolution {
+            scene: Some(yash_app_events_engine::ResolvedScene {
+                id: scene_id,
+                name: "home".into(),
+                confidence: 1.0,
+            }),
+            overlays: vec![yash_app_events_engine::ResolvedOverlay {
+                id: overlay_id,
+                name: "modal".into(),
+                confidence: 1.0,
+            }],
+            ambiguous: false,
+            candidates: Vec::new(),
+            overlay_candidates: Vec::new(),
+        };
+        let names = active_interaction_targets(&profile, &resolution)
+            .into_iter()
+            .map(|target| target.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["dismiss"]);
+    }
+
+    #[test]
+    fn scene_pipeline_skips_detectors_outside_active_context() {
+        let mut profile = Profile::new("Scene gating", "synthetic_game", 10, 2);
+        let element = |name: &str| yash_app_events_profile::Element {
+            id: ElementId::new(),
+            name: name.into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::ColorBar {
+                id: DetectorId::new(),
+                direction: BarDirection::LeftToRight,
+                minimum_rgb: [180, 0, 0],
+                maximum_rgb: [255, 60, 60],
+                mask: None,
+            },
+        };
+        profile.elements = vec![element("anchor"), element("active"), element("skipped")];
+        let anchor_id = profile.elements[0].id;
+        let active_id = profile.elements[1].id;
+        let skipped_id = profile.elements[2].id;
+        profile.scenes.push(yash_app_events_profile::Scene {
+            id: yash_app_events_profile::SceneId::new(),
+            name: "gameplay".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: yash_app_events_profile::RecognitionExpression::All {
+                conditions: vec![yash_app_events_profile::RecognitionCondition {
+                    element_id: anchor_id,
+                    predicate: yash_app_events_profile::AtomicRulePredicate::Boolean {
+                        expected: true,
+                    },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.8,
+            ambiguity_margin: 0.1,
+            required_samples: 2,
+            sample_window: 3,
+            element_ids: vec![active_id],
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+            transition_hints: Vec::new(),
+        });
+        profile.validate().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut pipeline = build_profile_pipeline(profile, directory.path(), 10).unwrap();
+        let frame =
+            synthetic_color_bar_frame(0, 10, BarDirection::LeftToRight, [180, 0, 0], [255, 60, 60])
+                .unwrap();
+        let first = pipeline.process_scene_aware(&frame);
+        assert_eq!(first.len(), 1);
+        assert_eq!(pipeline.last_gated_detectors, 2);
+        assert!(pipeline.scene_resolution.scene.is_none());
+        assert!(pipeline.process_scene_aware(&frame).is_empty());
+        assert!(pipeline.scene_resolution.scene.is_none());
+        let next_frame =
+            synthetic_color_bar_frame(1, 10, BarDirection::LeftToRight, [180, 0, 0], [255, 60, 60])
+                .unwrap();
+        let processed = pipeline.process_scene_aware(&next_frame);
+        let ids = processed
+            .iter()
+            .map(|item| item.observation.element_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids, HashSet::from([anchor_id, active_id]));
+        assert!(!ids.contains(&skipped_id));
+        assert_eq!(pipeline.last_evaluated_detectors, 2);
+        assert_eq!(pipeline.last_gated_detectors, 1);
+        assert_eq!(pipeline.last_throttled_detectors, 0);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn ocr_image_replay_reaches_text_rule_through_common_coordinator() {
         let directory = tempfile::tempdir().unwrap();
-        let (notifications, _) = broadcast::channel(8);
+        let (notifications, mut scene_notifications) = broadcast::channel(8);
         let local_config = LocalConfig::new(directory.path().join("config"));
         let output_routes = routes::Router::spawn(local_config.clone(), notifications.clone());
         let state = State {
@@ -5484,6 +6895,7 @@ mod tests {
                 preprocessing: Vec::new(),
                 empty_value: None,
                 zero_pad_to: None,
+                retry: None,
             },
         });
         profile.rules.push(yash_app_events_profile::EventRule {
@@ -5503,6 +6915,53 @@ mod tests {
             emit_initial: false,
             update_interval_ms: None,
         });
+        profile.elements.push(yash_app_events_profile::Element {
+            id: ElementId::new(),
+            name: "Unscoped detector".into(),
+            enabled: true,
+            color: "#f00".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::ColorBar {
+                id: DetectorId::new(),
+                direction: BarDirection::LeftToRight,
+                minimum_rgb: [180, 0, 0],
+                maximum_rgb: [255, 60, 60],
+                mask: None,
+            },
+        });
+        profile.scenes.push(yash_app_events_profile::Scene {
+            id: yash_app_events_profile::SceneId::new(),
+            name: "result".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: yash_app_events_profile::RecognitionExpression::All {
+                conditions: Vec::new(),
+            },
+            minimum_confidence: 1.0,
+            ambiguity_margin: 0.1,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![element_id],
+            required_element_ids: vec![element_id],
+            interaction_targets: vec![yash_app_events_profile::InteractionTarget {
+                id: yash_app_events_profile::InteractionTargetId::new(),
+                name: "continue".into(),
+                role: yash_app_events_profile::InteractionRole::Navigation,
+                region: NormalizedRegion {
+                    x: 0.25,
+                    y: 0.5,
+                    width: 0.5,
+                    height: 0.25,
+                },
+                interaction_point: Some(yash_app_events_profile::InteractionPoint::Center),
+                visibility: None,
+                required_for_json: true,
+                caution_class: None,
+                caution: None,
+            }],
+            transition_hints: Vec::new(),
+        });
         state.profiles.create(&profile).unwrap();
         let profile_directory = state.profiles.profile_directory(profile.id);
         fs::copy(
@@ -5515,6 +6974,112 @@ mod tests {
             profile_directory.join("victory.png"),
         )
         .unwrap();
+        let analyzed = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: profile.id,
+                path: profile_directory.join("victory.png"),
+                timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(analyzed["frame"]["width"], 640);
+        assert_eq!(analyzed["frame"]["height"], 120);
+        assert_eq!(analyzed["elements"][0]["id"], element_id.to_string());
+        assert_eq!(analyzed["elements"][0]["name"], "Result text");
+        assert_eq!(analyzed["elements"][0]["region"]["pixels"]["width"], 640);
+        assert_eq!(analyzed["interaction_targets"][0]["name"], "continue");
+        assert_eq!(
+            analyzed["interaction_targets"][0]["interaction"]["point_pixels"],
+            json!({"x":320,"y":75})
+        );
+        assert_eq!(analyzed["ai_handoff"]["json_sufficient"], true);
+        assert_eq!(analyzed["ai_handoff"]["image_bytes_included"], false);
+        assert_eq!(analyzed["analysis"]["evaluated_detectors"], 1);
+        assert_eq!(analyzed["analysis"]["gated_detectors"], 1);
+        assert_eq!(*state.latest_snapshot.lock().unwrap(), json!({}));
+        assert_eq!(state.sequence.load(Ordering::Relaxed), 0);
+        let scene_resolution = SceneResolution {
+            scene: Some(yash_app_events_engine::ResolvedScene {
+                id: profile.scenes[0].id,
+                name: profile.scenes[0].name.clone(),
+                confidence: 1.0,
+            }),
+            overlays: Vec::new(),
+            ambiguous: false,
+            candidates: Vec::new(),
+            overlay_candidates: Vec::new(),
+        };
+        publish_context_transition(
+            &state,
+            &profile.id.to_string(),
+            &profile.game,
+            None,
+            &HashSet::new(),
+            &scene_resolution,
+            Utc::now(),
+        )
+        .unwrap();
+        let scene_event = scene_notifications.try_recv().unwrap();
+        assert_eq!(scene_event["event"], "scene_changed");
+        assert_eq!(scene_event["value"]["scene"]["name"], "result");
+        let blank_frame = Frame::new(
+            0,
+            Duration::ZERO,
+            FrameLayout {
+                width: 640,
+                height: 120,
+                row_stride: 640 * 4,
+                format: PixelFormat::Rgba8,
+            },
+            Some("blank".into()),
+            Arc::from(vec![0_u8; 640 * 120 * 4]),
+        )
+        .unwrap();
+        fs::write(
+            profile_directory.join("blank.png"),
+            encode_frame_png(&blank_frame).unwrap(),
+        )
+        .unwrap();
+        let unresolved = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: profile.id,
+                path: profile_directory.join("blank.png"),
+                timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(unresolved["ai_handoff"]["json_sufficient"], false);
+        assert_eq!(
+            unresolved["ai_handoff"]["reason"],
+            "required_elements_unresolved"
+        );
+        assert_eq!(
+            unresolved["ai_handoff"]["suggested_crops"][0]["name"],
+            "Result text"
+        );
+        assert_eq!(unresolved["ai_handoff"]["full_frame_recommended"], false);
+        let mut mismatched = state.profiles.load(profile.id).unwrap();
+        mismatched.layout.reference_width = 100;
+        mismatched.layout.reference_height = 100;
+        state.profiles.commit(mismatched, 0).unwrap();
+        let incompatible = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: profile.id,
+                path: profile_directory.join("victory.png"),
+                timeout_ms: 5_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(incompatible["frame"]["layout_compatible"], false);
+        assert_eq!(incompatible["ai_handoff"]["reason"], "layout_incompatible");
+        assert_eq!(incompatible["ai_handoff"]["full_frame_recommended"], true);
+        assert_eq!(
+            incompatible["ai_handoff"]["suggested_crops"],
+            serde_json::json!([])
+        );
         let diagnostic_frame =
             replay_png_frames(&profile_directory, &[PathBuf::from("localized.png")])
                 .unwrap()
@@ -5932,5 +7497,45 @@ mod tests {
         assert!(safe_suite_path(package.path(), Path::new("inside.png")).is_ok());
         assert!(safe_suite_path(package.path(), Path::new("../outside.png")).is_err());
         assert!(safe_suite_path(package.path(), Path::new("/tmp/outside.png")).is_err());
+    }
+
+    #[test]
+    fn ocr_retry_hint_rejects_transiently_malformed_timer_text() {
+        let element = yash_app_events_profile::Element {
+            id: ElementId::new(),
+            name: "adventure_idle_counter".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::Ocr {
+                id: DetectorId::new(),
+                language: "eng".into(),
+                page_segmentation_mode: 7,
+                character_whitelist: Some("0123456789:".into()),
+                change_trigger_threshold: 0.01,
+                maximum_interval_ms: 1_000,
+                preprocessing: Vec::new(),
+                empty_value: None,
+                zero_pad_to: None,
+                retry: Some(yash_app_events_profile::OcrRetryHint {
+                    after_ms: 500,
+                    maximum_attempts: 3,
+                    expected_format: OcrExpectedFormat::HhMmSs,
+                }),
+            },
+        };
+        let observation = |value: &str| Observation {
+            detector_id: DetectorId::new(),
+            element_id: element.id,
+            timestamp_ms: 0,
+            value: ObservationValue::Text(value.into()),
+            confidence: Some(0.61),
+            status: yash_app_events_engine::ObservationStatus::Valid,
+            diagnostic: "fixture".into(),
+        };
+
+        assert!(observation_retry_request(&element, Some(&observation("01:30:"))).is_some());
+        assert!(observation_retry_request(&element, Some(&observation("01:30:45"))).is_none());
+        assert!(!is_hh_mm_ss("01:60:00"));
     }
 }

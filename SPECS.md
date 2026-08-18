@@ -173,6 +173,10 @@ Profiles, elements, detectors, and rules shall have stable opaque IDs separate f
 
 Regions shall use normalized coordinates in `[0,1]` and record reference resolution, aspect ratio, UI scale, and language metadata where known.
 
+Profiles may opt into strict reference dimensions when their execution contract is
+pixel-exact. This flag shall default off for existing normalized profiles; when enabled,
+same-aspect resizes are layout-incompatible and must fail closed.
+
 Validation shall reject non-finite, negative, zero-area, or out-of-bounds regions.
 
 ### SPEC-PROFILE-005 — Atomic save
@@ -362,6 +366,169 @@ Fixed-layout seven-segment HUD text shall use deterministic glyph decoding rathe
 general-purpose OCR. Profiles shall declare the digit count, optional separator
 position, brightness threshold, and preprocessing. Invalid or ambiguous glyphs shall
 produce `unknown`, never a fabricated digit.
+
+## 7A. Scene-aware game understanding
+
+### SPEC-SCENE-001 — Scene, overlay, and interaction profile model
+
+Portable profiles shall describe mutually exclusive base scenes, independently active
+overlays, global detector elements, recognition-anchor elements, contextual detector
+elements, and named interaction targets. Every scene, overlay, and interaction target
+shall have a stable opaque ID separate from its display name.
+
+An interaction target is descriptive geometry only. It shall never authorize or cause
+mouse, keyboard, controller, or other input. A target may declare a normalized rectangle,
+an optional explicitly configured safe interaction point, an owning scene or overlay,
+and a bounded visibility expression referencing detector observations.
+
+Profile schema version 2 shall add this model. Schema-version-1 profiles shall migrate
+deterministically to one implicit default scene that preserves their existing enabled
+detectors, rules, derived observations, and runtime behavior. Migration shall not
+overwrite the source before an explicit successful save.
+
+Acceptance:
+
+- Validation rejects duplicate/dangling IDs, cycles, excessive expressions, invalid
+  geometry, and interaction points outside their target rectangle.
+- Profile/element duplication, revision history, archive import/export, and catalog
+  validation preserve or rekey every new reference correctly.
+- Golden fixtures prove schema-1 compatibility and schema-2 round trips.
+
+### SPEC-SCENE-002 — Bounded scene and overlay recognition
+
+The engine shall evaluate a bounded first stage containing global observations and
+scene/overlay recognition anchors. It shall rank base-scene candidates, select at most
+one base scene, and independently select zero or more overlays.
+
+A base scene is recognized only when it meets its confidence threshold and exceeds the
+runner-up by its configured ambiguity margin. Otherwise the result shall be `unknown`
+or `ambiguous`. Live recognition shall support bounded N-of-M evidence and distinct
+entry/exit hysteresis. One-shot screenshot analysis shall report only evidence present
+in that frame and shall not fabricate temporal certainty. Transition hints may influence
+ranking but shall never prohibit recovery to an otherwise valid scene.
+
+Acceptance:
+
+- Deterministic tests cover winners, unknown, ties, ambiguity, priority, hysteresis,
+  unexpected transitions, and simultaneous overlays.
+- Unknown, erroneous, missing, or type-mismatched anchors never become negative evidence.
+
+### SPEC-SCENE-003 — Contextual detector scheduling
+
+After scene resolution, the second stage shall evaluate only global contextual elements
+and detector elements owned by the recognized scene and overlays. Expensive OCR and model
+inference outside the active context shall be skipped. Scene changes shall reset detector
+or rule history whose semantics do not cross the context boundary.
+
+The number of scenes, overlays, anchors, condition leaves, active contextual detectors,
+interaction targets, candidates, diagnostics, and per-request processing time shall have
+explicit validated bounds.
+
+Acceptance:
+
+- Instrumented replay tests prove which detectors ran and which were skipped.
+- A representative multi-scene profile performs materially fewer expensive detector
+  evaluations than the equivalent flat profile while producing the same contextual
+  observations.
+- Capture callbacks, latest-frame delivery, subscriptions, and GUI responsiveness remain
+  bounded under slow detectors and clients.
+
+### SPEC-SCENE-004 — Spatial result contract
+
+Every scene-analysis response shall identify the exact analyzed frame width, height,
+pixel format, and a top-left-origin coordinate system. Every returned visible element
+shall include its stable ID, name, role, visibility, confidence when meaningful, owner,
+normalized rectangle, and pixel rectangle resolved against that exact frame.
+
+Actionable elements may additionally include a profile-authored normalized safe point
+and its resolved pixel coordinate. Detection regions and interaction targets are separate:
+an OCR/template crop shall never implicitly become a clickable target. Unknown or
+ambiguous visibility shall not expose a supposedly safe point. Pixel rectangles use
+exclusive right/bottom bounds and shall not silently overflow or escape the frame.
+
+Acceptance:
+
+- Golden results cover `558x992`, `900x1600`, and a landscape frame.
+- Tests cover conversion rounding, overflow, invalid/out-of-frame geometry, configured
+  safe points, explicitly derived centers, and omission of unsafe points.
+
+### SPEC-SCENE-005 — Pure one-shot screenshot analysis
+
+The daemon shall expose an additive protocol method and CLI command that evaluate one
+explicit bounded PNG against a selected profile without starting capture. The result
+shall use the same scene resolver, detector implementations, derived observations, and
+geometry conversion as live/replay analysis.
+
+The operation shall not publish events, deliver output routes, mutate current state, or
+persist image content by default. It shall accept only bounded 8-bit grayscale/RGB/RGBA
+PNG input, run outside the GUI render thread, support bounded timeout/cancellation, and
+return `unknown` for detectors requiring unavailable temporal history.
+
+Acceptance:
+
+- CLI and JSON-RPC golden tests cover stable JSON and error categories.
+- Tests prove there are no durable state, event, route, or image side effects.
+- The implementation factors the existing validated replay/suite decoder rather than
+  introducing a divergent image parser.
+
+### SPEC-SCENE-006 — JSON-first AI handoff
+
+Scene-analysis results shall contain a deterministic `ai_handoff` decision with at least
+JSON sufficiency, visual-review recommendation, reason, coverage, missing required
+elements, and bounded suggested-crop geometry. JSON may be declared sufficient only when
+the scene is confidently unambiguous, required evidence is valid, actionable visibility
+and geometry are proven, layout is compatible, and no uncertain overlay materially
+obscures a required target.
+
+Visual escalation shall proceed from JSON only, to one explicit minimal crop, to multiple
+bounded crops, and finally to a full frame only when scene discovery, layout failure, or
+broad occlusion makes crops insufficient. The analysis response shall contain no image
+bytes. Materializing a crop or frame is a separate explicit action bound to the same fresh
+frame identity; stale coordinates shall be rejected.
+
+Acceptance:
+
+- Tests cover every insufficiency reason, coverage calculation, crop bounds, and stale
+  frame rejection.
+- Reviewed uncertain evidence can enter the existing regression workflow so recurring
+  states can become JSON-only.
+
+### SPEC-SCENE-007 — Live state, transitions, and authoring
+
+Daemon state shall expose the active scene, bounded ranked candidates, active overlays,
+scene confidence/status, transition sequence/time, contextual observations, visible
+element geometry, and evaluated/skipped detector metrics. Scene observations and temporal
+scene transitions shall preserve the existing observation/event separation.
+
+The GUI shall author, duplicate, reorder, validate, and diagnose scenes, overlays,
+recognition expressions, detector scopes, interaction rectangles, and optional safe
+points. Frozen/replay views shall explain matching evidence and evaluated/skipped
+detectors. No image processing or profile I/O may run on the GUI render thread.
+
+Acceptance:
+
+- A user can author two scenes and one overlay, draw a named action target, configure its
+  safe point, and inspect resolved pixel geometry without editing profile JSON.
+- Live and replay paths produce equivalent scene transitions for identical timestamped
+  inputs.
+
+### SPEC-SCENE-008 — Optional virtual-desktop adapter
+
+The optional `wayland-virtual-desktop` integration shall capture a fresh isolated-desktop
+screenshot into a user-private temporary file, invoke the generic screenshot-analysis
+command, return JSON without exposing image bytes when sufficient, and remove temporary
+content on success, failure, timeout, or interruption unless retention is explicit.
+
+Crop or full-frame escalation shall be explicit and bound to a fresh analyzed frame.
+The adapter shall never execute a returned action and ordinary virtual-desktop commands
+shall remain usable when Yash is absent.
+
+Acceptance:
+
+- An end-to-end test returns scene and element geometry matching the exact isolated
+  desktop dimensions.
+- Tests cover optional dependency behavior, cleanup, crop-first escalation, stale-frame
+  rejection, and the absence of automatic input.
 
 ## 8. Event engine
 
@@ -741,3 +908,11 @@ SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis F
 SPEC-OBS-003 | VERIFIED | protocol-v1 plan/review/export is shared by CLI and GUI; exact entry/size disclosure, visible privacy confirmation, recursive secret/binding/token redaction, explicit frozen element crops, PNG/name/count/file/total limits, atomic ZIP output, failure cleanup, and daemon/output adversarial tests pass (2026-07-11)
 SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
 SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)
+SPEC-SCENE-001 | VERIFIED | profile schema 2 models bounded scenes, overlays, enabled anchors, contextual/required detectors, targets and safe points; deterministic non-writing schema-1 migration, v1/v2 golden fixtures, archive/catalog compatibility, complete reference rekeying, validation, and GUI authoring tests pass (2026-08-02)
+SPEC-SCENE-002 | VERIFIED | weighted typed recognition, unknown/false distinction, N-of-M hysteresis, ambiguity preservation, priority/transition-hint ranking, independent overlay expiry, and bounded histories pass engine tests (2026-08-02)
+SPEC-SCENE-003 | VERIFIED | the common live/replay/suite scheduler advances evidence only on newly scheduled anchors, gates unrelated contextual detectors, and publishes evaluated/gated/throttled counts; the three-detector regression proves 1 then 2 evaluations with unrelated work skipped (2026-08-02)
+SPEC-SCENE-004 | VERIFIED | one-shot OCR fixture response proves exact 640×120 frame identity, stable element/target names and IDs, normalized/pixel rectangles, and configured 320×75 center point; validation rejects unsafe geometry (2026-08-02)
+SPEC-SCENE-005 | VERIFIED | additive `analysis.evaluate_image` and `yash-eventsctl --json analyze` reuse the bounded suite PNG decoder and common detectors/resolver/geometry; valid/blank/layout fixtures prove deterministic output, timeout bounds, and no state/sequence side effects (2026-08-02)
+SPEC-SCENE-006 | VERIFIED | deterministic handoff tests cover complete, unknown, ambiguous, uncertain-overlay, missing-required, and layout-incompatible reasons; responses contain no bytes, cap named crops at eight, and reserve full-frame recommendation for unknown-scene discovery or broad layout incompatibility (2026-08-03)
+SPEC-SCENE-007 | VERIFIED | live/replay state carries ranked scene/overlay context and detector scheduling metrics, emits stable scene/overlay transitions, and the GUI creates/duplicates/reorders scenes/layers, edits recognition/requirements/targets/safe points, draws targets from zones, diagnoses live/replay context, and provides tested scene/overlay/global/all canvas scopes with scoped hit-testing (2026-08-03)
+SPEC-SCENE-008 | VERIFIED | global skill validation and live `queen-blade` 558×992 E2E prove JSON-only default cleanup, explicit retained-frame crops, mode-0600 crop/full-frame materialization, stale-hash exit 3 cleanup, optional Yash doctor reporting, and no automatic input; the adapter was corrected to chmod named crop outputs to 0600 and reverified live (2026-08-03)

@@ -7,6 +7,7 @@ use std::io::{self, BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -19,7 +20,15 @@ pub use store::{OutputRecipeEntry, ProfileStore, StoreError};
 pub use yash_app_events_output::OutputRoute;
 
 /// Current portable profile schema version.
-pub const PROFILE_SCHEMA_VERSION: u16 = 1;
+pub const PROFILE_SCHEMA_VERSION: u16 = 2;
+
+const MAXIMUM_SCENES: usize = 128;
+const MAXIMUM_OVERLAYS: usize = 128;
+const MAXIMUM_ELEMENTS: usize = 512;
+const MAXIMUM_LAYER_ELEMENTS: usize = 256;
+const MAXIMUM_INTERACTION_TARGETS: usize = 256;
+const MAXIMUM_TOTAL_INTERACTION_TARGETS: usize = 512;
+const MAXIMUM_RECOGNITION_CONDITIONS: usize = 32;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -54,8 +63,11 @@ opaque_id!(ProfileId);
 opaque_id!(ElementId);
 opaque_id!(DetectorId);
 opaque_id!(RuleId);
+opaque_id!(SceneId);
+opaque_id!(OverlayId);
+opaque_id!(InteractionTargetId);
 
-/// Portable profile document version one.
+/// Current portable profile document.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Profile {
     /// Schema discriminator used by migration.
@@ -77,10 +89,19 @@ pub struct Profile {
     pub derived_observations: Vec<DerivedObservation>,
     /// Temporal rules consuming element observations.
     pub rules: Vec<EventRule>,
+    /// Elements evaluated independently of scene selection.
+    #[serde(default)]
+    pub global_elements: Vec<ElementId>,
+    /// Mutually exclusive base screens.
+    #[serde(default)]
+    pub scenes: Vec<Scene>,
+    /// Independently active layers such as dialogs and rewards.
+    #[serde(default)]
+    pub overlays: Vec<Overlay>,
 }
 
 impl Profile {
-    /// Creates an empty version-one profile.
+    /// Creates an empty profile using the current schema.
     #[must_use]
     pub fn new(name: impl Into<String>, game: impl Into<String>, width: u32, height: u32) -> Self {
         Self {
@@ -94,10 +115,14 @@ impl Profile {
                 reference_height: height,
                 ui_scale: None,
                 language: None,
+                require_reference_dimensions: false,
             },
             elements: Vec::new(),
             derived_observations: Vec::new(),
             rules: Vec::new(),
+            global_elements: Vec::new(),
+            scenes: Vec::new(),
+            overlays: Vec::new(),
         }
     }
 
@@ -119,6 +144,12 @@ impl Profile {
             errors.push(ValidationError::new(
                 "layout",
                 "reference resolution must have non-zero dimensions",
+            ));
+        }
+        if self.elements.len() > MAXIMUM_ELEMENTS {
+            errors.push(ValidationError::new(
+                "elements",
+                "contains more than 512 detector elements",
             ));
         }
         for (index, element) in self.elements.iter().enumerate() {
@@ -149,12 +180,564 @@ impl Profile {
             }
         }
         report_duplicate_ids(self.rules.iter().map(|rule| rule.id), "rules", &mut errors);
+        self.validate_scene_model(&element_ids, &mut errors);
         if errors.is_empty() {
             Ok(())
         } else {
             Err(ValidationErrors(errors))
         }
     }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_scene_model(
+        &self,
+        element_ids: &HashSet<ElementId>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if self.scenes.len() > MAXIMUM_SCENES {
+            errors.push(ValidationError::new(
+                "scenes",
+                "contains more than 128 scenes",
+            ));
+        }
+        if self.overlays.len() > MAXIMUM_OVERLAYS {
+            errors.push(ValidationError::new(
+                "overlays",
+                "contains more than 128 overlays",
+            ));
+        }
+        report_duplicate_ids(self.scenes.iter().map(|scene| scene.id), "scenes", errors);
+        report_duplicate_ids(
+            self.overlays.iter().map(|overlay| overlay.id),
+            "overlays",
+            errors,
+        );
+        validate_element_references(
+            "global_elements",
+            &self.global_elements,
+            element_ids,
+            errors,
+        );
+        let scene_ids = self
+            .scenes
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<HashSet<_>>();
+        let enabled_detector_ids = self
+            .elements
+            .iter()
+            .filter(|element| element.enabled)
+            .map(|element| element.id)
+            .collect::<HashSet<_>>();
+        for (index, scene) in self.scenes.iter().enumerate() {
+            scene.validate(index, element_ids, &scene_ids, errors);
+            validate_enabled_recognition(
+                &format!("scenes[{index}].recognition"),
+                &scene.recognition,
+                &enabled_detector_ids,
+                errors,
+            );
+            validate_required_enabled(
+                &format!("scenes[{index}].required_element_ids"),
+                &scene.required_element_ids,
+                &enabled_detector_ids,
+                errors,
+            );
+            for (target_index, target) in scene.interaction_targets.iter().enumerate() {
+                if let Some(visibility) = &target.visibility {
+                    validate_enabled_recognition(
+                        &format!("scenes[{index}].interaction_targets[{target_index}].visibility"),
+                        visibility,
+                        &enabled_detector_ids,
+                        errors,
+                    );
+                }
+            }
+        }
+        for (index, overlay) in self.overlays.iter().enumerate() {
+            overlay.validate(index, element_ids, errors);
+            validate_enabled_recognition(
+                &format!("overlays[{index}].recognition"),
+                &overlay.recognition,
+                &enabled_detector_ids,
+                errors,
+            );
+            validate_required_enabled(
+                &format!("overlays[{index}].required_element_ids"),
+                &overlay.required_element_ids,
+                &enabled_detector_ids,
+                errors,
+            );
+            for (target_index, target) in overlay.interaction_targets.iter().enumerate() {
+                if let Some(visibility) = &target.visibility {
+                    validate_enabled_recognition(
+                        &format!(
+                            "overlays[{index}].interaction_targets[{target_index}].visibility"
+                        ),
+                        visibility,
+                        &enabled_detector_ids,
+                        errors,
+                    );
+                }
+            }
+        }
+        let targets = self
+            .scenes
+            .iter()
+            .flat_map(|scene| scene.interaction_targets.iter())
+            .chain(
+                self.overlays
+                    .iter()
+                    .flat_map(|overlay| overlay.interaction_targets.iter()),
+            )
+            .map(|target| target.id)
+            .collect::<Vec<_>>();
+        if targets.len() > MAXIMUM_TOTAL_INTERACTION_TARGETS {
+            errors.push(ValidationError::new(
+                "interaction_targets",
+                "contains more than 512 targets across all scenes and overlays",
+            ));
+        }
+        report_duplicate_ids(targets.into_iter(), "interaction_targets", errors);
+    }
+}
+
+/// One base game screen selected exclusively from competing candidates.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Scene {
+    pub id: SceneId,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub priority: i16,
+    pub recognition: RecognitionExpression,
+    pub minimum_confidence: f32,
+    pub ambiguity_margin: f32,
+    pub required_samples: u16,
+    pub sample_window: u16,
+    #[serde(default)]
+    pub element_ids: Vec<ElementId>,
+    /// Contextual observations that must be valid before JSON-only handoff.
+    #[serde(default)]
+    pub required_element_ids: Vec<ElementId>,
+    #[serde(default)]
+    pub interaction_targets: Vec<InteractionTarget>,
+    #[serde(default)]
+    pub transition_hints: Vec<SceneId>,
+}
+
+impl Scene {
+    fn validate(
+        &self,
+        index: usize,
+        element_ids: &HashSet<ElementId>,
+        scene_ids: &HashSet<SceneId>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let base = format!("scenes[{index}]");
+        validate_layer_name(&base, &self.name, errors);
+        validate_recognition(
+            &format!("{base}.recognition"),
+            &self.recognition,
+            element_ids,
+            errors,
+        );
+        validate_confidence(
+            &format!("{base}.minimum_confidence"),
+            self.minimum_confidence,
+            errors,
+        );
+        validate_confidence(
+            &format!("{base}.ambiguity_margin"),
+            self.ambiguity_margin,
+            errors,
+        );
+        if self.required_samples == 0
+            || self.required_samples > self.sample_window
+            || self.sample_window > 32
+        {
+            errors.push(ValidationError::new(
+                format!("{base}.required_samples"),
+                "must be non-zero, no greater than sample_window, with sample_window at most 32",
+            ));
+        }
+        validate_layer_contents(
+            &base,
+            &self.element_ids,
+            &self.required_element_ids,
+            &self.interaction_targets,
+            element_ids,
+            errors,
+        );
+        for (hint_index, hint) in self.transition_hints.iter().enumerate() {
+            if *hint == self.id || !scene_ids.contains(hint) {
+                errors.push(ValidationError::new(
+                    format!("{base}.transition_hints[{hint_index}]"),
+                    "must reference a different existing scene",
+                ));
+            }
+        }
+    }
+}
+
+/// One independently recognized layer over a base scene.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Overlay {
+    pub id: OverlayId,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub enabled: bool,
+    /// When active, do not expose interaction targets owned by the underlying scene.
+    #[serde(default)]
+    pub blocks_scene_targets: bool,
+    #[serde(default)]
+    pub priority: i16,
+    pub recognition: RecognitionExpression,
+    pub minimum_confidence: f32,
+    pub required_samples: u16,
+    pub sample_window: u16,
+    #[serde(default)]
+    pub element_ids: Vec<ElementId>,
+    /// Contextual observations that must be valid before JSON-only handoff.
+    #[serde(default)]
+    pub required_element_ids: Vec<ElementId>,
+    #[serde(default)]
+    pub interaction_targets: Vec<InteractionTarget>,
+}
+
+impl Overlay {
+    fn validate(
+        &self,
+        index: usize,
+        element_ids: &HashSet<ElementId>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let base = format!("overlays[{index}]");
+        validate_layer_name(&base, &self.name, errors);
+        validate_recognition(
+            &format!("{base}.recognition"),
+            &self.recognition,
+            element_ids,
+            errors,
+        );
+        validate_confidence(
+            &format!("{base}.minimum_confidence"),
+            self.minimum_confidence,
+            errors,
+        );
+        if self.required_samples == 0
+            || self.required_samples > self.sample_window
+            || self.sample_window > 32
+        {
+            errors.push(ValidationError::new(
+                format!("{base}.required_samples"),
+                "must be non-zero, no greater than sample_window, with sample_window at most 32",
+            ));
+        }
+        validate_layer_contents(
+            &base,
+            &self.element_ids,
+            &self.required_element_ids,
+            &self.interaction_targets,
+            element_ids,
+            errors,
+        );
+    }
+}
+
+/// Bounded non-recursive expression used for recognition and visibility.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecognitionExpression {
+    All {
+        conditions: Vec<RecognitionCondition>,
+    },
+    Any {
+        conditions: Vec<RecognitionCondition>,
+    },
+}
+
+impl Default for RecognitionExpression {
+    fn default() -> Self {
+        Self::All {
+            conditions: Vec::new(),
+        }
+    }
+}
+
+/// One typed observation predicate contributing to scene recognition.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RecognitionCondition {
+    pub element_id: ElementId,
+    pub predicate: AtomicRulePredicate,
+    #[serde(default = "default_condition_weight")]
+    pub weight: f32,
+}
+
+const fn default_condition_weight() -> f32 {
+    1.0
+}
+
+/// Declarative, non-executable UI geometry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InteractionTarget {
+    pub id: InteractionTargetId,
+    pub name: String,
+    pub role: InteractionRole,
+    pub region: NormalizedRegion,
+    #[serde(default)]
+    pub interaction_point: Option<InteractionPoint>,
+    #[serde(default)]
+    pub visibility: Option<RecognitionExpression>,
+    #[serde(default)]
+    pub required_for_json: bool,
+    #[serde(default)]
+    pub caution_class: Option<InteractionCaution>,
+    #[serde(default)]
+    pub caution: Option<String>,
+}
+
+/// Semantic use of a described target.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionRole {
+    Action,
+    Navigation,
+    Dismiss,
+    Selection,
+}
+
+/// Gameplay risk classification carried as data; it never authorizes input.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionCaution {
+    Navigation,
+    RoutineAction,
+    Consequential,
+    NeverAutomatic,
+}
+
+/// How a safe point is obtained. Neither variant performs input.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum InteractionPoint {
+    Explicit { x: f32, y: f32 },
+    Center,
+}
+
+fn validate_layer_name(base: &str, name: &str, errors: &mut Vec<ValidationError>) {
+    validate_identifier(&format!("{base}.name"), name, errors);
+}
+
+fn validate_confidence(path: &str, value: f32, errors: &mut Vec<ValidationError>) {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        errors.push(ValidationError::new(
+            path,
+            "must be finite and within [0,1]",
+        ));
+    }
+}
+
+fn validate_element_references(
+    path: &str,
+    references: &[ElementId],
+    element_ids: &HashSet<ElementId>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if references.len() > MAXIMUM_LAYER_ELEMENTS {
+        errors.push(ValidationError::new(
+            path,
+            "contains more than 256 element references",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for (index, id) in references.iter().enumerate() {
+        if !element_ids.contains(id) || !seen.insert(*id) {
+            errors.push(ValidationError::new(
+                format!("{path}[{index}]"),
+                "must reference a unique existing detector element",
+            ));
+        }
+    }
+}
+
+fn validate_recognition(
+    path: &str,
+    expression: &RecognitionExpression,
+    element_ids: &HashSet<ElementId>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    if conditions.len() > MAXIMUM_RECOGNITION_CONDITIONS {
+        errors.push(ValidationError::new(
+            path,
+            "contains more than 32 recognition conditions",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for (index, condition) in conditions.iter().enumerate() {
+        if !element_ids.contains(&condition.element_id) || !seen.insert(condition.element_id) {
+            errors.push(ValidationError::new(
+                format!("{path}.conditions[{index}].element_id"),
+                "must reference a unique existing detector element",
+            ));
+        }
+        if !condition.weight.is_finite() || !(0.0..=100.0).contains(&condition.weight) {
+            errors.push(ValidationError::new(
+                format!("{path}.conditions[{index}].weight"),
+                "must be finite and within [0,100]",
+            ));
+        }
+    }
+}
+
+fn validate_enabled_recognition(
+    path: &str,
+    expression: &RecognitionExpression,
+    enabled_detector_ids: &HashSet<ElementId>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    for (index, condition) in conditions.iter().enumerate() {
+        if !enabled_detector_ids.contains(&condition.element_id) {
+            errors.push(ValidationError::new(
+                format!("{path}.conditions[{index}].element_id"),
+                "must reference an enabled detector element",
+            ));
+        }
+    }
+}
+
+fn validate_required_enabled(
+    path: &str,
+    references: &[ElementId],
+    enabled_detector_ids: &HashSet<ElementId>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (index, id) in references.iter().enumerate() {
+        if !enabled_detector_ids.contains(id) {
+            errors.push(ValidationError::new(
+                format!("{path}[{index}]"),
+                "must reference an enabled detector element",
+            ));
+        }
+    }
+}
+
+fn validate_layer_contents(
+    base: &str,
+    element_references: &[ElementId],
+    required_references: &[ElementId],
+    targets: &[InteractionTarget],
+    element_ids: &HashSet<ElementId>,
+    errors: &mut Vec<ValidationError>,
+) {
+    validate_element_references(
+        &format!("{base}.element_ids"),
+        element_references,
+        element_ids,
+        errors,
+    );
+    validate_element_references(
+        &format!("{base}.required_element_ids"),
+        required_references,
+        element_ids,
+        errors,
+    );
+    for (index, id) in required_references.iter().enumerate() {
+        if !element_references.contains(id) {
+            errors.push(ValidationError::new(
+                format!("{base}.required_element_ids[{index}]"),
+                "must also appear in the layer element_ids",
+            ));
+        }
+    }
+    if targets.len() > MAXIMUM_INTERACTION_TARGETS {
+        errors.push(ValidationError::new(
+            format!("{base}.interaction_targets"),
+            "contains more than 256 interaction targets",
+        ));
+    }
+    for (index, target) in targets.iter().enumerate() {
+        let path = format!("{base}.interaction_targets[{index}]");
+        validate_identifier(&format!("{path}.name"), &target.name, errors);
+        target.region.validate(&format!("{path}.region"), errors);
+        if let Some(InteractionPoint::Explicit { x, y }) = target.interaction_point {
+            let inside = x.is_finite()
+                && y.is_finite()
+                && x >= target.region.x
+                && y >= target.region.y
+                && x < target.region.x + target.region.width
+                && y < target.region.y + target.region.height;
+            if !inside {
+                errors.push(ValidationError::new(
+                    format!("{path}.interaction_point"),
+                    "must be finite and inside the target rectangle",
+                ));
+            }
+        }
+        if let Some(visibility) = &target.visibility {
+            validate_recognition(
+                &format!("{path}.visibility"),
+                visibility,
+                element_ids,
+                errors,
+            );
+        }
+        if target
+            .caution
+            .as_ref()
+            .is_some_and(|value| value.len() > 512)
+        {
+            errors.push(ValidationError::new(
+                format!("{path}.caution"),
+                "must contain at most 512 bytes",
+            ));
+        }
+    }
+}
+
+fn migrated_scene_id(profile_id: ProfileId) -> SceneId {
+    let digest =
+        Sha256::digest(format!("yash-app-events:v1-default-scene:{profile_id}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    SceneId(Uuid::from_bytes(bytes))
+}
+
+fn migrate_v1(document: serde_json::Value) -> Result<Profile, serde_json::Error> {
+    let mut profile: Profile = serde_json::from_value(document)?;
+    profile.schema = PROFILE_SCHEMA_VERSION;
+    profile.scenes = vec![Scene {
+        id: migrated_scene_id(profile.id),
+        name: "default".into(),
+        description: "Implicit scene migrated from schema version 1".into(),
+        enabled: true,
+        priority: 0,
+        recognition: RecognitionExpression::default(),
+        minimum_confidence: 0.0,
+        ambiguity_margin: 0.0,
+        required_samples: 1,
+        sample_window: 1,
+        element_ids: profile.elements.iter().map(|element| element.id).collect(),
+        required_element_ids: Vec::new(),
+        interaction_targets: Vec::new(),
+        transition_hints: Vec::new(),
+    }];
+    Ok(profile)
 }
 
 /// A daemon-composed text observation with stable identity.
@@ -221,6 +804,12 @@ pub struct LayoutMetadata {
     pub reference_height: u32,
     pub ui_scale: Option<f32>,
     pub language: Option<String>,
+    /// Reject frames whose dimensions differ from the authored reference size.
+    ///
+    /// This remains opt-in so existing normalized, aspect-compatible profiles keep
+    /// their resolution-independent behavior.
+    #[serde(default)]
+    pub require_reference_dimensions: bool,
 }
 
 /// A normalized rectangle where the origin is the top-left corner.
@@ -321,6 +910,9 @@ pub enum Detector {
         /// Left-pad non-empty numeric OCR results with zeroes to this width.
         #[serde(default)]
         zero_pad_to: Option<u8>,
+        /// Optional bounded retry guidance for transiently occluded OCR fields.
+        #[serde(default)]
+        retry: Option<OcrRetryHint>,
     },
     SevenSegment {
         id: DetectorId,
@@ -345,6 +937,19 @@ pub enum Detector {
         #[serde(default = "default_ocr_maximum_interval_ms")]
         maximum_interval_ms: u64,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OcrRetryHint {
+    pub after_ms: u32,
+    pub maximum_attempts: u8,
+    pub expected_format: OcrExpectedFormat,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrExpectedFormat {
+    HhMmSs,
 }
 
 const fn default_ocr_change_threshold() -> f32 {
@@ -451,6 +1056,7 @@ impl Detector {
                 character_whitelist,
                 change_trigger_threshold,
                 maximum_interval_ms,
+                retry,
                 zero_pad_to,
                 preprocessing,
                 ..
@@ -464,6 +1070,20 @@ impl Detector {
                     *maximum_interval_ms,
                     errors,
                 );
+                if let Some(retry) = retry {
+                    if !(100..=10_000).contains(&retry.after_ms) {
+                        errors.push(ValidationError::new(
+                            format!("{path}.retry.after_ms"),
+                            "must be within 100 through 10000",
+                        ));
+                    }
+                    if !(1..=10).contains(&retry.maximum_attempts) {
+                        errors.push(ValidationError::new(
+                            format!("{path}.retry.maximum_attempts"),
+                            "must be within 1 through 10",
+                        ));
+                    }
+                }
                 if zero_pad_to.is_some_and(|width| !(1..=16).contains(&width)) {
                     errors.push(ValidationError::new(
                         format!("{path}.zero_pad_to"),
@@ -711,6 +1331,8 @@ pub enum AtomicRulePredicate {
     TextEquals { expected: String },
     TextContains { needle: String },
     NumericBelow { threshold_micros: i32 },
+    NumericAbove { threshold_micros: i32 },
+    ConfidenceAbove { threshold_micros: i32 },
 }
 
 fn is_default_rule_predicate(predicate: &RulePredicate) -> bool {
@@ -832,7 +1454,9 @@ impl EventRule {
                             );
                         }
                         AtomicRulePredicate::Boolean { .. }
-                        | AtomicRulePredicate::NumericBelow { .. } => {}
+                        | AtomicRulePredicate::NumericBelow { .. }
+                        | AtomicRulePredicate::NumericAbove { .. }
+                        | AtomicRulePredicate::ConfidenceAbove { .. } => {}
                     }
                 }
             }
@@ -995,7 +1619,8 @@ pub fn load_profile(path: &Path) -> Result<Profile, StorageError> {
         .and_then(serde_json::Value::as_u64)
         .ok_or(StorageError::UnsupportedSchema(0))?;
     let profile: Profile = match schema {
-        1 => serde_json::from_value(document)?,
+        1 => migrate_v1(document)?,
+        2 => serde_json::from_value(document)?,
         version => return Err(StorageError::UnsupportedSchema(version)),
     };
     profile.validate()?;
@@ -1083,13 +1708,20 @@ mod tests {
 
     #[test]
     fn version_one_golden_fixture_is_a_stable_external_contract() {
-        let profile = load_profile(Path::new("tests/fixtures/profile-v1.json")).unwrap();
-        assert_eq!(profile.schema, 1);
+        let path = Path::new("tests/fixtures/profile-v1.json");
+        let original = fs::read(path).unwrap();
+        let profile = load_profile(path).unwrap();
+        let repeated = load_profile(path).unwrap();
+        assert_eq!(profile.schema, 2);
         assert_eq!(
             profile.id.to_string(),
             "10000000-0000-4000-8000-000000000001"
         );
         assert_eq!(profile.elements.len(), 1);
+        assert_eq!(profile.scenes.len(), 1);
+        assert_eq!(profile.scenes[0].name, "default");
+        assert_eq!(profile.scenes[0].element_ids, vec![profile.elements[0].id]);
+        assert_eq!(profile.scenes[0].id, repeated.scenes[0].id);
         assert_eq!(profile.rules[0].event, "critical_health");
         assert_eq!(profile.rules[0].predicate, RulePredicate::NumericBelow);
         let serialized = serde_json::to_value(&profile).unwrap();
@@ -1097,6 +1729,105 @@ mod tests {
         assert!(serialized["rules"][0].get("stable_for_ms").is_none());
         assert!(serialized["rules"][0].get("emit_initial").is_none());
         assert!(serialized["rules"][0].get("update_interval_ms").is_none());
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn version_two_golden_fixture_preserves_scene_geometry_contract() {
+        let profile = load_profile(Path::new("tests/fixtures/profile-v2.json")).unwrap();
+        profile.validate().unwrap();
+        assert_eq!(profile.schema, PROFILE_SCHEMA_VERSION);
+        assert_eq!(profile.scenes[0].name, "menu");
+        assert_eq!(
+            profile.scenes[0].required_element_ids,
+            profile.scenes[0].element_ids
+        );
+        let target = &profile.scenes[0].interaction_targets[0];
+        assert_eq!(target.name, "play_button");
+        assert_eq!(target.interaction_point, Some(InteractionPoint::Center));
+        assert!(target.required_for_json);
+    }
+
+    #[test]
+    fn scene_geometry_and_references_are_strictly_validated() {
+        let mut profile = Profile::new("Demo", "demo_game", 558, 992);
+        let element_id = ElementId::new();
+        profile.elements.push(Element {
+            id: element_id,
+            name: "Anchor".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.1,
+            },
+            detector: Detector::RegionChange {
+                id: DetectorId::new(),
+                threshold: 0.1,
+                preprocessing: Vec::new(),
+            },
+        });
+        profile.scenes.push(Scene {
+            id: SceneId::new(),
+            name: "gameplay".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: RecognitionExpression::All {
+                conditions: vec![RecognitionCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.8,
+            ambiguity_margin: 0.1,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![element_id],
+            required_element_ids: vec![element_id],
+            interaction_targets: vec![InteractionTarget {
+                id: InteractionTargetId::new(),
+                name: "attack".into(),
+                role: InteractionRole::Action,
+                region: NormalizedRegion {
+                    x: 0.5,
+                    y: 0.8,
+                    width: 0.4,
+                    height: 0.1,
+                },
+                interaction_point: Some(InteractionPoint::Explicit { x: 0.95, y: 0.85 }),
+                visibility: None,
+                required_for_json: true,
+                caution_class: None,
+                caution: None,
+            }],
+            transition_hints: Vec::new(),
+        });
+        let errors = profile.validate().unwrap_err();
+        assert!(errors
+            .0
+            .iter()
+            .any(|error| { error.path == "scenes[0].interaction_targets[0].interaction_point" }));
+        profile.scenes[0].interaction_targets[0].interaction_point = Some(InteractionPoint::Center);
+        profile.validate().unwrap();
+        profile.scenes[0].sample_window = 33;
+        assert!(profile
+            .validate()
+            .unwrap_err()
+            .0
+            .iter()
+            .any(|error| { error.path == "scenes[0].required_samples" }));
+        profile.scenes[0].sample_window = 1;
+        profile.scenes[0].element_ids.clear();
+        assert!(profile
+            .validate()
+            .unwrap_err()
+            .0
+            .iter()
+            .any(|error| { error.path == "scenes[0].required_element_ids[0]" }));
     }
 
     #[test]

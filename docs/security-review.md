@@ -1,6 +1,6 @@
 # First-release security and privacy review
 
-Reviewed 2026-07-11 against protocol/profile/capture/output schema version 1.
+Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output schema 1.
 
 - Control is local-only: the daemon binds no TCP listener, creates its runtime
   directory as `0700`, its Unix socket as `0600`, rejects unsafe stale paths, limits
@@ -31,6 +31,12 @@ Reviewed 2026-07-11 against protocol/profile/capture/output schema version 1.
 - Image replay accepts only profile-relative, non-traversing PNG paths, caps files at
   16 MiB, dimensions at 4096×4096, sample count at 10,000, and supported pixels to
   8-bit grayscale/RGB/RGBA.
+- One-shot analysis accepts only an explicit current-user path, reuses the same 16 MiB
+  and 4096×4096 PNG decoder limits, bounds profiles/scenes/targets and timeout, mutates
+  no daemon state/output, and returns no image bytes. Spatial JSON carries the exact
+  frame SHA-256 so external crop materialization can reject stale geometry.
+- Schema-2 interaction targets are inert rectangles and optional safe points. Neither
+  the daemon, CLI, GUI, nor Wayland adapter converts them into input automatically.
 - Diagnostic bundles require plan/review/export. The plan discloses every redacted
   entry and size. Only explicitly selected frozen element regions become crops; full
   frames are never implicit. Recursive redaction excludes tokens, secrets, credentials,

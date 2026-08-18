@@ -173,6 +173,7 @@ pub mod method {
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const CATALOG_INSTALL: &str = "catalog.install";
     pub const STATE_GET: &str = "state.get";
+    pub const ANALYZE_IMAGE: &str = "analysis.evaluate_image";
     pub const OUTPUT_LIST: &str = "output.list";
     pub const OUTPUT_SET: &str = "output.set";
     pub const OUTPUT_ENABLE: &str = "output.enable";

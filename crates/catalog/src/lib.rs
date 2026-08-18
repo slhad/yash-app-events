@@ -380,7 +380,8 @@ impl CatalogEntry {
             self.license.as_str(),
             &self.verification,
         )?;
-        if self.profile_schema != PROFILE_SCHEMA_VERSION
+        if self.profile_schema == 0
+            || self.profile_schema > PROFILE_SCHEMA_VERSION
             || self.bytes == 0
             || self.bytes > MAXIMUM_PACKAGE_BYTES as u64
             || !is_sha256(&self.sha256)
@@ -674,17 +675,16 @@ fn audit_json_value(path: &str, value: &serde_json::Value) -> Result<(), Catalog
                 audit_json_value(path, value)?;
             }
         }
-        serde_json::Value::String(value) => {
+        serde_json::Value::String(value)
             if Path::new(value).is_absolute()
                 || value.split_whitespace().any(|word| {
                     let trimmed = word.trim_matches(|character: char| {
                         !character.is_ascii_alphanumeric() && character != '@' && character != '.'
                     });
                     trimmed.contains('@') && trimmed.rsplit_once('.').is_some()
-                })
-            {
-                return Err(CatalogError::UnsafeSource(path.into()));
-            }
+                }) =>
+        {
+            return Err(CatalogError::UnsafeSource(path.into()));
         }
         _ => {}
     }

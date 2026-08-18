@@ -516,6 +516,7 @@ mod tests {
             active_profile: Some("profile".into()),
             observations: json!({"stage":{"value":"2"}}),
             events: json!({"stage_changed":true}),
+            context: Value::Null,
         }
     }
 

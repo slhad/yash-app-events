@@ -43,6 +43,10 @@ This plan sequences the requirements in `SPECS.md` into verifiable vertical slic
 - Phase 10: complete (2026-07-11). A clean-prefix source install, user service, desktop
   metadata, icon, Bash completion, man pages, recovery documentation, security review,
   Hyprland portal acceptance, and installed GUI workflow pass.
+- Phase 12: complete (2026-08-03). Profile schema 2 migration, bounded scene/overlay
+  resolution, common-path contextual scheduling, spatial one-shot JSON, crop-first AI
+  handoff, live/replay context transitions, GUI authoring/diagnostics, and the optional
+  private-frame virtual-desktop adapter satisfy `SPEC-SCENE-001` through `008`.
 
 ## Planning principles
 
@@ -389,6 +393,30 @@ Remaining candidates are deliberately unscheduled:
 
 Promote a remaining candidate only after a concrete use case, benchmark, and specification update.
 Milestone ordering and exit gates are maintained in `ROADMAP.md`.
+
+## Phase 12 — Scene-aware game understanding
+
+Goal: efficiently understand games with many gameplay screens, menus, and overlays while
+returning structured spatial information that normally removes the need to send images
+to an AI.
+
+Requirements: `SPEC-SCENE-001` through `SPEC-SCENE-008`.
+
+Implementation order and detailed gates are normative in `ENHANCE_PLAN.md`:
+
+1. Promote requirements and record compatibility/impact baselines.
+2. Introduce profile schema 2 with safe schema-1 migration.
+3. Implement bounded scene/overlay recognition and contextual detector scheduling.
+4. Add pure screenshot analysis with names, observations, rectangles, and safe points.
+5. Add deterministic JSON sufficiency and explicit crop-first visual escalation.
+6. Integrate live state/transitions and GUI authoring/diagnostics.
+7. Add the optional isolated-Wayland adapter without automatic input.
+8. Benchmark, run compatibility/security/privacy gates, and record verified evidence.
+
+Exit gate:
+
+- All completion conditions in `ENHANCE_PLAN.md` pass and every `SPEC-SCENE-*`
+  requirement has concrete `VERIFIED` evidence.
 
 ## Cross-phase verification checklist
 

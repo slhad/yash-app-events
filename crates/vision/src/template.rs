@@ -7,6 +7,8 @@ use crate::{
     PreprocessPipeline,
 };
 
+const MAXIMUM_TEMPLATE_PIXEL_COMPARISONS: usize = 2_000_000;
+
 /// One named grayscale template and optional row-major mask.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Template {
@@ -66,9 +68,18 @@ impl Detector for TemplateDetector {
             Err(error) => return Detection::error(error),
         };
         let mut best: Option<(&str, f32, usize, usize)> = None;
+        let mut comparisons = 0_usize;
         for template in &self.config.templates {
             if template.image.width > crop.width || template.image.height > crop.height {
                 continue;
+            }
+            let template_comparisons = (crop.width - template.image.width + 1)
+                .checked_mul(crop.height - template.image.height + 1)
+                .and_then(|origins| origins.checked_mul(template.image.pixels.len()))
+                .unwrap_or(usize::MAX);
+            comparisons = comparisons.saturating_add(template_comparisons);
+            if comparisons > MAXIMUM_TEMPLATE_PIXEL_COMPARISONS {
+                return Detection::error("template search exceeds bounded comparison budget");
             }
             for y in 0..=crop.height - template.image.height {
                 for x in 0..=crop.width - template.image.width {
@@ -200,5 +211,43 @@ mod tests {
         );
         assert_eq!(result.value, Some(DetectionValue::Number(1.0)));
         assert!(result.diagnostic.contains("cross"));
+    }
+
+    #[test]
+    fn rejects_unbounded_sliding_search_before_scoring() {
+        let frame = Frame::new(
+            0,
+            Duration::ZERO,
+            FrameLayout {
+                width: 1_500,
+                height: 1_500,
+                row_stride: 1_500 * 4,
+                format: PixelFormat::Rgba8,
+            },
+            None,
+            Arc::from(vec![0_u8; 1_500 * 1_500 * 4]),
+        )
+        .unwrap();
+        let mut detector = TemplateDetector::new(TemplateConfig {
+            templates: vec![Template {
+                name: "pixel".into(),
+                image: GrayImage::new(1, 1, vec![0]).unwrap(),
+                mask: None,
+            }],
+            threshold: 0.9,
+            preprocessing: PreprocessPipeline::default(),
+        })
+        .unwrap();
+        let result = detector.detect(
+            &frame,
+            NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(result.status, DetectionStatus::Error);
+        assert!(result.diagnostic.contains("bounded comparison budget"));
     }
 }

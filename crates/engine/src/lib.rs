@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yash_app_events_capture::Frame;
 use yash_app_events_profile::{
-    AtomicRulePredicate, DetectorId, ElementId, NormalizedRegion, ObservationCondition, RuleId,
-    RulePredicate,
+    AtomicRulePredicate, DetectorId, ElementId, NormalizedRegion, ObservationCondition, Overlay,
+    OverlayId, RecognitionCondition, RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
 };
 use yash_app_events_vision::{DetectionStatus, DetectionValue, Detector};
 
@@ -149,6 +149,288 @@ pub enum ObservationStatus {
     Valid,
     Unknown,
     Error,
+}
+
+/// Stable result of evaluating scene and overlay recognition evidence.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SceneResolution {
+    pub scene: Option<ResolvedScene>,
+    pub overlays: Vec<ResolvedOverlay>,
+    pub ambiguous: bool,
+    pub candidates: Vec<SceneCandidate>,
+    pub overlay_candidates: Vec<OverlayCandidate>,
+}
+
+/// Selected mutually exclusive base scene.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResolvedScene {
+    pub id: SceneId,
+    pub name: String,
+    pub confidence: f32,
+}
+
+/// Independently active overlay.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ResolvedOverlay {
+    pub id: OverlayId,
+    pub name: String,
+    pub confidence: f32,
+}
+
+/// Diagnostic score for an enabled scene candidate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SceneCandidate {
+    pub id: SceneId,
+    pub name: String,
+    pub confidence: f32,
+    pub eligible: bool,
+}
+
+/// Diagnostic score for an enabled overlay candidate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OverlayCandidate {
+    pub id: OverlayId,
+    pub name: String,
+    pub confidence: f32,
+    pub eligible: bool,
+}
+
+/// Bounded N-of-M scene resolver fed with the latest anchor observations.
+#[derive(Clone, Debug)]
+pub struct SceneResolver {
+    scenes: Vec<Scene>,
+    overlays: Vec<Overlay>,
+    scene_evidence: HashMap<SceneId, VecDeque<bool>>,
+    overlay_evidence: HashMap<OverlayId, VecDeque<bool>>,
+    active_scene: Option<SceneId>,
+}
+
+impl SceneResolver {
+    #[must_use]
+    pub fn new(scenes: Vec<Scene>, overlays: Vec<Overlay>) -> Self {
+        Self {
+            scenes,
+            overlays,
+            scene_evidence: HashMap::new(),
+            overlay_evidence: HashMap::new(),
+            active_scene: None,
+        }
+    }
+
+    /// Resolves one analysis sample from the latest observations.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve(&mut self, observations: &HashMap<ElementId, Observation>) -> SceneResolution {
+        let hinted = self
+            .active_scene
+            .and_then(|active| self.scenes.iter().find(|scene| scene.id == active))
+            .map_or_else(Vec::new, |scene| scene.transition_hints.clone());
+        let mut candidates = self
+            .scenes
+            .iter()
+            .filter(|scene| scene.enabled)
+            .map(|scene| {
+                let confidence = recognition_confidence(&scene.recognition, observations);
+                let matched = confidence.is_some_and(|value| value >= scene.minimum_confidence);
+                let history = self.scene_evidence.entry(scene.id).or_default();
+                push_bounded(history, matched, usize::from(scene.sample_window));
+                SceneCandidate {
+                    id: scene.id,
+                    name: scene.name.clone(),
+                    confidence: confidence.unwrap_or(0.0),
+                    eligible: history.iter().filter(|value| **value).count()
+                        >= usize::from(scene.required_samples),
+                }
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| hinted.contains(&right.id).cmp(&hinted.contains(&left.id)))
+                .then_with(|| {
+                    let left_priority = self
+                        .scenes
+                        .iter()
+                        .find(|scene| scene.id == left.id)
+                        .map_or(0, |scene| scene.priority);
+                    let right_priority = self
+                        .scenes
+                        .iter()
+                        .find(|scene| scene.id == right.id)
+                        .map_or(0, |scene| scene.priority);
+                    right_priority.cmp(&left_priority)
+                })
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| candidate.eligible)
+            .collect::<Vec<_>>();
+        let ambiguous = eligible.first().is_some_and(|best| {
+            eligible.get(1).is_some_and(|runner_up| {
+                let margin = self
+                    .scenes
+                    .iter()
+                    .find(|scene| scene.id == best.id)
+                    .map_or(0.0, |scene| scene.ambiguity_margin);
+                best.confidence - runner_up.confidence < margin
+            })
+        });
+        if !ambiguous {
+            self.active_scene = eligible.first().map(|candidate| candidate.id);
+        }
+        let scene = self.active_scene.and_then(|id| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == id && candidate.eligible)
+                .map(|candidate| ResolvedScene {
+                    id,
+                    name: candidate.name.clone(),
+                    confidence: candidate.confidence,
+                })
+        });
+
+        let mut overlay_candidates = self
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.enabled)
+            .map(|overlay| {
+                let confidence = recognition_confidence(&overlay.recognition, observations);
+                let history = self.overlay_evidence.entry(overlay.id).or_default();
+                push_bounded(
+                    history,
+                    confidence.is_some_and(|value| value >= overlay.minimum_confidence),
+                    usize::from(overlay.sample_window),
+                );
+                OverlayCandidate {
+                    id: overlay.id,
+                    name: overlay.name.clone(),
+                    confidence: confidence.unwrap_or(0.0),
+                    eligible: history.iter().filter(|value| **value).count()
+                        >= usize::from(overlay.required_samples),
+                }
+            })
+            .collect::<Vec<_>>();
+        overlay_candidates.sort_by(|left, right| left.name.cmp(&right.name));
+        let overlays = overlay_candidates
+            .iter()
+            .filter(|candidate| candidate.eligible)
+            // A lower-priority layer with the same named interaction target
+            // is a fallback/duplicate for the active higher-priority layer.
+            // Keep independent overlays, but do not expose two owners for
+            // one click target (for example a generic reward popup beside a
+            // route-specific reward result).
+            .filter(|candidate| {
+                let Some(current) = self
+                    .overlays
+                    .iter()
+                    .find(|overlay| overlay.id == candidate.id)
+                else {
+                    return false;
+                };
+                !self.overlays.iter().any(|other| {
+                    other.enabled
+                        && other.priority > current.priority
+                        && overlay_candidates.iter().any(|other_candidate| {
+                            other_candidate.id == other.id && other_candidate.eligible
+                        })
+                        && current.interaction_targets.iter().any(|target| {
+                            other
+                                .interaction_targets
+                                .iter()
+                                .any(|other_target| other_target.name == target.name)
+                        })
+                })
+            })
+            .map(|candidate| ResolvedOverlay {
+                id: candidate.id,
+                name: candidate.name.clone(),
+                confidence: candidate.confidence,
+            })
+            .collect();
+
+        SceneResolution {
+            scene,
+            overlays,
+            ambiguous,
+            candidates,
+            overlay_candidates,
+        }
+    }
+}
+
+fn push_bounded(history: &mut VecDeque<bool>, value: bool, capacity: usize) {
+    history.push_back(value);
+    while history.len() > capacity {
+        history.pop_front();
+    }
+}
+
+/// Evaluates one bounded recognition expression against the latest valid observations.
+#[must_use]
+pub fn recognition_confidence<S: std::hash::BuildHasher>(
+    expression: &RecognitionExpression,
+    observations: &HashMap<ElementId, Observation, S>,
+) -> Option<f32> {
+    let (conditions, require_all) = match expression {
+        RecognitionExpression::All { conditions } => (conditions, true),
+        RecognitionExpression::Any { conditions } => (conditions, false),
+    };
+    if conditions.is_empty() {
+        return require_all.then_some(1.0);
+    }
+    let evaluations = conditions
+        .iter()
+        .map(|condition| condition_confidence(condition, observations))
+        .collect::<Vec<_>>();
+    if require_all && evaluations.iter().any(Option::is_none) {
+        return None;
+    }
+    let total_weight = conditions
+        .iter()
+        .map(|condition| condition.weight)
+        .sum::<f32>();
+    let matched_weight = evaluations
+        .iter()
+        .flatten()
+        .map(
+            |(matched, confidence, weight)| {
+                if *matched {
+                    confidence * weight
+                } else {
+                    0.0
+                }
+            },
+        )
+        .sum::<f32>();
+    if !require_all && matched_weight == 0.0 {
+        return Some(0.0);
+    }
+    Some((matched_weight / total_weight).clamp(0.0, 1.0))
+}
+
+fn condition_confidence<S: std::hash::BuildHasher>(
+    condition: &RecognitionCondition,
+    observations: &HashMap<ElementId, Observation, S>,
+) -> Option<(bool, f32, f32)> {
+    let observation = observations.get(&condition.element_id)?;
+    if observation.status != ObservationStatus::Valid {
+        return None;
+    }
+    let matched = match condition.predicate {
+        AtomicRulePredicate::ConfidenceAbove { threshold_micros } => {
+            f64::from(observation.confidence.unwrap_or(1.0))
+                > f64::from(threshold_micros) / 1_000_000.0
+        }
+        _ => atomic_matches(&condition.predicate, &observation.value)?,
+    };
+    Some((
+        matched,
+        observation.confidence.unwrap_or(1.0),
+        condition.weight,
+    ))
 }
 
 /// Typed predicate used by the post-release temporal-rule language.
@@ -326,6 +608,10 @@ fn atomic_matches(predicate: &AtomicRulePredicate, value: &ObservationValue) -> 
             AtomicRulePredicate::NumericBelow { threshold_micros },
             ObservationValue::Number(value),
         ) => Some(*value < f64::from(*threshold_micros) / 1_000_000.0),
+        (
+            AtomicRulePredicate::NumericAbove { threshold_micros },
+            ObservationValue::Number(value),
+        ) => Some(*value > f64::from(*threshold_micros) / 1_000_000.0),
         _ => None,
     }
 }
@@ -939,11 +1225,16 @@ impl<D: Detector, R: ObservationRule> FrameProcessor<D, R> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
     use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
-    use yash_app_events_profile::{DetectorId, ElementId, RuleId};
+    use yash_app_events_profile::{
+        DetectorId, ElementId, InteractionRole, InteractionTarget, InteractionTargetId,
+        NormalizedRegion, Overlay, OverlayId, RecognitionCondition, RecognitionExpression, RuleId,
+        Scene, SceneId,
+    };
     use yash_app_events_vision::{ColorBarConfig, ColorBarDetector};
 
     fn observation(timestamp_ms: u64, value: f64, confidence: f32) -> Observation {
@@ -968,6 +1259,233 @@ mod tests {
             status: ObservationStatus::Valid,
             diagnostic: String::new(),
         }
+    }
+
+    fn recognized_scene(
+        name: &str,
+        element_id: ElementId,
+        required_samples: u16,
+        sample_window: u16,
+    ) -> Scene {
+        Scene {
+            id: SceneId::new(),
+            name: name.into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: RecognitionExpression::All {
+                conditions: vec![RecognitionCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.8,
+            ambiguity_margin: 0.1,
+            required_samples,
+            sample_window,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+            transition_hints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scene_resolver_applies_n_of_m_and_keeps_scene_during_ambiguity() {
+        let first_element = ElementId::new();
+        let second_element = ElementId::new();
+        let mut first = recognized_scene("gameplay", first_element, 2, 3);
+        let second = recognized_scene("menu", second_element, 1, 1);
+        let first_id = first.id;
+        first.transition_hints.push(second.id);
+        let second_id = second.id;
+        let mut resolver = SceneResolver::new(vec![first, second], Vec::new());
+        let mut observations = HashMap::new();
+        observations.insert(
+            first_element,
+            Observation {
+                detector_id: DetectorId::new(),
+                element_id: first_element,
+                timestamp_ms: 0,
+                value: ObservationValue::Boolean(true),
+                confidence: Some(0.95),
+                status: ObservationStatus::Valid,
+                diagnostic: String::new(),
+            },
+        );
+        assert!(resolver.resolve(&observations).scene.is_none());
+        let stable = resolver.resolve(&observations);
+        assert_eq!(stable.scene.as_ref().map(|scene| scene.id), Some(first_id));
+
+        observations.insert(
+            second_element,
+            Observation {
+                detector_id: DetectorId::new(),
+                element_id: second_element,
+                timestamp_ms: 1,
+                value: ObservationValue::Boolean(true),
+                confidence: Some(0.95),
+                status: ObservationStatus::Valid,
+                diagnostic: String::new(),
+            },
+        );
+        let ambiguous = resolver.resolve(&observations);
+        assert!(ambiguous.ambiguous);
+        assert_eq!(ambiguous.candidates[0].id, second_id);
+        assert_eq!(
+            ambiguous.scene.as_ref().map(|scene| scene.id),
+            Some(first_id)
+        );
+    }
+
+    #[test]
+    fn scene_resolver_tracks_overlays_independently() {
+        let element_id = ElementId::new();
+        let overlay_id = OverlayId::new();
+        let overlay = Overlay {
+            id: overlay_id,
+            name: "dialog".into(),
+            description: String::new(),
+            enabled: true,
+            blocks_scene_targets: true,
+            priority: 0,
+            recognition: RecognitionExpression::Any {
+                conditions: vec![RecognitionCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::TextContains {
+                        needle: "confirm".into(),
+                    },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.7,
+            required_samples: 1,
+            sample_window: 2,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+        };
+        let mut resolver = SceneResolver::new(Vec::new(), vec![overlay]);
+        let mut observations = HashMap::from([(
+            element_id,
+            Observation {
+                detector_id: DetectorId::new(),
+                element_id,
+                timestamp_ms: 0,
+                value: ObservationValue::Text("confirm purchase".into()),
+                confidence: Some(0.9),
+                status: ObservationStatus::Valid,
+                diagnostic: String::new(),
+            },
+        )]);
+        let resolution = resolver.resolve(&observations);
+        assert!(resolution.scene.is_none());
+        assert_eq!(resolution.overlays[0].id, overlay_id);
+        observations.get_mut(&element_id).unwrap().status = ObservationStatus::Unknown;
+        assert_eq!(resolver.resolve(&observations).overlays.len(), 1);
+        assert!(resolver.resolve(&observations).overlays.is_empty());
+    }
+
+    #[test]
+    fn scene_resolver_suppresses_lower_priority_duplicate_target_overlay() {
+        let element_id = ElementId::new();
+        let duplicate_target = || InteractionTarget {
+            id: InteractionTargetId::new(),
+            name: "dismiss_reward".into(),
+            role: InteractionRole::Dismiss,
+            region: NormalizedRegion {
+                x: 0.25,
+                y: 0.25,
+                width: 0.5,
+                height: 0.5,
+            },
+            interaction_point: None,
+            visibility: None,
+            required_for_json: true,
+            caution_class: None,
+            caution: None,
+        };
+        let make_overlay = |name: &str, priority: i16| Overlay {
+            id: OverlayId::new(),
+            name: name.into(),
+            description: String::new(),
+            enabled: true,
+            blocks_scene_targets: true,
+            priority,
+            recognition: RecognitionExpression::All {
+                conditions: vec![RecognitionCondition {
+                    element_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.7,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: vec![duplicate_target()],
+        };
+        let fallback = make_overlay("generic_reward", 10);
+        let specific = make_overlay("specific_reward", 20);
+        let specific_id = specific.id;
+        let mut resolver = SceneResolver::new(Vec::new(), vec![fallback, specific]);
+        let observations = HashMap::from([(
+            element_id,
+            Observation {
+                detector_id: DetectorId::new(),
+                element_id,
+                timestamp_ms: 0,
+                value: ObservationValue::Boolean(true),
+                confidence: Some(0.95),
+                status: ObservationStatus::Valid,
+                diagnostic: String::new(),
+            },
+        )]);
+
+        let resolution = resolver.resolve(&observations);
+        assert_eq!(resolution.overlays.len(), 1);
+        assert_eq!(resolution.overlays[0].id, specific_id);
+        assert!(resolution
+            .overlay_candidates
+            .iter()
+            .all(|candidate| candidate.eligible));
+    }
+
+    #[test]
+    fn visibility_evidence_distinguishes_missing_false_and_visible() {
+        let element_id = ElementId::new();
+        let expression = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        let mut observations = HashMap::new();
+        assert_eq!(recognition_confidence(&expression, &observations), None);
+        observations.insert(
+            element_id,
+            Observation {
+                detector_id: DetectorId::new(),
+                element_id,
+                timestamp_ms: 0,
+                value: ObservationValue::Boolean(false),
+                confidence: Some(0.9),
+                status: ObservationStatus::Valid,
+                diagnostic: String::new(),
+            },
+        );
+        assert_eq!(
+            recognition_confidence(&expression, &observations),
+            Some(0.0)
+        );
+        observations.get_mut(&element_id).unwrap().value = ObservationValue::Boolean(true);
+        assert_eq!(
+            recognition_confidence(&expression, &observations),
+            Some(0.9)
+        );
     }
 
     fn typed_rule(predicate: ValuePredicate) -> TemporalRule {
@@ -1053,6 +1571,57 @@ mod tests {
                 .unwrap()
                 .state,
             TransitionState::Entered
+        );
+    }
+
+    #[test]
+    fn numeric_above_predicate_is_strict_and_typed() {
+        let predicate = AtomicRulePredicate::NumericAbove {
+            threshold_micros: 750_000,
+        };
+        assert_eq!(
+            atomic_matches(&predicate, &ObservationValue::Number(0.9)),
+            Some(true)
+        );
+        assert_eq!(
+            atomic_matches(&predicate, &ObservationValue::Number(0.75)),
+            Some(false)
+        );
+        assert_eq!(
+            atomic_matches(&predicate, &ObservationValue::Number(0.2)),
+            Some(false)
+        );
+        assert_eq!(
+            atomic_matches(&predicate, &ObservationValue::Text("0.9".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn confidence_above_predicate_uses_detector_confidence() {
+        let element_id = ElementId::new();
+        let condition = RecognitionCondition {
+            element_id,
+            predicate: AtomicRulePredicate::ConfidenceAbove {
+                threshold_micros: 850_000,
+            },
+            weight: 1.0,
+        };
+        let mut observations = HashMap::new();
+        let mut high = observation(0, 0.0, 0.9);
+        high.element_id = element_id;
+        observations.insert(element_id, high);
+        assert_eq!(
+            condition_confidence(&condition, &observations).map(|result| result.0),
+            Some(true)
+        );
+
+        let mut low = observation(0, 1.0, 0.8);
+        low.element_id = element_id;
+        observations.insert(element_id, low);
+        assert_eq!(
+            condition_confidence(&condition, &observations).map(|result| result.0),
+            Some(false)
         );
     }
 

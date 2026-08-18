@@ -19,6 +19,8 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
   bounded and cached public profile discovery; install requires the reviewed revision/hash
   and leaves the imported profile inactive)
 - `state.get`, `events.subscribe`, `status.subscribe`
+- `analysis.evaluate_image` (pure bounded PNG evaluation with scene/overlay context,
+  spatial element/target JSON, no image bytes, and no state/event/output side effects)
 - `output.list`, `output.set`, `output.enable`, `output.remove`, and `output.test`
   (machine-local profile routes; `test` performs an explicit sample delivery)
 - `output.recipe_list`, `output.recipe_preview`, and `output.recipe_install` (portable
@@ -52,6 +54,18 @@ Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.
 Import/export paths are local filesystem paths supplied by the current-user client.
 
+`analysis.evaluate_image` accepts `profile_id`, an explicit local PNG `path`, and a
+bounded `timeout_ms`. Its response includes the exact frame dimensions and SHA-256,
+ranked scene/overlay evidence, stable names and IDs, normalized and pixel rectangles,
+optional profile-authored safe points, detector scheduling metrics, and `ai_handoff`.
+The handoff is JSON-only when the scene is unambiguous, layout-compatible, and every
+explicitly required observation/visibility condition is valid. Otherwise it names at
+most eight minimal crops; only a broad layout mismatch recommends a full frame. An OCR
+detector may include a bounded `retry` policy with `after_ms`, `maximum_attempts`, and
+an `expected_format`. When its required observation is missing or malformed,
+`ai_handoff.retry.recommended` is true and `requests` names the affected element without
+executing or scheduling the retry itself.
+
 Revision history is exposed without a GUI-only path. `profile.revisions` accepts
 `profile_id` and returns retained profile snapshots from oldest to current.
 `profile.revision_get` accepts `profile_id` and `revision`. `profile.rollback` accepts
@@ -69,6 +83,11 @@ use the normal event subscription and durable output.
 `system.status` includes process-wide daemon CPU percentage and resident-memory bytes
 alongside capture/analysis rates and detector latency. CPU is derived from Linux
 process user+system time over the sampling interval rather than one thread.
+
+For schema-2 profiles, `state.get` adds `context` with the recognized scene, ranked
+candidates, active/uncertain overlays, and evaluated/gated/throttled detector counts.
+Subscriptions emit `scene_changed` and `overlays_changed` records when that context
+changes; existing observation/event fields remain compatible.
 
 `suite.evaluate` accepts `{"path":"/absolute/or/client-resolved/path"}`. The path may
 name a package directory or its `suite.json`. The daemon canonicalizes every referenced
@@ -103,5 +122,5 @@ hash, allocates a fresh route ID, records recipe provenance, and forces `enabled
 Stable application errors are `-32001` handshake required, `-32002` incompatible
 version, `-32009` revision conflict, and `-32010` subscriber lag. Standard JSON-RPC
 parse/request/method/parameter/internal codes retain their standard meanings. The
-method set above and its persisted schema-1/protocol-1 identifiers are frozen for the
+method set above and its protocol-1 identifiers are frozen for the
 first release; additive response fields remain compatible.

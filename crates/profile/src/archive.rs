@@ -139,7 +139,10 @@ pub fn import_profile(
         }
         serde_json::from_reader(&mut entry)?
     };
-    if manifest.schema != 1 || manifest.profile_schema != PROFILE_SCHEMA_VERSION {
+    if manifest.schema != 1
+        || manifest.profile_schema == 0
+        || manifest.profile_schema > PROFILE_SCHEMA_VERSION
+    {
         return Err(ArchiveError::UnsupportedSchema);
     }
     let declared: HashMap<_, _> = manifest

@@ -28,6 +28,10 @@ criteria in `SPECS.md`. Do not claim support until those criteria have evidence.
   routes, JSON templates, file/direct-command sinks, bounded execution, shared controls,
   GUI verification, portable inert recipe browse/edit/preview/install, archive/provenance
   safety, and refreshed workspace quality gates pass.
+- R7 — scene-aware game understanding and JSON-first screenshot analysis: complete
+  (2026-08-02). Profile schema/migration, bounded two-stage scheduling, pure spatial
+  JSON, live/replay/GUI context, crop-first privacy, and the isolated-Wayland adapter
+  have concrete `SPEC-SCENE-001` through `008` evidence.
 
 ## R1 — Complete event-rule language
 
@@ -114,6 +118,35 @@ Exit gate:
   local routes after explicit GUI review, editing, preview, and sink selection.
 - A later BlazBlue stage-marker route can call the reviewed local `yash` IPC executable
   without adding a game-specific sink to this repository.
+
+## R7 — Scene-aware game understanding and JSON-first screenshot analysis
+
+Implement `ENHANCE_PLAN.md` as the next post-release milestone. Promote profiles from a
+flat detector list to a versioned scene/overlay model with bounded anchor recognition,
+contextual detector scheduling, descriptive interaction geometry, and safe schema-1
+migration. Add pure PNG analysis through the daemon/protocol/CLI, live scene state and
+transitions, GUI authoring/diagnostics, and the optional isolated-Wayland adapter.
+
+The default AI handoff is structured JSON containing names, values, normalized and pixel
+rectangles, and explicitly configured safe points. Images remain an explicit crop-first
+fallback for unknown, ambiguous, novel, or geometrically unsafe states. Yash continues to
+observe only and never generates input.
+
+Exit gate:
+
+- Every `SPEC-SCENE-*` requirement is verified with concrete schema, migration, engine,
+  protocol, CLI, GUI, replay, security, privacy, performance, and adapter evidence.
+- Representative multi-scene profiles execute materially fewer irrelevant expensive
+  detectors than their flat equivalents.
+- Known frames are consumable as JSON only; uncertain frames provide bounded explicit
+  crop-first escalation without embedding image bytes in RPC.
+- All existing release gates and schema/protocol compatibility tests remain green.
+
+Completed 2026-08-03: 138 workspace tests and strict Clippy pass; v1/v2 profile
+goldens, resolver/gating/geometry/handoff/live/replay/GUI tests are green. A live
+558×992 isolated-Wayland run returned JSON without image bytes, produced an explicit
+209×10 hash-bound crop, materialized a mode-0600 full frame only on request, and
+rejected/cleaned a stale hash with exit 3.
 
 ## R5 — Candidates requiring promotion
 

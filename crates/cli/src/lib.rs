@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use thiserror::Error;
 use yash_app_events_engine::ReplayManifest;
-use yash_app_events_profile::{load_profile, CollectionPolicy, OutputRoute, Profile};
+use yash_app_events_profile::{
+    export_profile, load_profile, CollectionPolicy, OutputRoute, Profile,
+};
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
 /// `yash-eventsctl` command line.
@@ -35,6 +37,12 @@ pub enum Command {
     Status,
     /// Read the current state snapshot.
     State,
+    /// Analyze one PNG and return spatial JSON without embedding image bytes.
+    Analyze {
+        image: PathBuf,
+        #[arg(long)]
+        profile_id: String,
+    },
     /// Ask the daemon to stop cleanly.
     Shutdown,
     /// Manage portable profiles.
@@ -249,6 +257,11 @@ pub enum ProfileCommand {
     Validate {
         path: PathBuf,
     },
+    /// Build a portable archive from a validated profile directory without a daemon.
+    Pack {
+        directory: PathBuf,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -305,15 +318,28 @@ pub enum CaptureCommand {
 /// Returns connection, timeout, protocol, RPC, or offline-validation errors.
 #[allow(clippy::too_many_lines)]
 pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
-    if let Command::Profile {
-        command: ProfileCommand::Validate { path },
-    } = &cli.command
-    {
-        let profile =
-            load_profile(path).map_err(|error| CliError::Validation(error.to_string()))?;
-        return Ok(
-            json!({"valid": true, "schema": profile.schema, "profile_id": profile.id, "revision": profile.revision}),
-        );
+    if let Command::Profile { command } = &cli.command {
+        match command {
+            ProfileCommand::Validate { path } => {
+                let profile =
+                    load_profile(path).map_err(|error| CliError::Validation(error.to_string()))?;
+                return Ok(
+                    json!({"valid": true, "schema": profile.schema, "profile_id": profile.id, "revision": profile.revision}),
+                );
+            }
+            ProfileCommand::Pack { directory, path } => {
+                let manifest = export_profile(directory, path)
+                    .map_err(|error| CliError::Validation(error.to_string()))?;
+                return Ok(json!({
+                    "packed": true,
+                    "profile_id": manifest.profile_id,
+                    "schema": manifest.profile_schema,
+                    "files": manifest.files.len(),
+                    "path": path,
+                }));
+            }
+            _ => {}
+        }
     }
     if matches!(
         cli.command,
@@ -357,6 +383,14 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
             Command::Version => client.call(method::VERSION, Value::Null).await?,
             Command::Status => client.call(method::STATUS, Value::Null).await?,
             Command::State => client.call(method::STATE_GET, Value::Null).await?,
+            Command::Analyze { image, profile_id } => {
+                let path = std::fs::canonicalize(image).map_err(|error| {
+                    CliError::Replay(format!("cannot open analysis image: {error}"))
+                })?;
+                client
+                    .call(method::ANALYZE_IMAGE, json!({"profile_id":profile_id,"path":path,"timeout_ms":cli.timeout_ms}))
+                    .await?
+            }
             Command::Shutdown => client.call(method::SHUTDOWN, Value::Null).await?,
             Command::Profile { command } => match command {
                 ProfileCommand::List => client.call(method::PROFILE_LIST, Value::Null).await?,
@@ -440,7 +474,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                         )
                         .await?
                 }
-                ProfileCommand::Validate { .. } => unreachable!(),
+                ProfileCommand::Validate { .. } | ProfileCommand::Pack { .. } => unreachable!(),
             },
             Command::Catalog { command } => match command {
                 CatalogCommand::Status => {
@@ -792,6 +826,13 @@ pub fn format_result(command: &Command, value: &Value, json_output: bool) -> Str
             value["profile_id"].as_str().unwrap_or("?"),
             value["schema"].as_u64().unwrap_or(0)
         ),
+        Command::Profile {
+            command: ProfileCommand::Pack { .. },
+        } => format!(
+            "packed profile {} ({} files)",
+            value["profile_id"].as_str().unwrap_or("?"),
+            value["files"].as_u64().unwrap_or(0)
+        ),
         _ => serde_json::to_string_pretty(value)
             .unwrap_or_else(|error| format!("unable to format result: {error}")),
     }
@@ -845,6 +886,24 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn analyze_command_requires_image_and_profile() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "--json",
+            "analyze",
+            "/tmp/frame.png",
+            "--profile-id",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .unwrap();
+        let Command::Analyze { image, profile_id } = cli.command else {
+            panic!("analyze command was not parsed");
+        };
+        assert_eq!(image, PathBuf::from("/tmp/frame.png"));
+        assert_eq!(profile_id, "00000000-0000-0000-0000-000000000001");
+    }
 
     #[test]
     fn catalog_install_requires_reviewed_revision_and_hash() {
@@ -1069,6 +1128,32 @@ mod tests {
         let result = execute(&cli).await.unwrap();
         assert_eq!(result["valid"], true);
         assert_eq!(result["profile_id"], profile.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn offline_pack_builds_a_valid_archive_without_a_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile_directory = directory.path().join("profile");
+        std::fs::create_dir(&profile_directory).unwrap();
+        let profile = Profile::new("Packable", "demo_game", 558, 992);
+        yash_app_events_profile::save_profile(&profile_directory.join("profile.json"), &profile)
+            .unwrap();
+        let archive = directory.path().join("profile.hudprofile");
+        let cli = Cli {
+            json: true,
+            socket: Some(directory.path().join("missing.sock")),
+            timeout_ms: 1,
+            command: Command::Profile {
+                command: ProfileCommand::Pack {
+                    directory: profile_directory,
+                    path: archive.clone(),
+                },
+            },
+        };
+        let result = execute(&cli).await.unwrap();
+        assert_eq!(result["packed"], true);
+        assert_eq!(result["profile_id"], profile.id.to_string());
+        assert!(archive.is_file());
     }
 
     #[test]

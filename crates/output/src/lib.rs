@@ -66,6 +66,9 @@ pub struct StateSnapshot {
     pub active_profile: Option<String>,
     pub observations: Value,
     pub events: Value,
+    /// Optional additive scene/overlay context for scene-aware profiles.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub context: Value,
 }
 
 /// Transition-log durability configuration.

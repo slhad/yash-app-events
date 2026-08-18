@@ -5,9 +5,12 @@ yash-eventsctl \- inspect and control yash-app-eventsd
 .B yash-eventsctl
 [--json] [--socket PATH] [--timeout-ms MS] COMMAND
 .SH COMMANDS
-version, status, state, shutdown, profile, events follow, capture, replay MANIFEST,
+version, status, state, shutdown, profile, events follow, capture, analyze PNG --profile-id UUID, replay MANIFEST,
 catalog status/refresh/list/install, suite evaluate PACKAGE, collection policy/status/review/compare, output
 list/set/enable/remove/test, diagnostic plan, and diagnostic export.
+.PP
+Profile validate and profile pack DIRECTORY ARCHIVE run offline. Pack validates a
+portable profile directory and creates an inert .hudprofile archive for daemon import.
 .PP
 Diagnostic export requires an exact total returned by diagnostic plan plus the
 --privacy-reviewed flag. Selected --element-id crops require a frozen preview.
@@ -17,6 +20,10 @@ absolute executable, do not invoke a shell, and receive compact JSON on standard
 .PP
 Catalog refresh and install use the daemon-owned fixed GitHub Profile Catalog origin.
 Install requires the reviewed catalog revision and SHA-256 and leaves the profile inactive.
+.PP
+Analyze returns scene-aware spatial JSON with frame dimensions, named element and target
+rectangles, configured safe points, and crop-first AI handoff metadata. It never embeds
+image bytes or generates input.
 .SH EXIT STATUS
 0 success; 3 connection; 4 protocol/RPC; 5 validation; 6 timeout; 7 replay or suite regression.
 .SH SEE ALSO

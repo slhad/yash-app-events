@@ -1,0 +1,68 @@
+{
+  "schema": 2,
+  "id": "10000000-0000-4000-8000-000000000002",
+  "revision": 4,
+  "name": "Golden scene profile",
+  "game": "synthetic_game",
+  "layout": {
+    "reference_width": 558,
+    "reference_height": 992,
+    "ui_scale": 1.0,
+    "language": "en"
+  },
+  "elements": [
+    {
+      "id": "20000000-0000-4000-8000-000000000002",
+      "name": "Menu anchor",
+      "enabled": true,
+      "color": "#ffffff",
+      "region": { "x": 0.1, "y": 0.1, "width": 0.2, "height": 0.1 },
+      "detector": {
+        "type": "region_change",
+        "id": "30000000-0000-4000-8000-000000000002",
+        "threshold": 0.1,
+        "preprocessing": []
+      }
+    }
+  ],
+  "derived_observations": [],
+  "rules": [],
+  "global_elements": [],
+  "scenes": [
+    {
+      "id": "50000000-0000-4000-8000-000000000002",
+      "name": "menu",
+      "description": "Main menu",
+      "enabled": true,
+      "priority": 10,
+      "recognition": {
+        "type": "all",
+        "conditions": [
+          {
+            "element_id": "20000000-0000-4000-8000-000000000002",
+            "predicate": { "type": "boolean", "expected": true },
+            "weight": 1.0
+          }
+        ]
+      },
+      "minimum_confidence": 0.8,
+      "ambiguity_margin": 0.1,
+      "required_samples": 2,
+      "sample_window": 3,
+      "element_ids": ["20000000-0000-4000-8000-000000000002"],
+      "required_element_ids": ["20000000-0000-4000-8000-000000000002"],
+      "interaction_targets": [
+        {
+          "id": "70000000-0000-4000-8000-000000000002",
+          "name": "play_button",
+          "role": "navigation",
+          "region": { "x": 0.25, "y": 0.7, "width": 0.5, "height": 0.1 },
+          "interaction_point": { "source": "center" },
+          "required_for_json": true
+        }
+      ],
+      "transition_hints": []
+    }
+  ],
+  "overlays": []
+}

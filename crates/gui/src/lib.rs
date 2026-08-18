@@ -1,6 +1,6 @@
 //! Responsive egui protocol client and visual normalized-region editor.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -12,8 +12,10 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
     AtomicRulePredicate, BarDirection, DerivedInput, DerivedObservation, Detector, DetectorId,
-    Element, ElementId, EventRule, NormalizedRegion, ObservationCondition, PreprocessOperation,
-    Profile, ProfileId, ProfileStore, RuleId, RulePredicate,
+    Element, ElementId, EventRule, InteractionCaution, InteractionPoint, InteractionRole,
+    InteractionTarget, InteractionTargetId, NormalizedRegion, ObservationCondition, Overlay,
+    OverlayId, PreprocessOperation, Profile, ProfileId, ProfileStore, RecognitionCondition,
+    RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -53,6 +55,14 @@ enum RequestKind {
     CatalogStatus,
     CatalogList,
     CatalogInstall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewScope {
+    All,
+    GlobalAndAnchors,
+    Scene(SceneId),
+    Overlay(OverlayId),
 }
 
 #[derive(Debug)]
@@ -327,6 +337,7 @@ pub struct App {
     last_refresh: Instant,
     zoom: f32,
     pan: egui::Vec2,
+    preview_scope: Option<PreviewScope>,
     selected_region: Option<usize>,
     selected_derived: Option<usize>,
     drawing: bool,
@@ -438,6 +449,7 @@ impl App {
             last_refresh: Instant::now(),
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            preview_scope: None,
             selected_region: None,
             selected_derived: None,
             drawing: false,
@@ -1123,6 +1135,7 @@ impl App {
                 self.selected=Some(index);
                 self.draft=Some(self.profiles[index].clone());
                 self.dirty_since=None;
+                self.preview_scope=None;
                 self.selected_region=None;
                 self.revisions.clear();
                 self.selected_revision=None;
@@ -1378,6 +1391,9 @@ impl App {
                         self.gui_usage.cpu_percent,
                         self.gui_usage.rss_bytes as f64 / 1_048_576.0,
                     ));
+                    ui.separator();
+                    ui.strong("Scene context");
+                    ui.label(display_json(&self.state["context"]));
                     ui.separator();
                     ui.strong("Observations");
                     observations_ui(
@@ -1898,6 +1914,7 @@ impl App {
                 });
             });
             self.layout_compatibility_ui(ui, &profile);
+            self.scene_model_editor(ui, &mut profile);
             ui.strong("Detection hierarchy");
             for (derived_index, derived) in profile.derived_observations.iter().enumerate() {
                 ui.group(|ui| {
@@ -1998,6 +2015,7 @@ impl App {
                 }
                 self.detector_editor(ui, &mut profile, index);
             }
+            self.preview_scope_ui(ui, &profile);
             let size = ui.available_size().max(egui::vec2(200.0, 150.0));
             let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
             painter.rect_filled(response.rect, 0.0, egui::Color32::from_gray(24));
@@ -2020,6 +2038,280 @@ impl App {
             self.region_interaction(&response, &painter, base_canvas, &mut profile);
             self.draft = Some(profile);
         });
+    }
+
+    fn preview_scope_ui(&mut self, ui: &mut egui::Ui, profile: &Profile) {
+        let mut scope = normalized_preview_scope(profile, self.preview_scope);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Preview scope");
+            egui::ComboBox::from_id_salt("preview-scope")
+                .selected_text(preview_scope_label(profile, scope))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut scope, PreviewScope::All, "All layers");
+                    ui.selectable_value(
+                        &mut scope,
+                        PreviewScope::GlobalAndAnchors,
+                        "Global + all recognition anchors",
+                    );
+                    ui.separator();
+                    for scene in &profile.scenes {
+                        ui.selectable_value(
+                            &mut scope,
+                            PreviewScope::Scene(scene.id),
+                            format!("Scene · {}", scene.name),
+                        );
+                    }
+                    if !profile.overlays.is_empty() {
+                        ui.separator();
+                    }
+                    for overlay in &profile.overlays {
+                        ui.selectable_value(
+                            &mut scope,
+                            PreviewScope::Overlay(overlay.id),
+                            format!("Overlay · {}", overlay.name),
+                        );
+                    }
+                });
+            let detector_count = preview_element_ids(profile, scope).len();
+            let target_count = preview_target_count(profile, scope);
+            ui.small(format!(
+                "{detector_count} detector region(s) · {target_count} interaction target(s)"
+            ));
+        });
+        ui.small(
+            "Scene/overlay scopes show their global regions, recognition anchors, contextual detectors, visibility evidence, and owned targets. A detector selected above remains visible for editing.",
+        );
+        self.preview_scope = Some(scope);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn scene_model_editor(&mut self, ui: &mut egui::Ui, profile: &mut Profile) {
+        let elements = profile
+            .elements
+            .iter()
+            .map(|element| (element.id, element.name.clone()))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        let reference_size = (
+            profile.layout.reference_width,
+            profile.layout.reference_height,
+        );
+        let selected_target_region = self.selected_region.and_then(|index| {
+            profile.elements.get(index).map(|element| {
+                (
+                    element.region,
+                    format!("{}_action", stable_name(&element.name)),
+                )
+            })
+        });
+        ui.collapsing("Scene model and AI interaction geometry", |ui| {
+            ui.small(
+                "Targets only describe geometry and safe points. Yash never clicks or sends input.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Add scene").clicked() {
+                    profile.scenes.push(new_scene(&elements));
+                    changed = true;
+                }
+                if ui.button("Add overlay").clicked() {
+                    profile.overlays.push(new_overlay(&elements));
+                    changed = true;
+                }
+            });
+            let mut remove_scene = None;
+            let mut duplicate_scene = None;
+            let mut move_scene = None;
+            let scene_count = profile.scenes.len();
+            for (index, scene) in profile.scenes.iter_mut().enumerate() {
+                ui.collapsing(format!("Scene · {}", scene.name), |ui| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(&mut scene.name).changed();
+                        changed |= ui.checkbox(&mut scene.enabled, "Enabled").changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut scene.priority).prefix("priority "))
+                            .changed();
+                        if ui.small_button("Remove scene").clicked() {
+                            remove_scene = Some(index);
+                        }
+                        if ui.small_button("Duplicate").clicked() {
+                            duplicate_scene = Some(duplicate_scene_model(scene));
+                        }
+                        if index > 0 && ui.small_button("↑").clicked() {
+                            move_scene = Some((index, index - 1));
+                        }
+                        if index + 1 < scene_count && ui.small_button("↓").clicked() {
+                            move_scene = Some((index, index + 1));
+                        }
+                    });
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut scene.minimum_confidence, 0.0..=1.0)
+                                .text("minimum confidence"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut scene.ambiguity_margin, 0.0..=1.0)
+                                .text("ambiguity margin"),
+                        )
+                        .changed();
+                    changed |=
+                        sample_editor(ui, &mut scene.required_samples, &mut scene.sample_window);
+                    ui.strong("Recognition anchors");
+                    changed |=
+                        recognition_editor(ui, &mut scene.recognition, &elements, ("scene", index));
+                    ui.strong("Contextual detectors");
+                    changed |= element_membership_editor(
+                        ui,
+                        &mut scene.element_ids,
+                        &elements,
+                        ("scene-elements", index),
+                    );
+                    let contextual = elements
+                        .iter()
+                        .filter(|(id, _)| scene.element_ids.contains(id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ui.strong("Required for JSON-only handoff");
+                    changed |= element_membership_editor(
+                        ui,
+                        &mut scene.required_element_ids,
+                        &contextual,
+                        ("scene-required", index),
+                    );
+                    scene
+                        .required_element_ids
+                        .retain(|id| scene.element_ids.contains(id));
+                    ui.strong("Interaction targets");
+                    if let Some((region, name)) = &selected_target_region {
+                        if ui.button("Use selected drawn zone as target").clicked() {
+                            scene
+                                .interaction_targets
+                                .push(default_interaction_target(*region, name.clone()));
+                            changed = true;
+                        }
+                    }
+                    changed |= interaction_targets_editor(
+                        ui,
+                        &mut scene.interaction_targets,
+                        ("scene-targets", index),
+                        reference_size,
+                    );
+                });
+            }
+            if let Some(index) = remove_scene {
+                profile.scenes.remove(index);
+                changed = true;
+            }
+            if let Some((left, right)) = move_scene {
+                profile.scenes.swap(left, right);
+                changed = true;
+            }
+            if let Some(scene) = duplicate_scene {
+                profile.scenes.push(scene);
+                changed = true;
+            }
+            let mut remove_overlay = None;
+            let mut duplicate_overlay = None;
+            let mut move_overlay = None;
+            let overlay_count = profile.overlays.len();
+            for (index, overlay) in profile.overlays.iter_mut().enumerate() {
+                ui.collapsing(format!("Overlay · {}", overlay.name), |ui| {
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(&mut overlay.name).changed();
+                        changed |= ui.checkbox(&mut overlay.enabled, "Enabled").changed();
+                        changed |= ui
+                            .checkbox(&mut overlay.blocks_scene_targets, "Block scene targets")
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut overlay.priority).prefix("priority "))
+                            .changed();
+                        if ui.small_button("Remove overlay").clicked() {
+                            remove_overlay = Some(index);
+                        }
+                        if ui.small_button("Duplicate").clicked() {
+                            duplicate_overlay = Some(duplicate_overlay_model(overlay));
+                        }
+                        if index > 0 && ui.small_button("↑").clicked() {
+                            move_overlay = Some((index, index - 1));
+                        }
+                        if index + 1 < overlay_count && ui.small_button("↓").clicked() {
+                            move_overlay = Some((index, index + 1));
+                        }
+                    });
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut overlay.minimum_confidence, 0.0..=1.0)
+                                .text("minimum confidence"),
+                        )
+                        .changed();
+                    changed |= sample_editor(
+                        ui,
+                        &mut overlay.required_samples,
+                        &mut overlay.sample_window,
+                    );
+                    ui.strong("Recognition anchors");
+                    changed |= recognition_editor(
+                        ui,
+                        &mut overlay.recognition,
+                        &elements,
+                        ("overlay", index),
+                    );
+                    ui.strong("Contextual detectors");
+                    changed |= element_membership_editor(
+                        ui,
+                        &mut overlay.element_ids,
+                        &elements,
+                        ("overlay-elements", index),
+                    );
+                    let contextual = elements
+                        .iter()
+                        .filter(|(id, _)| overlay.element_ids.contains(id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    ui.strong("Required for JSON-only handoff");
+                    changed |= element_membership_editor(
+                        ui,
+                        &mut overlay.required_element_ids,
+                        &contextual,
+                        ("overlay-required", index),
+                    );
+                    overlay
+                        .required_element_ids
+                        .retain(|id| overlay.element_ids.contains(id));
+                    ui.strong("Interaction targets");
+                    if let Some((region, name)) = &selected_target_region {
+                        if ui.button("Use selected drawn zone as target").clicked() {
+                            overlay
+                                .interaction_targets
+                                .push(default_interaction_target(*region, name.clone()));
+                            changed = true;
+                        }
+                    }
+                    changed |= interaction_targets_editor(
+                        ui,
+                        &mut overlay.interaction_targets,
+                        ("overlay-targets", index),
+                        reference_size,
+                    );
+                });
+            }
+            if let Some(index) = remove_overlay {
+                profile.overlays.remove(index);
+                changed = true;
+            }
+            if let Some((left, right)) = move_overlay {
+                profile.overlays.swap(left, right);
+                changed = true;
+            }
+            if let Some(overlay) = duplicate_overlay {
+                profile.overlays.push(overlay);
+                changed = true;
+            }
+        });
+        if changed {
+            self.mark_dirty();
+        }
     }
 
     fn layout_compatibility_ui(&self, ui: &mut egui::Ui, profile: &Profile) {
@@ -2243,6 +2535,7 @@ impl App {
                     preprocessing: Vec::new(),
                     empty_value: None,
                     zero_pad_to: None,
+                    retry: None,
                 },
                 "Seven segment" => Detector::SevenSegment {
                     id: DetectorId::new(),
@@ -2775,33 +3068,25 @@ impl App {
         canvas: egui::Rect,
         profile: &mut Profile,
     ) {
-        for (index, element) in profile.elements.iter().enumerate() {
-            let rect = region_rect(canvas, self.zoom, self.pan, element.region);
-            painter.rect_stroke(
-                rect,
-                0.0,
-                egui::Stroke::new(
-                    if self.selected_region == Some(index) {
-                        3.0
-                    } else {
-                        1.5
-                    },
-                    if element.enabled {
-                        egui::Color32::LIGHT_GREEN
-                    } else {
-                        egui::Color32::GRAY
-                    },
-                ),
-                egui::StrokeKind::Inside,
-            );
-            painter.text(
-                rect.left_top() + egui::vec2(3.0, 3.0),
-                egui::Align2::LEFT_TOP,
-                &element.name,
-                egui::FontId::proportional(13.0),
-                egui::Color32::WHITE,
-            );
+        let scope = normalized_preview_scope(profile, self.preview_scope);
+        self.preview_scope = Some(scope);
+        let mut visible_element_ids = preview_element_ids(profile, scope);
+        if let Some(selected) = self
+            .selected_region
+            .and_then(|index| profile.elements.get(index))
+        {
+            visible_element_ids.insert(selected.id);
         }
+        paint_detector_regions(
+            painter,
+            canvas,
+            self.zoom,
+            self.pan,
+            profile,
+            &visible_element_ids,
+            self.selected_region,
+        );
+        paint_interaction_targets(painter, canvas, self.zoom, self.pan, profile, scope);
         if response.dragged_by(egui::PointerButton::Middle) {
             self.pan += response.drag_delta();
             return;
@@ -2815,7 +3100,7 @@ impl App {
                 painter.rect_stroke(
                     egui::Rect::from_two_pos(start, current),
                     0.0,
-                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                    egui::Stroke::new(2.0_f32, egui::Color32::YELLOW),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -2835,13 +3120,26 @@ impl App {
         }
         if response.clicked() {
             self.selected_region = pointer_position.and_then(|position| {
-                region_at_position(&profile.elements, canvas, self.zoom, self.pan, position)
+                region_at_position(
+                    &profile.elements,
+                    &visible_element_ids,
+                    canvas,
+                    self.zoom,
+                    self.pan,
+                    position,
+                )
             });
         }
         if response.drag_started() {
             if let Some(position) = pointer_position {
-                self.selected_region =
-                    region_at_position(&profile.elements, canvas, self.zoom, self.pan, position);
+                self.selected_region = region_at_position(
+                    &profile.elements,
+                    &visible_element_ids,
+                    canvas,
+                    self.zoom,
+                    self.pan,
+                    position,
+                );
                 if let Some(index) = self.selected_region {
                     let rect =
                         region_rect(canvas, self.zoom, self.pan, profile.elements[index].region);
@@ -3412,6 +3710,231 @@ fn downscale_preview(
     }
 }
 
+fn paint_interaction_targets(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    zoom: f32,
+    pan: egui::Vec2,
+    profile: &Profile,
+    scope: PreviewScope,
+) {
+    for target in preview_interaction_targets(profile, scope) {
+        let rect = region_rect(canvas, zoom, pan, target.region);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(2.0_f32, egui::Color32::LIGHT_BLUE),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.right_top() + egui::vec2(-3.0, 3.0),
+            egui::Align2::RIGHT_TOP,
+            &target.name,
+            egui::FontId::proportional(13.0),
+            egui::Color32::LIGHT_BLUE,
+        );
+        if let Some(point) = target.interaction_point {
+            let normalized = match point {
+                InteractionPoint::Explicit { x, y } => egui::pos2(x, y),
+                InteractionPoint::Center => egui::pos2(
+                    target.region.x + target.region.width / 2.0,
+                    target.region.y + target.region.height / 2.0,
+                ),
+            };
+            let point = egui::pos2(
+                canvas.left() + pan.x + normalized.x * canvas.width() * zoom,
+                canvas.top() + pan.y + normalized.y * canvas.height() * zoom,
+            );
+            painter.circle_filled(point, 4.0, egui::Color32::LIGHT_BLUE);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_detector_regions(
+    painter: &egui::Painter,
+    canvas: egui::Rect,
+    zoom: f32,
+    pan: egui::Vec2,
+    profile: &Profile,
+    visible_element_ids: &HashSet<ElementId>,
+    selected_region: Option<usize>,
+) {
+    for (index, element) in profile
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| visible_element_ids.contains(&element.id))
+    {
+        let rect = region_rect(canvas, zoom, pan, element.region);
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(
+                if selected_region == Some(index) {
+                    3.0_f32
+                } else {
+                    1.5_f32
+                },
+                if element.enabled {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::GRAY
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(3.0, 3.0),
+            egui::Align2::LEFT_TOP,
+            &element.name,
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+fn normalized_preview_scope(profile: &Profile, scope: Option<PreviewScope>) -> PreviewScope {
+    match scope {
+        Some(PreviewScope::Scene(id)) if profile.scenes.iter().any(|scene| scene.id == id) => {
+            PreviewScope::Scene(id)
+        }
+        Some(PreviewScope::Overlay(id))
+            if profile.overlays.iter().any(|overlay| overlay.id == id) =>
+        {
+            PreviewScope::Overlay(id)
+        }
+        Some(PreviewScope::All) => PreviewScope::All,
+        Some(PreviewScope::GlobalAndAnchors) => PreviewScope::GlobalAndAnchors,
+        _ => profile.scenes.first().map_or_else(
+            || {
+                profile
+                    .overlays
+                    .first()
+                    .map_or(PreviewScope::All, |overlay| {
+                        PreviewScope::Overlay(overlay.id)
+                    })
+            },
+            |scene| PreviewScope::Scene(scene.id),
+        ),
+    }
+}
+
+fn preview_scope_label(profile: &Profile, scope: PreviewScope) -> String {
+    match scope {
+        PreviewScope::All => "All layers".into(),
+        PreviewScope::GlobalAndAnchors => "Global + all recognition anchors".into(),
+        PreviewScope::Scene(id) => profile
+            .scenes
+            .iter()
+            .find(|scene| scene.id == id)
+            .map_or_else(
+                || "Scene · missing".into(),
+                |scene| format!("Scene · {}", scene.name),
+            ),
+        PreviewScope::Overlay(id) => profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == id)
+            .map_or_else(
+                || "Overlay · missing".into(),
+                |overlay| format!("Overlay · {}", overlay.name),
+            ),
+    }
+}
+
+fn extend_recognition_ids(ids: &mut HashSet<ElementId>, expression: &RecognitionExpression) {
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    ids.extend(conditions.iter().map(|condition| condition.element_id));
+}
+
+fn extend_target_visibility_ids<'a>(
+    ids: &mut HashSet<ElementId>,
+    targets: impl IntoIterator<Item = &'a InteractionTarget>,
+) {
+    for target in targets {
+        if let Some(visibility) = &target.visibility {
+            extend_recognition_ids(ids, visibility);
+        }
+    }
+}
+
+fn preview_element_ids(profile: &Profile, scope: PreviewScope) -> HashSet<ElementId> {
+    if scope == PreviewScope::All {
+        return profile.elements.iter().map(|element| element.id).collect();
+    }
+    let mut ids = profile
+        .global_elements
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    match scope {
+        PreviewScope::All => unreachable!("handled above"),
+        PreviewScope::GlobalAndAnchors => {
+            for recognition in profile
+                .scenes
+                .iter()
+                .map(|scene| &scene.recognition)
+                .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+            {
+                extend_recognition_ids(&mut ids, recognition);
+            }
+        }
+        PreviewScope::Scene(id) => {
+            if let Some(scene) = profile.scenes.iter().find(|scene| scene.id == id) {
+                extend_recognition_ids(&mut ids, &scene.recognition);
+                ids.extend(scene.element_ids.iter().copied());
+                extend_target_visibility_ids(&mut ids, &scene.interaction_targets);
+            }
+        }
+        PreviewScope::Overlay(id) => {
+            if let Some(overlay) = profile.overlays.iter().find(|overlay| overlay.id == id) {
+                extend_recognition_ids(&mut ids, &overlay.recognition);
+                ids.extend(overlay.element_ids.iter().copied());
+                extend_target_visibility_ids(&mut ids, &overlay.interaction_targets);
+            }
+        }
+    }
+    ids
+}
+
+fn preview_interaction_targets(profile: &Profile, scope: PreviewScope) -> Vec<&InteractionTarget> {
+    match scope {
+        PreviewScope::All => profile
+            .scenes
+            .iter()
+            .flat_map(|scene| &scene.interaction_targets)
+            .chain(
+                profile
+                    .overlays
+                    .iter()
+                    .flat_map(|overlay| &overlay.interaction_targets),
+            )
+            .collect(),
+        PreviewScope::Scene(id) => profile
+            .scenes
+            .iter()
+            .find(|scene| scene.id == id)
+            .map_or_else(Vec::new, |scene| scene.interaction_targets.iter().collect()),
+        PreviewScope::Overlay(id) => profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.id == id)
+            .map_or_else(Vec::new, |overlay| {
+                overlay.interaction_targets.iter().collect()
+            }),
+        PreviewScope::GlobalAndAnchors => Vec::new(),
+    }
+}
+
+fn preview_target_count(profile: &Profile, scope: PreviewScope) -> usize {
+    preview_interaction_targets(profile, scope).len()
+}
+
 fn region_rect(
     canvas: egui::Rect,
     zoom: f32,
@@ -3427,6 +3950,7 @@ fn region_rect(
 
 fn region_at_position(
     elements: &[Element],
+    visible_element_ids: &HashSet<ElementId>,
     canvas: egui::Rect,
     zoom: f32,
     pan: egui::Vec2,
@@ -3436,7 +3960,10 @@ fn region_at_position(
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, element)| region_rect(canvas, zoom, pan, element.region).contains(position))
+        .find(|(_, element)| {
+            visible_element_ids.contains(&element.id)
+                && region_rect(canvas, zoom, pan, element.region).contains(position)
+        })
         .map(|(index, _)| index)
 }
 
@@ -3580,6 +4107,427 @@ fn predicate_choice(
     false
 }
 
+fn new_recognition(elements: &[(ElementId, String)]) -> RecognitionExpression {
+    RecognitionExpression::All {
+        conditions: elements.first().map_or_else(Vec::new, |(element_id, _)| {
+            vec![RecognitionCondition {
+                element_id: *element_id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }]
+        }),
+    }
+}
+
+fn new_scene(elements: &[(ElementId, String)]) -> Scene {
+    Scene {
+        id: SceneId::new(),
+        name: "new_scene".into(),
+        description: String::new(),
+        enabled: true,
+        priority: 0,
+        recognition: new_recognition(elements),
+        minimum_confidence: 0.8,
+        ambiguity_margin: 0.1,
+        required_samples: 2,
+        sample_window: 3,
+        element_ids: elements.iter().map(|(id, _)| *id).collect(),
+        required_element_ids: Vec::new(),
+        interaction_targets: Vec::new(),
+        transition_hints: Vec::new(),
+    }
+}
+
+fn new_overlay(elements: &[(ElementId, String)]) -> Overlay {
+    Overlay {
+        id: OverlayId::new(),
+        name: "new_overlay".into(),
+        description: String::new(),
+        enabled: true,
+        blocks_scene_targets: false,
+        priority: 0,
+        recognition: new_recognition(elements),
+        minimum_confidence: 0.8,
+        required_samples: 2,
+        sample_window: 3,
+        element_ids: Vec::new(),
+        required_element_ids: Vec::new(),
+        interaction_targets: Vec::new(),
+    }
+}
+
+fn duplicate_scene_model(scene: &Scene) -> Scene {
+    let mut duplicate = scene.clone();
+    duplicate.id = SceneId::new();
+    duplicate.name = format!("{}_copy", scene.name).chars().take(64).collect();
+    for target in &mut duplicate.interaction_targets {
+        target.id = InteractionTargetId::new();
+    }
+    duplicate
+}
+
+fn duplicate_overlay_model(overlay: &Overlay) -> Overlay {
+    let mut duplicate = overlay.clone();
+    duplicate.id = OverlayId::new();
+    duplicate.name = format!("{}_copy", overlay.name).chars().take(64).collect();
+    for target in &mut duplicate.interaction_targets {
+        target.id = InteractionTargetId::new();
+    }
+    duplicate
+}
+
+fn stable_name(value: &str) -> String {
+    let mut name = String::new();
+    let mut separator = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !name.is_empty() {
+                name.push('_');
+            }
+            name.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    if name.is_empty() {
+        "target".into()
+    } else {
+        name.truncate(56);
+        name
+    }
+}
+
+fn default_interaction_target(region: NormalizedRegion, name: String) -> InteractionTarget {
+    InteractionTarget {
+        id: InteractionTargetId::new(),
+        name,
+        role: InteractionRole::Action,
+        region,
+        interaction_point: Some(InteractionPoint::Center),
+        visibility: None,
+        required_for_json: true,
+        caution_class: None,
+        caution: None,
+    }
+}
+
+fn sample_editor(ui: &mut egui::Ui, required: &mut u16, window: &mut u16) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                egui::DragValue::new(required)
+                    .range(1..=32)
+                    .prefix("samples "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(window)
+                    .range(1..=32)
+                    .prefix("of window "),
+            )
+            .changed();
+    });
+    *window = (*window).max(*required);
+    changed
+}
+
+fn recognition_editor(
+    ui: &mut egui::Ui,
+    expression: &mut RecognitionExpression,
+    elements: &[(ElementId, String)],
+    salt: (&'static str, usize),
+) -> bool {
+    let mut changed = false;
+    let mut require_all = matches!(expression, RecognitionExpression::All { .. });
+    egui::ComboBox::from_id_salt((salt, "mode"))
+        .selected_text(if require_all {
+            "all anchors"
+        } else {
+            "any anchor"
+        })
+        .show_ui(ui, |ui| {
+            changed |= ui
+                .selectable_value(&mut require_all, true, "all anchors")
+                .changed();
+            changed |= ui
+                .selectable_value(&mut require_all, false, "any anchor")
+                .changed();
+        });
+    let was_all = matches!(expression, RecognitionExpression::All { .. });
+    if was_all != require_all {
+        let conditions = match std::mem::take(expression) {
+            RecognitionExpression::All { conditions }
+            | RecognitionExpression::Any { conditions } => conditions,
+        };
+        *expression = if require_all {
+            RecognitionExpression::All { conditions }
+        } else {
+            RecognitionExpression::Any { conditions }
+        };
+    }
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    let mut remove = None;
+    for (index, condition) in conditions.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt((salt, "element", index))
+                    .selected_text(
+                        elements
+                            .iter()
+                            .find(|(id, _)| *id == condition.element_id)
+                            .map_or("missing element", |(_, name)| name),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (id, name) in elements {
+                            changed |= ui
+                                .selectable_value(&mut condition.element_id, *id, name)
+                                .changed();
+                        }
+                    });
+                let mut kind = atomic_predicate_kind(&condition.predicate);
+                egui::ComboBox::from_id_salt((salt, "kind", index))
+                    .selected_text(kind.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in AtomicPredicateKind::ALL {
+                            changed |= ui
+                                .selectable_value(&mut kind, candidate, candidate.label())
+                                .changed();
+                        }
+                    });
+                if kind != atomic_predicate_kind(&condition.predicate) {
+                    condition.predicate = kind.default_predicate();
+                    changed = true;
+                }
+                changed |= ui
+                    .add(egui::Slider::new(&mut condition.weight, 0.01..=10.0).text("weight"))
+                    .changed();
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            changed |= atomic_predicate_value_editor(ui, &mut condition.predicate);
+        });
+    }
+    if let Some(index) = remove {
+        conditions.remove(index);
+        changed = true;
+    }
+    if conditions.len() < 32
+        && !elements.is_empty()
+        && ui.button("Add recognition anchor").clicked()
+    {
+        conditions.push(RecognitionCondition {
+            element_id: elements[0].0,
+            predicate: AtomicRulePredicate::Boolean { expected: true },
+            weight: 1.0,
+        });
+        changed = true;
+    }
+    changed
+}
+
+fn atomic_predicate_value_editor(ui: &mut egui::Ui, predicate: &mut AtomicRulePredicate) -> bool {
+    match predicate {
+        AtomicRulePredicate::Boolean { expected } => ui.checkbox(expected, "Expected").changed(),
+        AtomicRulePredicate::TextEquals { expected } => ui.text_edit_singleline(expected).changed(),
+        AtomicRulePredicate::TextContains { needle } => ui.text_edit_singleline(needle).changed(),
+        AtomicRulePredicate::NumericBelow { threshold_micros }
+        | AtomicRulePredicate::NumericAbove { threshold_micros }
+        | AtomicRulePredicate::ConfidenceAbove { threshold_micros } => ui
+            .add(egui::DragValue::new(threshold_micros).prefix("threshold µ "))
+            .changed(),
+    }
+}
+
+fn element_membership_editor(
+    ui: &mut egui::Ui,
+    selected: &mut Vec<ElementId>,
+    elements: &[(ElementId, String)],
+    salt: (&'static str, usize),
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        for (element_id, name) in elements {
+            let mut active = selected.contains(element_id);
+            if ui
+                .push_id((salt, *element_id), |ui| ui.checkbox(&mut active, name))
+                .inner
+                .changed()
+            {
+                if active {
+                    selected.push(*element_id);
+                } else {
+                    selected.retain(|id| id != element_id);
+                }
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+#[allow(clippy::too_many_lines)]
+fn interaction_targets_editor(
+    ui: &mut egui::Ui,
+    targets: &mut Vec<InteractionTarget>,
+    salt: (&'static str, usize),
+    reference_size: (u32, u32),
+) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    for (index, target) in targets.iter_mut().enumerate() {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                changed |= ui.text_edit_singleline(&mut target.name).changed();
+                egui::ComboBox::from_id_salt((salt, "role", index))
+                    .selected_text(format!("{:?}", target.role).to_ascii_lowercase())
+                    .show_ui(ui, |ui| {
+                        for (role, label) in [
+                            (InteractionRole::Action, "action"),
+                            (InteractionRole::Navigation, "navigation"),
+                            (InteractionRole::Dismiss, "dismiss"),
+                            (InteractionRole::Selection, "selection"),
+                        ] {
+                            changed |= ui.selectable_value(&mut target.role, role, label).changed();
+                        }
+                    });
+                changed |= ui
+                    .checkbox(&mut target.required_for_json, "Required for JSON")
+                    .changed();
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            ui.small(format!(
+                "reference pixels: x {:.0} y {:.0} w {:.0} h {:.0} @ {}×{}",
+                f64::from(target.region.x) * f64::from(reference_size.0),
+                f64::from(target.region.y) * f64::from(reference_size.1),
+                f64::from(target.region.width) * f64::from(reference_size.0),
+                f64::from(target.region.height) * f64::from(reference_size.1),
+                reference_size.0,
+                reference_size.1,
+            ));
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt((salt, "caution_class", index))
+                    .selected_text(target.caution_class.map_or_else(
+                        || "unclassified".into(),
+                        |value| format!("{value:?}").to_ascii_lowercase(),
+                    ))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (None, "unclassified"),
+                            (Some(InteractionCaution::Navigation), "navigation"),
+                            (Some(InteractionCaution::RoutineAction), "routine_action"),
+                            (Some(InteractionCaution::Consequential), "consequential"),
+                            (Some(InteractionCaution::NeverAutomatic), "never_automatic"),
+                        ] {
+                            changed |= ui
+                                .selectable_value(&mut target.caution_class, value, label)
+                                .changed();
+                        }
+                    });
+                let caution = target.caution.get_or_insert_with(String::new);
+                changed |= ui
+                    .text_edit_singleline(caution)
+                    .on_hover_text("Preconditions or safety warning")
+                    .changed();
+                if caution.is_empty() {
+                    target.caution = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut target.region.x)
+                            .speed(0.001)
+                            .prefix("x "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut target.region.y)
+                            .speed(0.001)
+                            .prefix("y "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut target.region.width)
+                            .speed(0.001)
+                            .prefix("w "),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut target.region.height)
+                            .speed(0.001)
+                            .prefix("h "),
+                    )
+                    .changed();
+            });
+            let mut point_mode = match target.interaction_point {
+                None => 0,
+                Some(InteractionPoint::Center) => 1,
+                Some(InteractionPoint::Explicit { .. }) => 2,
+            };
+            egui::ComboBox::from_id_salt((salt, "point", index))
+                .selected_text(["no safe point", "center", "explicit"][point_mode])
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut point_mode, 0, "no safe point")
+                        .changed();
+                    changed |= ui.selectable_value(&mut point_mode, 1, "center").changed();
+                    changed |= ui
+                        .selectable_value(&mut point_mode, 2, "explicit")
+                        .changed();
+                });
+            target.interaction_point = match (point_mode, target.interaction_point) {
+                (1, _) => Some(InteractionPoint::Center),
+                (2, Some(point @ InteractionPoint::Explicit { .. })) => Some(point),
+                (2, _) => Some(InteractionPoint::Explicit {
+                    x: target.region.x + target.region.width / 2.0,
+                    y: target.region.y + target.region.height / 2.0,
+                }),
+                _ => None,
+            };
+            if let Some(InteractionPoint::Explicit { x, y }) = &mut target.interaction_point {
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(x).speed(0.001).prefix("safe x "))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(y).speed(0.001).prefix("safe y "))
+                        .changed();
+                });
+            }
+        });
+    }
+    if let Some(index) = remove {
+        targets.remove(index);
+        changed = true;
+    }
+    if targets.len() < 256 && ui.button("Add interaction target").clicked() {
+        targets.push(default_interaction_target(
+            NormalizedRegion {
+                x: 0.4,
+                y: 0.4,
+                width: 0.2,
+                height: 0.2,
+            },
+            format!("target_{}", targets.len() + 1),
+        ));
+        changed = true;
+    }
+    changed
+}
+
 fn composition_editor(
     ui: &mut egui::Ui,
     conditions: &mut Vec<ObservationCondition>,
@@ -3631,7 +4579,9 @@ fn composition_editor(
                 AtomicRulePredicate::TextContains { needle } => {
                     changed |= ui.text_edit_singleline(needle).changed();
                 }
-                AtomicRulePredicate::NumericBelow { threshold_micros } => {
+                AtomicRulePredicate::NumericBelow { threshold_micros }
+                | AtomicRulePredicate::NumericAbove { threshold_micros }
+                | AtomicRulePredicate::ConfidenceAbove { threshold_micros } => {
                     changed |= ui
                         .add(egui::DragValue::new(threshold_micros).prefix("threshold µ "))
                         .changed();
@@ -3659,14 +4609,18 @@ enum AtomicPredicateKind {
     TextEquals,
     TextContains,
     NumericBelow,
+    NumericAbove,
+    ConfidenceAbove,
 }
 
 impl AtomicPredicateKind {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::Boolean,
         Self::TextEquals,
         Self::TextContains,
         Self::NumericBelow,
+        Self::NumericAbove,
+        Self::ConfidenceAbove,
     ];
 
     const fn label(self) -> &'static str {
@@ -3675,6 +4629,8 @@ impl AtomicPredicateKind {
             Self::TextEquals => "text equals",
             Self::TextContains => "text contains",
             Self::NumericBelow => "numeric below",
+            Self::NumericAbove => "numeric above",
+            Self::ConfidenceAbove => "confidence above",
         }
     }
 
@@ -3690,6 +4646,12 @@ impl AtomicPredicateKind {
             Self::NumericBelow => AtomicRulePredicate::NumericBelow {
                 threshold_micros: 200_000,
             },
+            Self::NumericAbove => AtomicRulePredicate::NumericAbove {
+                threshold_micros: 800_000,
+            },
+            Self::ConfidenceAbove => AtomicRulePredicate::ConfidenceAbove {
+                threshold_micros: 800_000,
+            },
         }
     }
 }
@@ -3700,6 +4662,8 @@ fn atomic_predicate_kind(predicate: &AtomicRulePredicate) -> AtomicPredicateKind
         AtomicRulePredicate::TextEquals { .. } => AtomicPredicateKind::TextEquals,
         AtomicRulePredicate::TextContains { .. } => AtomicPredicateKind::TextContains,
         AtomicRulePredicate::NumericBelow { .. } => AtomicPredicateKind::NumericBelow,
+        AtomicRulePredicate::NumericAbove { .. } => AtomicPredicateKind::NumericAbove,
+        AtomicRulePredicate::ConfidenceAbove { .. } => AtomicPredicateKind::ConfidenceAbove,
     }
 }
 
@@ -3763,6 +4727,37 @@ fn default_element(region: NormalizedRegion) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_and_overlay_duplicates_rekey_interaction_targets() {
+        let elements = vec![(ElementId::new(), "Anchor".into())];
+        let mut scene = new_scene(&elements);
+        scene.interaction_targets.push(default_interaction_target(
+            NormalizedRegion {
+                x: 0.2,
+                y: 0.3,
+                width: 0.4,
+                height: 0.1,
+            },
+            "play_button".into(),
+        ));
+        let scene_copy = duplicate_scene_model(&scene);
+        assert_ne!(scene_copy.id, scene.id);
+        assert_ne!(
+            scene_copy.interaction_targets[0].id,
+            scene.interaction_targets[0].id
+        );
+        assert_eq!(scene_copy.element_ids, scene.element_ids);
+
+        let mut overlay = new_overlay(&elements);
+        overlay.interaction_targets = scene.interaction_targets.clone();
+        let overlay_copy = duplicate_overlay_model(&overlay);
+        assert_ne!(overlay_copy.id, overlay.id);
+        assert_ne!(
+            overlay_copy.interaction_targets[0].id,
+            overlay.interaction_targets[0].id
+        );
+    }
 
     #[test]
     fn layout_aspect_ratio_is_human_readable() {
@@ -3834,9 +4829,11 @@ mod tests {
                 height: 0.5,
             }),
         ];
+        let visible = elements.iter().map(|element| element.id).collect();
         assert_eq!(
             region_at_position(
                 &elements,
+                &visible,
                 canvas,
                 1.0,
                 egui::Vec2::ZERO,
@@ -3847,12 +4844,139 @@ mod tests {
         assert_eq!(
             region_at_position(
                 &elements,
+                &visible,
                 canvas,
                 1.0,
                 egui::Vec2::ZERO,
                 egui::pos2(90.0, 90.0)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn scene_preview_scope_is_readable_and_complete() {
+        let mut profile = Profile::new("Game", "game", 558, 992);
+        profile.elements = (0_u8..6)
+            .map(|index| {
+                let mut element = default_element(NormalizedRegion {
+                    x: f32::from(index) / 10.0,
+                    y: 0.1,
+                    width: 0.05,
+                    height: 0.05,
+                });
+                element.name = format!("element_{index}");
+                element
+            })
+            .collect();
+        let global = profile.elements[0].id;
+        let scene_anchor = profile.elements[1].id;
+        let scene_context = profile.elements[2].id;
+        let visibility_anchor = profile.elements[3].id;
+        let overlay_anchor = profile.elements[4].id;
+        let unrelated = profile.elements[5].id;
+        profile.global_elements = vec![global];
+
+        let mut scene = new_scene(&[]);
+        scene.name = "home".into();
+        scene.recognition = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: scene_anchor,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        scene.element_ids = vec![scene_context];
+        let mut scene_target = default_interaction_target(
+            NormalizedRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.2,
+                height: 0.1,
+            },
+            "play".into(),
+        );
+        scene_target.visibility = Some(RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: visibility_anchor,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        });
+        scene.interaction_targets.push(scene_target);
+        let scene_id = scene.id;
+
+        let mut overlay = new_overlay(&[]);
+        overlay.name = "dialog".into();
+        overlay.recognition = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: overlay_anchor,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        overlay.interaction_targets.push(default_interaction_target(
+            NormalizedRegion {
+                x: 0.3,
+                y: 0.3,
+                width: 0.2,
+                height: 0.1,
+            },
+            "close".into(),
+        ));
+        profile.scenes.push(scene);
+        profile.overlays.push(overlay);
+
+        let visible = preview_element_ids(&profile, PreviewScope::Scene(scene_id));
+        assert_eq!(
+            visible,
+            HashSet::from([global, scene_anchor, scene_context, visibility_anchor])
+        );
+        assert!(!visible.contains(&overlay_anchor));
+        assert!(!visible.contains(&unrelated));
+        assert_eq!(
+            preview_target_count(&profile, PreviewScope::Scene(scene_id)),
+            1
+        );
+        assert_eq!(
+            preview_target_count(&profile, PreviewScope::GlobalAndAnchors),
+            0
+        );
+        assert_eq!(preview_target_count(&profile, PreviewScope::All), 2);
+        assert_eq!(
+            normalized_preview_scope(&profile, None),
+            PreviewScope::Scene(scene_id)
+        );
+    }
+
+    #[test]
+    fn scoped_hit_testing_skips_hidden_regions() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let elements = vec![
+            default_element(NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            default_element(NormalizedRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.5,
+                height: 0.5,
+            }),
+        ];
+        let visible = HashSet::from([elements[0].id]);
+        assert_eq!(
+            region_at_position(
+                &elements,
+                &visible,
+                canvas,
+                1.0,
+                egui::Vec2::ZERO,
+                egui::pos2(30.0, 30.0),
+            ),
+            Some(0)
         );
     }
 

@@ -8,7 +8,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use yash_app_events_output::OutputRecipe;
 
-use crate::{save_profile, ElementId, Profile, ProfileId, RuleId, RulePredicate, StorageError};
+use crate::{
+    save_profile, ElementId, InteractionTarget, OverlayId, Profile, ProfileId,
+    RecognitionExpression, RuleId, RulePredicate, SceneId, StorageError,
+};
 
 const PROFILE_FILE: &str = "profile.json";
 const DRAFT_FILE: &str = "draft.json";
@@ -233,6 +236,35 @@ impl ProfileStore {
             }
             remap_composition_elements(rule, |id| element_ids.get(&id).copied());
         }
+        duplicate.global_elements = duplicate
+            .global_elements
+            .iter()
+            .filter_map(|id| element_ids.get(id).copied())
+            .collect();
+        let scene_ids = duplicate
+            .scenes
+            .iter()
+            .map(|scene| (scene.id, SceneId::new()))
+            .collect::<HashMap<_, _>>();
+        for scene in &mut duplicate.scenes {
+            scene.id = scene_ids[&scene.id];
+            remap_scene_elements(&mut scene.element_ids, &element_ids);
+            remap_scene_elements(&mut scene.required_element_ids, &element_ids);
+            remap_recognition(&mut scene.recognition, &element_ids);
+            remap_interaction_targets(&mut scene.interaction_targets, &element_ids);
+            scene.transition_hints = scene
+                .transition_hints
+                .iter()
+                .filter_map(|id| scene_ids.get(id).copied())
+                .collect();
+        }
+        for overlay in &mut duplicate.overlays {
+            overlay.id = OverlayId::new();
+            remap_scene_elements(&mut overlay.element_ids, &element_ids);
+            remap_scene_elements(&mut overlay.required_element_ids, &element_ids);
+            remap_recognition(&mut overlay.recognition, &element_ids);
+            remap_interaction_targets(&mut overlay.interaction_targets, &element_ids);
+        }
         let source_directory = self.profile_directory(source_id);
         let destination = self.profile_directory(duplicate.id);
         copy_portable_tree(&source_directory, &destination)?;
@@ -269,6 +301,25 @@ impl ProfileStore {
         duplicate.detector.assign_new_id();
         let new_id = duplicate.id;
         profile.elements.push(duplicate);
+        if profile.global_elements.contains(&element_id) {
+            profile.global_elements.push(new_id);
+        }
+        for scene in &mut profile.scenes {
+            if scene.element_ids.contains(&element_id) {
+                scene.element_ids.push(new_id);
+            }
+            if scene.required_element_ids.contains(&element_id) {
+                scene.required_element_ids.push(new_id);
+            }
+        }
+        for overlay in &mut profile.overlays {
+            if overlay.element_ids.contains(&element_id) {
+                overlay.element_ids.push(new_id);
+            }
+            if overlay.required_element_ids.contains(&element_id) {
+                overlay.required_element_ids.push(new_id);
+            }
+        }
         if copy_rules {
             let copied: Vec<_> = profile
                 .rules
@@ -363,6 +414,44 @@ impl ProfileStore {
             fs::remove_file(entry.path())?;
         }
         Ok(())
+    }
+}
+
+fn remap_scene_elements(
+    references: &mut Vec<ElementId>,
+    element_ids: &HashMap<ElementId, ElementId>,
+) {
+    *references = references
+        .iter()
+        .filter_map(|id| element_ids.get(id).copied())
+        .collect();
+}
+
+fn remap_recognition(
+    expression: &mut RecognitionExpression,
+    element_ids: &HashMap<ElementId, ElementId>,
+) {
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    for condition in conditions {
+        if let Some(id) = element_ids.get(&condition.element_id) {
+            condition.element_id = *id;
+        }
+    }
+}
+
+fn remap_interaction_targets(
+    targets: &mut [InteractionTarget],
+    element_ids: &HashMap<ElementId, ElementId>,
+) {
+    for target in targets {
+        target.id = crate::InteractionTargetId::new();
+        if let Some(visibility) = &mut target.visibility {
+            remap_recognition(visibility, element_ids);
+        }
     }
 }
 
@@ -492,7 +581,9 @@ pub enum StoreError {
 mod tests {
     use crate::{
         AtomicRulePredicate, BarDirection, Detector, DetectorId, Element, EventRule,
-        NormalizedRegion, ObservationCondition, RulePredicate,
+        InteractionPoint, InteractionRole, InteractionTarget, InteractionTargetId,
+        NormalizedRegion, ObservationCondition, Overlay, OverlayId, RecognitionCondition,
+        RecognitionExpression, RulePredicate, Scene, SceneId,
     };
 
     use super::*;
@@ -623,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn deep_duplicate_rekeys_objects_copies_assets_and_resets_history() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 20);
@@ -633,6 +725,82 @@ mod tests {
                 predicate: AtomicRulePredicate::Boolean { expected: true },
             }],
         };
+        let first_scene = SceneId::new();
+        let second_scene = SceneId::new();
+        let recognition = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: profile.elements[0].id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        let target = InteractionTarget {
+            id: InteractionTargetId::new(),
+            name: "confirm".into(),
+            role: InteractionRole::Action,
+            region: NormalizedRegion {
+                x: 0.5,
+                y: 0.5,
+                width: 0.2,
+                height: 0.1,
+            },
+            interaction_point: Some(InteractionPoint::Center),
+            visibility: Some(recognition.clone()),
+            required_for_json: true,
+            caution_class: None,
+            caution: None,
+        };
+        profile.scenes = vec![
+            Scene {
+                id: first_scene,
+                name: "menu".into(),
+                description: String::new(),
+                enabled: true,
+                priority: 0,
+                recognition: recognition.clone(),
+                minimum_confidence: 0.8,
+                ambiguity_margin: 0.1,
+                required_samples: 1,
+                sample_window: 1,
+                element_ids: vec![profile.elements[0].id],
+                required_element_ids: vec![profile.elements[0].id],
+                interaction_targets: vec![target.clone()],
+                transition_hints: vec![second_scene],
+            },
+            Scene {
+                id: second_scene,
+                name: "gameplay".into(),
+                description: String::new(),
+                enabled: true,
+                priority: 0,
+                recognition: recognition.clone(),
+                minimum_confidence: 0.8,
+                ambiguity_margin: 0.1,
+                required_samples: 1,
+                sample_window: 1,
+                element_ids: vec![profile.elements[0].id],
+                required_element_ids: Vec::new(),
+                interaction_targets: Vec::new(),
+                transition_hints: vec![first_scene],
+            },
+        ];
+        let mut overlay_target = target;
+        overlay_target.id = InteractionTargetId::new();
+        profile.overlays.push(Overlay {
+            id: OverlayId::new(),
+            name: "dialog".into(),
+            description: String::new(),
+            enabled: true,
+            blocks_scene_targets: true,
+            priority: 0,
+            recognition,
+            minimum_confidence: 0.8,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![profile.elements[0].id],
+            required_element_ids: vec![profile.elements[0].id],
+            interaction_targets: vec![overlay_target],
+        });
         store.create(&profile).unwrap();
         let source = store.profile_directory(profile.id);
         fs::create_dir_all(source.join("templates")).unwrap();
@@ -645,6 +813,41 @@ mod tests {
             panic!("composition was not preserved");
         };
         assert_eq!(conditions[0].element_id, duplicate.elements[0].id);
+        assert_ne!(duplicate.scenes[0].id, first_scene);
+        assert_ne!(duplicate.scenes[1].id, second_scene);
+        assert_eq!(
+            duplicate.scenes[0].transition_hints,
+            vec![duplicate.scenes[1].id]
+        );
+        assert_eq!(
+            duplicate.scenes[1].transition_hints,
+            vec![duplicate.scenes[0].id]
+        );
+        assert_eq!(
+            duplicate.scenes[0].element_ids,
+            vec![duplicate.elements[0].id]
+        );
+        assert_eq!(
+            duplicate.scenes[0].required_element_ids,
+            vec![duplicate.elements[0].id]
+        );
+        assert_ne!(
+            duplicate.scenes[0].interaction_targets[0].id,
+            profile.scenes[0].interaction_targets[0].id
+        );
+        let RecognitionExpression::All { conditions } = &duplicate.scenes[0].interaction_targets[0]
+            .visibility
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("visibility expression was not preserved");
+        };
+        assert_eq!(conditions[0].element_id, duplicate.elements[0].id);
+        assert_ne!(duplicate.overlays[0].id, profile.overlays[0].id);
+        assert_eq!(
+            duplicate.overlays[0].required_element_ids,
+            vec![duplicate.elements[0].id]
+        );
         assert_eq!(duplicate.revision, 0);
         assert_eq!(
             fs::read(

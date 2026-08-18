@@ -13,6 +13,13 @@ Implemented controls include:
 - portal source selection, stop, metrics, opt-in preview, and freeze;
 - aspect-preserving preview, zoom, pan, draw/select/move/resize/duplicate regions,
   enable state, labels, normalized coordinates, and reference-pixel sizes.
+- schema-2 scene and overlay creation, duplication, ordering, anchor expressions,
+  confidence/N-of-M policy, contextual and required detector scopes;
+- an explicit canvas preview scope for all layers, global/recognition anchors, or one
+  scene/overlay; multi-scene profiles default to the first scene, hidden regions cannot
+  intercept pointer selection, and a deliberately selected detector remains visible;
+- named interaction-target creation from a drawn zone, normalized/reference-pixel
+  geometry, optional explicit/center safe points, and cyan preview overlays;
 - numeric, boolean, text, stable-duration, composed, initial, and updated event rules;
 - deterministic color/template/change/seven-segment, OCR, and portable ONNX classifier configuration and diagnostics;
 - diagnostic bundle entry/size/privacy review and confirmed export.
@@ -27,10 +34,14 @@ Implemented controls include:
 - collapsed public Profile Catalog browsing with cached/offline status, compatibility,
   media/provenance/license/verification disclosure, explicit review, and inactive install.
 
+The live evidence panel shows ranked scene/overlay context and evaluated, gated, and
+throttled detector counts. Interaction targets are descriptive only: the GUI and daemon
+never click or generate input.
+
 Preview is a per-connection lease. The daemon downsamples to at most 320×180 and
 returns a compressed PNG from a clone of the latest frame; detector input is unchanged.
 Disconnecting the GUI drops the lease automatically, and preview never writes a file.
 
-Automated evidence includes normalized interaction tests, preview lease/downscale PNG
-tests, strict workspace Clippy/tests, and native Wayland picker/preview/configuration
-acceptance alongside the daemon on 2026-07-11.
+Automated evidence includes normalized and scope-filtered interaction tests, preview
+lease/downscale PNG tests, strict workspace Clippy/tests, and native Wayland
+picker/preview/configuration acceptance alongside the daemon on 2026-07-11.

@@ -86,6 +86,19 @@ the same `expected_events` contract as replay manifests. `source_media` records 
 original screenshot or footage produced extracted frames without requiring video
 decoding during every regression run.
 
+Full-frame cases may also assert the one-shot spatial contract with `expected_frame`,
+`expected_scene`, exact `expected_overlays`, named `expected_targets`, and
+`expected_ai_handoff`. Target assertions can pin visibility, owning scene/overlay,
+role, caution class, rectangle, safe point, caution text, and an explicit pixel
+tolerance (zero by default). Frame assertions pin the exact PNG SHA-256 and layout
+compatibility. These fields deliberately require `full_frame` placement so partial or
+scaled crops cannot masquerade as authoritative whole-layout geometry.
+
+Reviewed private cases may add `provenance` with the source/session, capture time,
+original dimensions and SHA-256, review state, and an affirmative
+`no_account_secret` privacy review. A present provenance block is rejected unless all
+of those integrity/privacy fields are complete.
+
 Minimal case:
 
 ```json
@@ -110,6 +123,11 @@ path before sending it to the daemon and allows 60 seconds by default. Results i
 per-case and per-category totals, every typed assertion with its actual observation,
 optional event metrics, and an overall `passed` flag. Exit status 7 means a regression;
 invalid packages remain JSON-RPC errors.
+
+To package a reviewed portable profile without connecting to a daemon, run
+`yash-eventsctl --json profile pack /path/to/profile-directory /path/to/profile.hudprofile`.
+Keep private suite media outside that directory: packing includes only the validated
+portable profile and its referenced inert assets, never the external regression cases.
 
 ## Passive evidence inbox
 

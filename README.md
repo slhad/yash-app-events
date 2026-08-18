@@ -4,8 +4,8 @@
 
 It captures a selected game window through the Wayland ScreenCast portal and PipeWire, analyzes user-configured regions, turns visual observations into debounced state transitions, and exposes results through JSON files, a CLI, and local JSON-RPC IPC.
 
-> Status: first usable Linux release verified on CachyOS/Arch with Hyprland. Profile
-> schema 1 and protocol 1 provide validated storage, recovery, portable archives,
+> Status: first usable Linux release verified on CachyOS/Arch with Hyprland.
+> Profile schema 2 and protocol 1 provide validated storage, recovery, portable archives,
 > daemon/CLI/GUI control, deterministic detectors, replay, and durable/live outputs.
 
 ## Intended use cases
@@ -78,10 +78,12 @@ the documented Hyprland environment. GNOME and KDE are not currently claimed.
 4. Freeze or inspect the live preview.
 5. Draw normalized HUD regions, or select an existing named zone from the zone list above the preview.
 6. Assign a detector to each region.
-7. Convert observations into temporal event rules.
-8. Test the profile against live frames or a replay.
-9. Save or export the profile.
-10. Consume events from files, the CLI, or JSON-RPC subscriptions.
+7. Group anchors and contextual detectors into scenes and overlays when the game has multiple screens.
+8. Author named interaction rectangles and optional safe points; these are descriptive and never generate input.
+9. Convert observations into temporal event rules.
+10. Test the profile against live frames, one PNG, or a replay.
+11. Save or export the profile.
+12. Consume scene context and events from files, the CLI, or JSON-RPC subscriptions.
 
 The profile sidebar includes daemon-backed revision history. Selecting a retained
 revision shows a stable-ID comparison; rollback requires confirmation and creates a
@@ -96,6 +98,13 @@ resolution/aspect ratio with the current capture, shows X/Y scaling and normaliz
 behavior, and warns when letterboxing, cropping, UI scale, or aspect mismatch may make a
 profile created on another machine target the wrong pixels.
 
+The region canvas has an explicit **Preview scope** selector. Multi-screen profiles open
+on their first scene instead of painting every configured rectangle at once. Choose one
+scene or overlay to see its global regions, recognition anchors, contextual detectors,
+visibility evidence, and owned interaction targets; use **Global + all recognition
+anchors** or **All layers** for deliberate cross-layer review. A detector selected in the
+zone list remains visible while it is edited even when it is outside the current scope.
+
 The preview requests a bounded high-detail image up to 1600×900; it never changes the
 full-resolution frame used by detectors. The always-visible **Live evidence** panel shows
 capture resolution/rates/errors, current observations, event states, daemon/GUI CPU and
@@ -109,9 +118,11 @@ yash-eventsctl status
 yash-eventsctl profile list
 yash-eventsctl profile create "My game" my_game
 yash-eventsctl profile validate ./profile.json
+yash-eventsctl profile pack ./portable-profile ./portable-profile.hudprofile
 yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
+yash-eventsctl --json analyze /path/to/frame.png --profile-id <profile-uuid>
 yash-eventsctl --json replay ./manifest.json
 yash-eventsctl --json suite evaluate /path/to/blazblue-entropy-effect
 yash-eventsctl collection policy-set <profile-uuid> /path/to/blazblue-entropy-effect --enabled true
@@ -126,9 +137,26 @@ state/events, subscriptions, and enabled profile output routes are updated while
 manifest is evaluated. The GUI keeps long image/OCR evaluations bounded to five minutes
 and displays the final metrics when processing completes.
 
-The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation does
-not require a running daemon. All commands accept `--json`, `--socket`, and
-`--timeout-ms`.
+The daemon and live commands require `XDG_RUNTIME_DIR`; offline profile validation and
+packing do not require a running daemon. `profile pack` validates a portable profile
+directory and builds the same inert `.hudprofile` archive accepted by daemon import.
+All commands accept `--json`, `--socket`, and `--timeout-ms`.
+
+Schema-2 profiles recognize one base scene plus independent overlays through bounded
+N-of-M anchor evidence. Live analysis runs global/anchor detectors first and gates
+contextual detectors to active layers. `state` includes the current context, and scene
+changes are emitted as `scene_changed` events.
+
+The one-shot `analyze` command is JSON-first: it returns exact frame dimensions and
+SHA-256, scene candidates, named observations, normalized and pixel rectangles, and
+profile-authored interaction targets with optional safe points. It never embeds image
+bytes. `ai_handoff.json_sufficient` depends only on explicitly required observations;
+otherwise the result recommends at most eight minimal named crops. OCR fields may also
+declare a bounded retry hint and expected format; malformed or transiently occluded text
+then appears under `ai_handoff.retry` with a delay and maximum attempt count. Full-frame review is
+reserved for unknown scenes or broad layout/aspect incompatibility. Profiles that need
+pixel-exact execution can opt into strict reference dimensions while existing normalized
+profiles remain aspect-compatible across resolutions.
 
 Post-release detector work adds typed boolean/text rules, Tesseract OCR, deterministic
 fixed-layout seven-segment recognition, and portable ONNX classifiers. OCR and classifiers use change-triggered bounded scheduling and the

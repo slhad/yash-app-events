@@ -34,3 +34,11 @@ sampling again, and shutting it down through the CLI.
 The CI-safe live-worker test injects 60 timestamped frames per second into the same
 latest-frame slot used by PipeWire, permits no more than 10 detector evaluations per
 second, records 59 replacements, and emits the expected transition without backlog.
+
+Schema-2 scheduling adds no frame queue. Resolver histories are capped at 32 samples,
+scene/overlay candidate counts are bounded by profile validation, and N-of-M history
+advances only when an anchor detector produces a newly scheduled observation. The
+scene-pipeline test uses three enabled detectors and proves that the unknown scene
+evaluates only its one anchor, then the recognized scene evaluates the anchor plus one
+contextual detector while permanently gating the unrelated third detector. Live state
+reports evaluated, gated, and rate-throttled counts for direct profiling.
