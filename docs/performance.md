@@ -76,11 +76,14 @@ That operation completed all 202 cases in 918.772 seconds: case work consumed
 918.772 seconds versus 170 ms inventory, 7 ms profile load, and 107 ms serialization;
 the slowest case was 6.753 seconds. It found 13 correctness failures. Twelve unknown-scene
 handoff failures revealed and fixed a generic fail-open condition (an overlay match could
-previously make an unknown base scene JSON-sufficient). The focused rerun passed all 18
-unknown-scene cases. One private-profile failure remains: the `server_error` overlay
-reuses guild attack-info anchors and co-activates with its specific overlay. The tool
-reports this deterministic external-data regression but does not mutate the checksummed
-private package.
+previously make an unknown base scene JSON-sufficient), and the focused rerun passed all
+18 unknown-scene cases. The remaining private-data failure was corrected by adding the
+existing `fast_btl_adventure_title_anchor` to the `server_error` overlay recognition;
+the anchor is strong on the server-error frame and absent from the guild attack-info
+frame. A fresh release run then passed 202/202 cases and 2,129/2,129 assertions in
+958.134 seconds (inventory 192 ms, profile load 10 ms, serialization 110 ms; slowest
+case 4.917 seconds). The corrected package profile and suite hashes are recorded in
+the private Queen Blade evidence log.
 
 Inventory hashing now streams through 64 KiB rather than reading each large package file
 into one allocation. A bounded cache reuses verification only when the package root,

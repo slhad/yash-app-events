@@ -1,8 +1,8 @@
 # Performance, Profiling, Reliability, and Usability Plan
 
-Status: implementation complete; one external-profile regression remains before the
-private complete-suite gate is green. The plan began after the Queen Blade schema-2
-profile reached the 512-element limit and its 202-case suite exceeded a 10-minute
+Status: implementation complete; the private complete-suite gate is green. The plan
+began after the Queen Blade schema-2 profile reached the 512-element limit and its
+202-case suite exceeded a 10-minute
 daemon RPC deadline on 2026-08-18.
 
 Implementation progress (2026-08-18): the first executable slice now exposes opt-in
@@ -37,12 +37,14 @@ Complete-workload evidence: the first observable run finished all 202 cases in
 slowest case 6.753 seconds) while control RPCs remained responsive. It exposed 13
 pre-existing regression assertions. A generic JSON-handoff bug was corrected so an
 unknown base scene cannot become JSON-sufficient merely because an overlay matched;
-the focused 19-case rerun then improved from 6/19 to 18/19. The sole remaining failure
-is private-profile data: `server_error` reuses the guild attack-info title/message
-anchors and therefore activates beside the more-specific `guild_battle_attack_info`
-overlay. Three runs reproduce it. This repository does not silently rewrite that
-external profile or its checksummed suite; its owner must correct/review the anchors
-before the complete-suite correctness row can be marked green.
+the focused unknown-scene rerun passed all 18 cases. The private profile then received
+one narrow data correction: `server_error` now also requires the existing
+`fast_btl_adventure_title_anchor`, preventing it from activating beside the more-
+specific `guild_battle_attack_info` overlay. The corrected 202-case release run
+passed 202/202 cases and 2,129/2,129 assertions in 958.134 seconds (inventory 192 ms,
+profile load 10 ms, result serialization 110 ms; slowest case 4.917 seconds).
+The corrected package and its manifest-pinned hashes are recorded in the private
+Queen Blade evidence log rather than this repository.
 
 `SPECS.md` remains normative. This document does not change profile/protocol contracts
 or authorize raising resource limits; any such change must first update the relevant
