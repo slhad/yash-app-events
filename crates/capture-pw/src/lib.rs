@@ -418,11 +418,14 @@ fn frame_from_buffer(
             "short PipeWire frame: required {required} bytes, got {available}"
         ));
     }
-    let mut frame_bytes = bytes[offset..offset + required].to_vec();
+    // Allocate the final shared buffer directly. Vec -> Arc would copy every
+    // captured pixel a second time, including frames replaced before analysis.
+    let mut frame_bytes: Arc<[u8]> = Arc::from(&bytes[offset..offset + required]);
     if force_opaque_alpha || swap_red_blue {
+        let pixels = Arc::get_mut(&mut frame_bytes).expect("new capture buffer is uniquely owned");
         for row in 0..usize::try_from(height).unwrap_or(0) {
             let row_start = row.saturating_mul(stride);
-            for pixel in frame_bytes[row_start..row_start.saturating_add(packed)]
+            for pixel in pixels[row_start..row_start.saturating_add(packed)]
                 .chunks_exact_mut(bytes_per_pixel)
             {
                 if swap_red_blue {
@@ -444,7 +447,7 @@ fn frame_from_buffer(
             format: pixel_format,
         },
         Some("pipewire-node".to_owned()),
-        Arc::from(frame_bytes),
+        frame_bytes,
     )
     .map(|frame| (Arc::new(frame), label))
     .map_err(|error| error.to_string())
@@ -613,6 +616,40 @@ pub enum CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "release-mode performance measurement"]
+    fn packed_capture_copy_benchmark() {
+        let width = 3_840;
+        let height = 2_160;
+        let bytes = vec![127; 3_840 * 2_160 * 4];
+        for format in [
+            spa::param::video::VideoFormat::RGBA,
+            spa::param::video::VideoFormat::BGRx,
+        ] {
+            let started = Instant::now();
+            for sequence in 0..60 {
+                std::hint::black_box(
+                    frame_from_buffer(
+                        sequence,
+                        Duration::ZERO,
+                        width,
+                        height,
+                        format,
+                        3_840 * 4,
+                        0,
+                        bytes.len(),
+                        std::hint::black_box(&bytes),
+                    )
+                    .unwrap(),
+                );
+            }
+            eprintln!(
+                "{format:?} 4K capture: {:.3} ms/frame",
+                started.elapsed().as_secs_f64() * 1_000.0 / 60.0
+            );
+        }
+    }
 
     #[test]
     fn format_pod_requests_only_supported_packed_rgb_formats() {

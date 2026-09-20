@@ -5,11 +5,11 @@ yash-eventsctl \- inspect and control yash-app-eventsd
 .B yash-eventsctl
 [--json] [--socket PATH] [--timeout-ms MS] COMMAND
 .SH COMMANDS
-version, status, state, shutdown, profile, events follow, capture, analyze PNG --profile-id UUID, replay MANIFEST,
+version, status, state, shutdown, profile, events follow, capture, analyze PNG (--profile-id UUID | --profile-bundle BUNDLE), replay MANIFEST,
 catalog status/refresh/list/install, suite evaluate PACKAGE [--timings], collection policy/status/review/compare, output
 list/set/enable/remove/test, diagnostic plan, and diagnostic export.
 .PP
-Profile validate and profile pack DIRECTORY ARCHIVE run offline. Pack validates a
+Profile validate, profile bundle validate, and profile pack DIRECTORY ARCHIVE run offline. Pack validates a
 portable profile directory and creates an inert .hudprofile archive for daemon import.
 .PP
 Diagnostic export requires an exact total returned by diagnostic plan plus the
@@ -23,7 +23,10 @@ Install requires the reviewed catalog revision and SHA-256 and leaves the profil
 .PP
 Analyze returns scene-aware spatial JSON with frame dimensions, named element and target
 rectangles, configured safe points, and crop-first AI handoff metadata. It never embeds
-image bytes or generates input.
+image bytes or generates input. --profile-bundle selects one pinned member through a bounded
+router; --profile-id remains the legacy single-profile form. Optional --context-json supplies
+bounded previous/expected scene context (IDs or semantic names) as a soft ranking prior
+with full-profile fallback.
 .PP
 Suite evaluate omits unstable wall-clock data by default. --timings adds inventory,
 profile-load, total-case, serialization, and ten-slowest-case millisecond diagnostics.

@@ -1,6 +1,7 @@
 //! Responsive egui protocol client and visual normalized-region editor.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -11,15 +12,16 @@ use eframe::egui;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
-    AtomicRulePredicate, BarDirection, DerivedInput, DerivedObservation, Detector, DetectorId,
-    Element, ElementId, EventRule, InteractionCaution, InteractionPoint, InteractionRole,
-    InteractionTarget, InteractionTargetId, NormalizedRegion, ObservationCondition, Overlay,
-    OverlayId, PreprocessOperation, Profile, ProfileId, ProfileStore, RecognitionCondition,
-    RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
+    AtomicRulePredicate, BarDirection, CapacityUsage, DerivedInput, DerivedObservation, Detector,
+    DetectorId, Element, ElementId, EventRule, InteractionCaution, InteractionPoint,
+    InteractionRole, InteractionTarget, InteractionTargetId, NormalizedRegion,
+    ObservationCondition, Overlay, OverlayId, PreprocessOperation, Profile, ProfileCapacityReport,
+    ProfileId, ProfileLimits, ProfileStore, RecognitionCondition, RecognitionExpression, RuleId,
+    RulePredicate, Scene, SceneId,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RequestKind {
     Profiles,
     Status,
@@ -103,15 +105,17 @@ struct PreviewImage {
 
 #[derive(Debug)]
 struct Worker {
-    requests: tokio_mpsc::UnboundedSender<Request>,
+    requests: tokio_mpsc::Sender<Request>,
     responses: mpsc::Receiver<Response>,
+    pending_polls: RefCell<HashSet<RequestKind>>,
+    send_errors: RefCell<HashMap<RequestKind, Response>>,
 }
 
 impl Worker {
     #[allow(clippy::too_many_lines)]
     fn spawn(socket: PathBuf) -> Self {
-        let (requests, mut request_receiver) = tokio_mpsc::unbounded_channel::<Request>();
-        let (response_sender, responses) = mpsc::channel();
+        let (requests, mut request_receiver) = tokio_mpsc::channel::<Request>(64);
+        let (response_sender, responses) = mpsc::sync_channel(64);
         std::thread::Builder::new()
             .name("yash-gui-rpc".into())
             .spawn(move || {
@@ -298,15 +302,67 @@ impl Worker {
         Self {
             requests,
             responses,
+            pending_polls: RefCell::default(),
+            send_errors: RefCell::default(),
         }
     }
 
+    fn poll(&self, kind: RequestKind, method: &'static str, params: Value) {
+        if self.pending_polls.borrow_mut().insert(kind) {
+            self.send(kind, method, params);
+        }
+    }
+
+    fn try_recv(&self) -> Option<Response> {
+        let failed = self.send_errors.borrow().keys().next().copied();
+        let response = failed
+            .and_then(|kind| self.send_errors.borrow_mut().remove(&kind))
+            .or_else(|| self.responses.try_recv().ok())?;
+        self.pending_polls.borrow_mut().remove(&response.kind);
+        Some(response)
+    }
+
     fn send(&self, kind: RequestKind, method: &'static str, params: Value) {
-        let _ = self.requests.send(Request {
+        if let Err(error) = self.requests.try_send(Request {
             kind,
             method,
             params,
-        });
+        }) {
+            let message = match error {
+                tokio_mpsc::error::TrySendError::Full(_) => {
+                    "Request queue is full. Wait for the current operation, then retry."
+                }
+                tokio_mpsc::error::TrySendError::Closed(_) => {
+                    "RPC worker stopped. Restart the GUI to reconnect."
+                }
+            };
+            self.send_errors.borrow_mut().insert(
+                kind,
+                Response {
+                    kind,
+                    payload: Payload::Error(message.into()),
+                },
+            );
+        }
+    }
+}
+
+/// One in-memory capacity report, refreshed whenever the draft content changes.
+#[derive(Debug, Default)]
+struct CapacityCache {
+    entry: Option<(Profile, ProfileCapacityReport)>,
+}
+
+impl CapacityCache {
+    fn report(&mut self, profile: &Profile) -> &ProfileCapacityReport {
+        if self
+            .entry
+            .as_ref()
+            .is_none_or(|(cached, _)| cached != profile)
+        {
+            self.entry = Some((profile.clone(), profile.analyze_capacity()));
+        }
+        &self.entry.as_ref().expect("capacity report initialized").1
     }
 }
 
@@ -322,6 +378,9 @@ pub struct App {
     status: Value,
     state: Value,
     error: Option<String>,
+    error_request: Option<RequestKind>,
+    capacity_error: Option<String>,
+    capacity_cache: CapacityCache,
     new_name: String,
     new_game: String,
     import_path: String,
@@ -424,6 +483,10 @@ impl App {
             method::CATALOG_STATUS,
             Value::Null,
         );
+        Self::with_worker(worker)
+    }
+
+    fn with_worker(worker: Worker) -> Self {
         Self {
             worker,
             profiles: Vec::new(),
@@ -434,6 +497,9 @@ impl App {
             status: json!({}),
             state: json!({}),
             error: None,
+            error_request: None,
+            capacity_error: None,
+            capacity_cache: CapacityCache::default(),
             new_name: "New profile".into(),
             new_game: "game_id".into(),
             import_path: String::new(),
@@ -514,11 +580,27 @@ impl App {
 
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn drain(&mut self, context: &egui::Context) {
-        while let Ok(response) = self.worker.responses.try_recv() {
+        while let Some(response) = self.worker.try_recv() {
+            if !matches!(response.payload, Payload::Error(_))
+                && self.error_request == Some(response.kind)
+            {
+                self.error = None;
+                self.error_request = None;
+            }
             match response.payload {
                 Payload::Error(error) => {
                     self.error = Some(error);
-                    self.preview_pending = false;
+                    self.error_request = Some(response.kind);
+                    if response.kind == RequestKind::PreviewFrame {
+                        self.preview_pending = false;
+                    }
+                    if response.kind == RequestKind::DetectorTest {
+                        self.test_pending = false;
+                    }
+                    if response.kind == RequestKind::Draft {
+                        self.draft_saved = false;
+                        self.dirty_since = Some(Instant::now());
+                    }
                     if response.kind == RequestKind::CaptureSelect {
                         self.capture_select_pending = false;
                     }
@@ -530,7 +612,6 @@ impl App {
                     }
                 }
                 Payload::Preview(image) => {
-                    self.error = None;
                     let color = egui::ColorImage::from_rgba_unmultiplied(
                         [image.width, image.height],
                         &image.rgba,
@@ -547,7 +628,6 @@ impl App {
                     original,
                     processed,
                 } => {
-                    self.error = None;
                     self.detector_result = value;
                     self.original_texture = Some(load_preview_texture(
                         context,
@@ -575,7 +655,6 @@ impl App {
                     }
                 }
                 Payload::CollectionInspection { value, image } => {
-                    self.error = None;
                     self.collection_selected = value;
                     self.collection_texture =
                         Some(load_preview_texture(context, "collection-review", &image));
@@ -589,198 +668,183 @@ impl App {
                     self.collection_expected_json =
                         serde_json::to_string_pretty(&expected).unwrap_or_else(|_| "{}".into());
                 }
-                Payload::Json(value) => {
-                    self.error = None;
-                    match response.kind {
-                        RequestKind::Profiles => self.apply_profiles(value),
-                        RequestKind::RevisionHistory => {
-                            match serde_json::from_value::<Vec<Profile>>(value) {
-                                Ok(revisions) => {
-                                    self.revisions = revisions;
-                                    self.selected_revision = self.revisions.len().checked_sub(2);
-                                }
-                                Err(error) => {
-                                    self.error = Some(format!("invalid revision history: {error}"));
-                                }
+                Payload::Json(value) => match response.kind {
+                    RequestKind::Profiles => self.apply_profiles(value),
+                    RequestKind::RevisionHistory => {
+                        match serde_json::from_value::<Vec<Profile>>(value) {
+                            Ok(revisions) => {
+                                self.revisions = revisions;
+                                self.selected_revision = self.revisions.len().checked_sub(2);
                             }
-                        }
-                        RequestKind::Status => self.status = value,
-                        RequestKind::State => {
-                            let sequence = value["sequence"].as_u64().unwrap_or(0);
-                            if sequence > self.last_state_sequence {
-                                self.push_timeline(format!(
-                                    "transition {} · seq {sequence} · {}",
-                                    value["updated_at"].as_str().unwrap_or("unknown time"),
-                                    value["events"]
-                                ));
-                                self.last_state_sequence = sequence;
+                            Err(error) => {
+                                self.error = Some(format!("invalid revision history: {error}"));
                             }
-                            self.state = value;
-                        }
-                        RequestKind::Commit => {
-                            self.error = None;
-                            self.dirty_since = None;
-                            self.draft_saved = false;
-                            self.worker.send(
-                                RequestKind::Profiles,
-                                method::PROFILE_LIST,
-                                Value::Null,
-                            );
-                        }
-                        RequestKind::Draft => self.draft_saved = true,
-                        RequestKind::Mutation | RequestKind::Create => {
-                            self.worker.send(
-                                RequestKind::Profiles,
-                                method::PROFILE_LIST,
-                                Value::Null,
-                            );
-                        }
-                        RequestKind::Rollback => {
-                            self.rollback_confirm = false;
-                            self.dirty_since = None;
-                            self.worker.send(
-                                RequestKind::Profiles,
-                                method::PROFILE_LIST,
-                                Value::Null,
-                            );
-                            if let Some(profile) = &self.draft {
-                                self.worker.send(
-                                    RequestKind::RevisionHistory,
-                                    method::PROFILE_REVISIONS,
-                                    json!({"profile_id":profile.id}),
-                                );
-                            }
-                        }
-                        RequestKind::AutoCapture => {
-                            self.auto_capture_enabled = value["enabled"].as_bool().unwrap_or(false);
-                            self.auto_process_match =
-                                value["process_match"].as_str().unwrap_or("").to_owned();
-                            self.auto_process_running =
-                                value["process_running"].as_bool().unwrap_or(false);
-                        }
-                        RequestKind::CollectionPolicy => {
-                            let policy = &value["policy"];
-                            self.collection_enabled = policy["enabled"].as_bool().unwrap_or(false);
-                            self.collection_dataset_root =
-                                policy["dataset_root"].as_str().unwrap_or("").to_owned();
-                            self.collection_interval_seconds =
-                                policy["interval_seconds"].as_u64().unwrap_or(70);
-                            self.collection_jitter_seconds =
-                                policy["jitter_seconds"].as_u64().unwrap_or(10);
-                            self.collection_similarity_threshold =
-                                policy["similarity_threshold"].as_f64().unwrap_or(0.015) as f32;
-                            self.collection_maximum_pending = policy["maximum_pending_items"]
-                                .as_u64()
-                                .and_then(|value| usize::try_from(value).ok())
-                                .unwrap_or(1_000);
-                            self.collection_maximum_bytes =
-                                policy["maximum_bytes"].as_u64().unwrap_or(2_147_483_648);
-                            self.collection_novelty_targets = policy["novelty_targets"]
-                                .as_array()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(Value::as_str)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                        }
-                        RequestKind::CollectionStatus => self.collection_status = value,
-                        RequestKind::CollectionItems => {
-                            self.collection_items =
-                                value["items"].as_array().cloned().unwrap_or_default();
-                        }
-                        RequestKind::CollectionMutation => {
-                            self.refresh_collection();
-                        }
-                        RequestKind::OutputRoutes | RequestKind::OutputMutation => {
-                            self.output_routes = value.as_array().cloned().unwrap_or_default();
-                        }
-                        RequestKind::OutputTest => self.output_test = value,
-                        RequestKind::OutputRecipeList => {
-                            self.output_recipes = value.as_array().cloned().unwrap_or_default();
-                            if self
-                                .selected_output_recipe
-                                .is_none_or(|index| index >= self.output_recipes.len())
-                            {
-                                self.selected_output_recipe = None;
-                                if !self.output_recipes.is_empty() {
-                                    self.select_output_recipe(0);
-                                }
-                            }
-                        }
-                        RequestKind::OutputRecipePreview => {
-                            self.output_recipe_preview = value;
-                        }
-                        RequestKind::OutputRecipeInstall => {
-                            self.output_routes =
-                                value["routes"].as_array().cloned().unwrap_or_default();
-                            self.output_recipe_preview = json!({
-                                "installed":value["installed"],
-                                "note":"Installed disabled; test and enable it above after review."
-                            });
-                        }
-                        RequestKind::CatalogStatus => self.catalog_status = value,
-                        RequestKind::CatalogList => {
-                            self.catalog_pending = false;
-                            self.catalog_status = json!({
-                                "cached": true,
-                                "revision": value["revision"],
-                                "generated_at": value["generated_at"],
-                                "profile_count": value["profiles"].as_array().map_or(0, Vec::len),
-                            });
-                            self.catalog = value;
-                            self.selected_catalog_profile = None;
-                            self.catalog_install_reviewed = false;
-                        }
-                        RequestKind::CatalogInstall => {
-                            self.catalog_pending = false;
-                            self.catalog_install_reviewed = false;
-                            self.worker.send(
-                                RequestKind::Profiles,
-                                method::PROFILE_LIST,
-                                Value::Null,
-                            );
-                            self.worker.send(
-                                RequestKind::CatalogList,
-                                method::CATALOG_LIST,
-                                Value::Null,
-                            );
-                        }
-                        RequestKind::Capture | RequestKind::CaptureSelect => {
-                            self.capture_status = value;
-                            if response.kind == RequestKind::CaptureSelect {
-                                self.capture_select_pending = false;
-                            }
-                        }
-                        RequestKind::PreviewStart => {
-                            self.preview_enabled = value["enabled"].as_bool().unwrap_or(false);
-                        }
-                        RequestKind::PreviewStop => {
-                            self.preview_enabled = false;
-                            self.preview_pending = false;
-                        }
-                        RequestKind::PreviewFrame | RequestKind::CollectionItem => {}
-                        RequestKind::DetectorTest => {
-                            self.detector_result = value;
-                            self.test_pending = false;
-                        }
-                        RequestKind::TemplateCapture => {
-                            if let Some(path) = value["path"].as_str() {
-                                self.add_template_path(path.into());
-                            }
-                        }
-                        RequestKind::Replay => {
-                            self.replay_result = value;
-                            self.replay_frame = 0;
-                        }
-                        RequestKind::DiagnosticPlan | RequestKind::DiagnosticExport => {
-                            self.diagnostic_plan = value;
-                            self.diagnostic_privacy_reviewed = false;
                         }
                     }
-                }
+                    RequestKind::Status => self.status = value,
+                    RequestKind::State => {
+                        let sequence = value["sequence"].as_u64().unwrap_or(0);
+                        if sequence > self.last_state_sequence {
+                            self.push_timeline(format!(
+                                "transition {} · seq {sequence} · {}",
+                                value["updated_at"].as_str().unwrap_or("unknown time"),
+                                value["events"]
+                            ));
+                            self.last_state_sequence = sequence;
+                        }
+                        self.state = value;
+                    }
+                    RequestKind::Commit => {
+                        self.dirty_since = None;
+                        self.draft_saved = false;
+                        self.capacity_error = None;
+                        self.worker
+                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                    }
+                    RequestKind::Draft => self.draft_saved = true,
+                    RequestKind::Mutation | RequestKind::Create => {
+                        self.worker
+                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                    }
+                    RequestKind::Rollback => {
+                        self.rollback_confirm = false;
+                        self.dirty_since = None;
+                        self.worker
+                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        if let Some(profile) = &self.draft {
+                            self.worker.send(
+                                RequestKind::RevisionHistory,
+                                method::PROFILE_REVISIONS,
+                                json!({"profile_id":profile.id}),
+                            );
+                        }
+                    }
+                    RequestKind::AutoCapture => {
+                        self.auto_capture_enabled = value["enabled"].as_bool().unwrap_or(false);
+                        self.auto_process_match =
+                            value["process_match"].as_str().unwrap_or("").to_owned();
+                        self.auto_process_running =
+                            value["process_running"].as_bool().unwrap_or(false);
+                    }
+                    RequestKind::CollectionPolicy => {
+                        let policy = &value["policy"];
+                        self.collection_enabled = policy["enabled"].as_bool().unwrap_or(false);
+                        self.collection_dataset_root =
+                            policy["dataset_root"].as_str().unwrap_or("").to_owned();
+                        self.collection_interval_seconds =
+                            policy["interval_seconds"].as_u64().unwrap_or(70);
+                        self.collection_jitter_seconds =
+                            policy["jitter_seconds"].as_u64().unwrap_or(10);
+                        self.collection_similarity_threshold =
+                            policy["similarity_threshold"].as_f64().unwrap_or(0.015) as f32;
+                        self.collection_maximum_pending = policy["maximum_pending_items"]
+                            .as_u64()
+                            .and_then(|value| usize::try_from(value).ok())
+                            .unwrap_or(1_000);
+                        self.collection_maximum_bytes =
+                            policy["maximum_bytes"].as_u64().unwrap_or(2_147_483_648);
+                        self.collection_novelty_targets = policy["novelty_targets"]
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                    }
+                    RequestKind::CollectionStatus => self.collection_status = value,
+                    RequestKind::CollectionItems => {
+                        self.collection_items =
+                            value["items"].as_array().cloned().unwrap_or_default();
+                    }
+                    RequestKind::CollectionMutation => {
+                        self.refresh_collection();
+                    }
+                    RequestKind::OutputRoutes | RequestKind::OutputMutation => {
+                        self.output_routes = value.as_array().cloned().unwrap_or_default();
+                    }
+                    RequestKind::OutputTest => self.output_test = value,
+                    RequestKind::OutputRecipeList => {
+                        self.output_recipes = value.as_array().cloned().unwrap_or_default();
+                        if self
+                            .selected_output_recipe
+                            .is_none_or(|index| index >= self.output_recipes.len())
+                        {
+                            self.selected_output_recipe = None;
+                            if !self.output_recipes.is_empty() {
+                                self.select_output_recipe(0);
+                            }
+                        }
+                    }
+                    RequestKind::OutputRecipePreview => {
+                        self.output_recipe_preview = value;
+                    }
+                    RequestKind::OutputRecipeInstall => {
+                        self.output_routes =
+                            value["routes"].as_array().cloned().unwrap_or_default();
+                        self.output_recipe_preview = json!({
+                            "installed":value["installed"],
+                            "note":"Installed disabled; test and enable it above after review."
+                        });
+                    }
+                    RequestKind::CatalogStatus => self.catalog_status = value,
+                    RequestKind::CatalogList => {
+                        self.catalog_pending = false;
+                        self.catalog_status = json!({
+                            "cached": true,
+                            "revision": value["revision"],
+                            "generated_at": value["generated_at"],
+                            "profile_count": value["profiles"].as_array().map_or(0, Vec::len),
+                        });
+                        self.catalog = value;
+                        self.selected_catalog_profile = None;
+                        self.catalog_install_reviewed = false;
+                    }
+                    RequestKind::CatalogInstall => {
+                        self.catalog_pending = false;
+                        self.catalog_install_reviewed = false;
+                        self.worker
+                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        self.worker.send(
+                            RequestKind::CatalogList,
+                            method::CATALOG_LIST,
+                            Value::Null,
+                        );
+                    }
+                    RequestKind::Capture | RequestKind::CaptureSelect => {
+                        self.capture_status = value;
+                        if response.kind == RequestKind::CaptureSelect {
+                            self.capture_select_pending = false;
+                        }
+                    }
+                    RequestKind::PreviewStart => {
+                        self.preview_enabled = value["enabled"].as_bool().unwrap_or(false);
+                    }
+                    RequestKind::PreviewStop => {
+                        self.preview_enabled = false;
+                        self.preview_pending = false;
+                    }
+                    RequestKind::PreviewFrame | RequestKind::CollectionItem => {}
+                    RequestKind::DetectorTest => {
+                        self.detector_result = value;
+                        self.test_pending = false;
+                    }
+                    RequestKind::TemplateCapture => {
+                        if let Some(path) = value["path"].as_str() {
+                            self.add_template_path(path.into());
+                        }
+                    }
+                    RequestKind::Replay => {
+                        self.replay_result = value;
+                        self.replay_frame = 0;
+                    }
+                    RequestKind::DiagnosticPlan | RequestKind::DiagnosticExport => {
+                        self.diagnostic_plan = value;
+                        self.diagnostic_privacy_reviewed = false;
+                    }
+                },
             }
         }
     }
@@ -859,23 +923,23 @@ impl App {
         if self.last_refresh.elapsed() >= Duration::from_secs(2) {
             self.gui_usage = sample_process_usage(&mut self.process_sampler);
             self.worker
-                .send(RequestKind::Status, method::STATUS, Value::Null);
+                .poll(RequestKind::Status, method::STATUS, Value::Null);
             self.worker
-                .send(RequestKind::State, method::STATE_GET, Value::Null);
+                .poll(RequestKind::State, method::STATE_GET, Value::Null);
             self.worker
-                .send(RequestKind::Capture, method::CAPTURE_STATUS, Value::Null);
-            self.worker.send(
+                .poll(RequestKind::Capture, method::CAPTURE_STATUS, Value::Null);
+            self.worker.poll(
                 RequestKind::AutoCapture,
                 method::CAPTURE_AUTO_GET,
                 Value::Null,
             );
             if let Some(profile) = &self.draft {
-                self.worker.send(
+                self.worker.poll(
                     RequestKind::CollectionStatus,
                     method::COLLECTION_STATUS,
                     json!({"profile_id":profile.id}),
                 );
-                self.worker.send(
+                self.worker.poll(
                     RequestKind::CollectionItems,
                     method::COLLECTION_ITEMS,
                     json!({"profile_id":profile.id}),
@@ -1123,6 +1187,7 @@ impl App {
             ui.heading("Profiles");
             ui.label(if self.status["capture_active"].as_bool().unwrap_or(false) { "Capture active" } else { "Capture stopped" });
             if let Some(error) = &self.error { ui.colored_label(egui::Color32::RED,error); }
+            if let Some(error) = &self.capacity_error { ui.colored_label(egui::Color32::RED,error); }
             ui.separator();
             ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_name); });
             ui.horizontal(|ui| { ui.text_edit_singleline(&mut self.new_game); if ui.button("Create").clicked() { let profile = Profile::new(&self.new_name,&self.new_game,1920,1080); self.worker.send(RequestKind::Create,method::PROFILE_CREATE,json!({"profile":profile})); } });
@@ -1135,6 +1200,7 @@ impl App {
                 self.selected=Some(index);
                 self.draft=Some(self.profiles[index].clone());
                 self.dirty_since=None;
+                self.capacity_error=None;
                 self.preview_scope=None;
                 self.selected_region=None;
                 self.revisions.clear();
@@ -1914,7 +1980,7 @@ impl App {
                 });
             });
             self.layout_compatibility_ui(ui, &profile);
-            Self::capacity_ui(ui, &profile);
+            self.capacity_ui(ui, &profile);
             self.scene_model_editor(ui, &mut profile);
             ui.strong("Detection hierarchy");
             for (derived_index, derived) in profile.derived_observations.iter().enumerate() {
@@ -1970,14 +2036,33 @@ impl App {
                 ui.toggle_value(&mut self.drawing, "Draw region");
                 if ui.button("Duplicate region").clicked() {
                     if let Some(index) = self.selected_region {
-                        let id = profile.elements[index].id;
-                        if let Ok(new_id) = ProfileStore::duplicate_element(&mut profile, id, false)
-                        {
-                            self.selected_region = profile
-                                .elements
-                                .iter()
-                                .position(|element| element.id == new_id);
-                            self.mark_dirty();
+                        if let Some(id) = profile.elements.get(index).map(|element| element.id) {
+                            let capacity_error = projected_capacity_error(
+                                &profile,
+                                "Duplicate region",
+                                |projected| {
+                                    ProfileStore::duplicate_element(projected, id, false)
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string())
+                                },
+                            );
+                            if let Some(error) = capacity_error {
+                                self.capacity_error = Some(error);
+                            } else {
+                                match ProfileStore::duplicate_element(&mut profile, id, false) {
+                                    Ok(new_id) => {
+                                        self.selected_region = profile
+                                            .elements
+                                            .iter()
+                                            .position(|element| element.id == new_id);
+                                        self.capacity_error = None;
+                                        self.mark_dirty();
+                                    }
+                                    Err(error) => {
+                                        self.error = Some(format!("duplicate region: {error}"));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1988,6 +2073,7 @@ impl App {
                 }
             });
             if let Some(index) = self.selected_region {
+                let mut remove_selected_region = false;
                 if let Some(element) = profile.elements.get_mut(index) {
                     ui.horizontal(|ui| {
                         if ui.text_edit_singleline(&mut element.name).changed() {
@@ -2012,9 +2098,29 @@ impl App {
                             profile.layout.reference_width,
                             profile.layout.reference_height
                         ));
+                        if ui.small_button("Remove region").clicked() {
+                            remove_selected_region = true;
+                        }
                     });
                 }
-                self.detector_editor(ui, &mut profile, index);
+                if remove_selected_region {
+                    if let Some(element_id) = profile.elements.get(index).map(|element| element.id)
+                    {
+                        match ProfileStore::remove_element(&mut profile, element_id) {
+                            Ok(()) => {
+                                self.selected_region = None;
+                                self.selected_derived = None;
+                                self.capacity_error = None;
+                                self.mark_dirty();
+                            }
+                            Err(error) => {
+                                self.error = Some(format!("remove region: {error}"));
+                            }
+                        }
+                    }
+                } else if index < profile.elements.len() {
+                    self.detector_editor(ui, &mut profile, index);
+                }
             }
             self.preview_scope_ui(ui, &profile);
             let size = ui.available_size().max(egui::vec2(200.0, 150.0));
@@ -2093,6 +2199,8 @@ impl App {
             .map(|element| (element.id, element.name.clone()))
             .collect::<Vec<_>>();
         let mut changed = false;
+        let mut add_target_to_scene = None;
+        let mut add_target_to_overlay = None;
         let reference_size = (
             profile.layout.reference_width,
             profile.layout.reference_height,
@@ -2111,12 +2219,34 @@ impl App {
             );
             ui.horizontal(|ui| {
                 if ui.button("Add scene").clicked() {
-                    profile.scenes.push(new_scene(&elements));
-                    changed = true;
+                    let scene = new_scene(&elements);
+                    if let Some(error) =
+                        projected_capacity_error(profile, "Add scene", |projected| {
+                            projected.scenes.push(scene.clone());
+                            Ok(())
+                        })
+                    {
+                        self.capacity_error = Some(error);
+                    } else {
+                        profile.scenes.push(scene);
+                        self.capacity_error = None;
+                        changed = true;
+                    }
                 }
                 if ui.button("Add overlay").clicked() {
-                    profile.overlays.push(new_overlay(&elements));
-                    changed = true;
+                    let overlay = new_overlay(&elements);
+                    if let Some(error) =
+                        projected_capacity_error(profile, "Add overlay", |projected| {
+                            projected.overlays.push(overlay.clone());
+                            Ok(())
+                        })
+                    {
+                        self.capacity_error = Some(error);
+                    } else {
+                        profile.overlays.push(overlay);
+                        self.capacity_error = None;
+                        changed = true;
+                    }
                 }
             });
             let mut remove_scene = None;
@@ -2186,10 +2316,7 @@ impl App {
                     ui.strong("Interaction targets");
                     if let Some((region, name)) = &selected_target_region {
                         if ui.button("Use selected drawn zone as target").clicked() {
-                            scene
-                                .interaction_targets
-                                .push(default_interaction_target(*region, name.clone()));
-                            changed = true;
+                            add_target_to_scene = Some((scene.id, *region, name.clone()));
                         }
                     }
                     changed |= interaction_targets_editor(
@@ -2209,8 +2336,47 @@ impl App {
                 changed = true;
             }
             if let Some(scene) = duplicate_scene {
-                profile.scenes.push(scene);
-                changed = true;
+                if let Some(error) =
+                    projected_capacity_error(profile, "Duplicate scene", |projected| {
+                        projected.scenes.push(scene.clone());
+                        Ok(())
+                    })
+                {
+                    self.capacity_error = Some(error);
+                } else {
+                    profile.scenes.push(scene);
+                    self.capacity_error = None;
+                    changed = true;
+                }
+            }
+            if let Some((scene_id, region, name)) = add_target_to_scene {
+                let scene_name = profile
+                    .scenes
+                    .iter()
+                    .find(|scene| scene.id == scene_id)
+                    .map_or_else(|| "scene".into(), |scene| scene.name.clone());
+                let target = default_interaction_target(region, name);
+                let action = format!("Add interaction target to scene \"{scene_name}\"");
+                let capacity_error = projected_capacity_error(profile, &action, |projected| {
+                    let Some(scene) = projected
+                        .scenes
+                        .iter_mut()
+                        .find(|scene| scene.id == scene_id)
+                    else {
+                        return Err("the scene no longer exists".into());
+                    };
+                    scene.interaction_targets.push(target.clone());
+                    Ok(())
+                });
+                if let Some(error) = capacity_error {
+                    self.capacity_error = Some(error);
+                } else if let Some(scene) =
+                    profile.scenes.iter_mut().find(|scene| scene.id == scene_id)
+                {
+                    scene.interaction_targets.push(target);
+                    self.capacity_error = None;
+                    changed = true;
+                }
             }
             let mut remove_overlay = None;
             let mut duplicate_overlay = None;
@@ -2283,10 +2449,7 @@ impl App {
                     ui.strong("Interaction targets");
                     if let Some((region, name)) = &selected_target_region {
                         if ui.button("Use selected drawn zone as target").clicked() {
-                            overlay
-                                .interaction_targets
-                                .push(default_interaction_target(*region, name.clone()));
-                            changed = true;
+                            add_target_to_overlay = Some((overlay.id, *region, name.clone()));
                         }
                     }
                     changed |= interaction_targets_editor(
@@ -2306,8 +2469,49 @@ impl App {
                 changed = true;
             }
             if let Some(overlay) = duplicate_overlay {
-                profile.overlays.push(overlay);
-                changed = true;
+                if let Some(error) =
+                    projected_capacity_error(profile, "Duplicate overlay", |projected| {
+                        projected.overlays.push(overlay.clone());
+                        Ok(())
+                    })
+                {
+                    self.capacity_error = Some(error);
+                } else {
+                    profile.overlays.push(overlay);
+                    self.capacity_error = None;
+                    changed = true;
+                }
+            }
+            if let Some((overlay_id, region, name)) = add_target_to_overlay {
+                let overlay_name = profile
+                    .overlays
+                    .iter()
+                    .find(|overlay| overlay.id == overlay_id)
+                    .map_or_else(|| "overlay".into(), |overlay| overlay.name.clone());
+                let target = default_interaction_target(region, name);
+                let action = format!("Add interaction target to overlay \"{overlay_name}\"");
+                let capacity_error = projected_capacity_error(profile, &action, |projected| {
+                    let Some(overlay) = projected
+                        .overlays
+                        .iter_mut()
+                        .find(|overlay| overlay.id == overlay_id)
+                    else {
+                        return Err("the overlay no longer exists".into());
+                    };
+                    overlay.interaction_targets.push(target.clone());
+                    Ok(())
+                });
+                if let Some(error) = capacity_error {
+                    self.capacity_error = Some(error);
+                } else if let Some(overlay) = profile
+                    .overlays
+                    .iter_mut()
+                    .find(|overlay| overlay.id == overlay_id)
+                {
+                    overlay.interaction_targets.push(target);
+                    self.capacity_error = None;
+                    changed = true;
+                }
             }
         });
         if changed {
@@ -2375,9 +2579,9 @@ impl App {
         });
     }
 
-    fn capacity_ui(ui: &mut egui::Ui, profile: &Profile) {
-        let report = profile.analyze_capacity();
+    fn capacity_ui(&mut self, ui: &mut egui::Ui, profile: &Profile) {
         ui.collapsing("Profile capacity", |ui| {
+            let report = self.capacity_cache.report(profile);
             for (name, usage) in [
                 ("Detector elements", &report.elements),
                 ("Scenes", &report.scenes),
@@ -2385,8 +2589,11 @@ impl App {
                 ("Interaction targets", &report.interaction_targets),
             ] {
                 let text = format!(
-                    "{name}: {}/{} ({:.1}%)",
-                    usage.used, usage.maximum, usage.percent
+                    "{name}: {}/{} ({:.1}%) · {} free",
+                    usage.used,
+                    usage.maximum,
+                    usage.percent,
+                    usage.maximum.saturating_sub(usage.used),
                 );
                 if usage.warning.is_some() {
                     ui.colored_label(egui::Color32::YELLOW, text);
@@ -2400,6 +2607,31 @@ impl App {
                 report.largest_layer_targets,
                 report.recognition_conditions,
             ));
+            ui.label(format!(
+                "Always-evaluated anchors: {} · weighted detector cost: {}",
+                report.always_evaluated_anchor_count, report.always_evaluated_anchor_cost,
+            ));
+            if report.elements.used >= report.elements.maximum {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "No detector-element slots remain. Remove an unused region or consolidate a duplicate before drawing or duplicating.",
+                );
+            }
+            if report.largest_layer_element_usage.used >= report.largest_layer_element_usage.maximum {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "A scene or overlay has no detector-reference slots left. Uncheck unused regions before copying a layer.",
+                );
+            }
+            if report.interaction_targets.used >= report.interaction_targets.maximum
+                || report.largest_layer_target_usage.used
+                    >= report.largest_layer_target_usage.maximum
+            {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "Interaction-target capacity is full. Remove an existing target before adding another.",
+                );
+            }
             if !report.unreachable_elements.is_empty() {
                 ui.colored_label(
                     egui::Color32::YELLOW,
@@ -2411,6 +2643,9 @@ impl App {
             }
             for suggestion in report.suggestions.iter().take(3) {
                 ui.small(format!("• {suggestion}"));
+            }
+            if let Some(error) = &self.capacity_error {
+                ui.colored_label(egui::Color32::RED, error);
             }
         });
     }
@@ -3102,6 +3337,7 @@ impl App {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn region_interaction(
         &mut self,
         response: &egui::Response,
@@ -3150,9 +3386,19 @@ impl App {
                     if let Some(region) =
                         region_from_points(canvas, self.zoom, self.pan, start, end)
                     {
-                        profile.elements.push(default_element(region));
-                        self.selected_region = Some(profile.elements.len() - 1);
-                        self.mark_dirty();
+                        let capacity_error =
+                            projected_capacity_error(profile, "Draw region", |projected| {
+                                projected.elements.push(default_element(region));
+                                Ok(())
+                            });
+                        if let Some(error) = capacity_error {
+                            self.capacity_error = Some(error);
+                        } else {
+                            profile.elements.push(default_element(region));
+                            self.selected_region = Some(profile.elements.len() - 1);
+                            self.capacity_error = None;
+                            self.mark_dirty();
+                        }
                     }
                 }
                 self.drawing = false;
@@ -3222,6 +3468,19 @@ impl eframe::App for App {
         self.editor(context);
         context.request_repaint_after(Duration::from_millis(50));
     }
+}
+
+fn projected_capacity_error<F>(profile: &Profile, action: &str, project: F) -> Option<String>
+where
+    F: FnOnce(&mut Profile) -> Result<(), String>,
+{
+    let mut projected = profile.clone();
+    if let Err(reason) = project(&mut projected) {
+        return Some(format!(
+            "{action} unavailable: {reason}. No changes were made."
+        ));
+    }
+    capacity_error(&projected, action)
 }
 
 fn display_json(value: &Value) -> String {
@@ -4239,6 +4498,66 @@ fn stable_name(value: &str) -> String {
     }
 }
 
+fn capacity_error(profile: &Profile, action: &str) -> Option<String> {
+    let report = profile.analyze_capacity();
+    let mut violations = Vec::new();
+    append_capacity_violation(&mut violations, "detector elements", &report.elements);
+    append_capacity_violation(&mut violations, "scenes", &report.scenes);
+    append_capacity_violation(&mut violations, "overlays", &report.overlays);
+    append_capacity_violation(
+        &mut violations,
+        "interaction targets total",
+        &report.interaction_targets,
+    );
+    append_capacity_violation(
+        &mut violations,
+        "largest layer elements",
+        &report.largest_layer_element_usage,
+    );
+    append_capacity_violation(
+        &mut violations,
+        "largest layer targets",
+        &report.largest_layer_target_usage,
+    );
+    append_capacity_violation(
+        &mut violations,
+        "largest recognition expression",
+        &report.largest_recognition_usage,
+    );
+    if violations.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{action} blocked. Projected capacity exceeds the profile limit: {}. {} No changes were made.",
+        violations.join("; "),
+        capacity_recovery_hint(&report),
+    ))
+}
+
+fn append_capacity_violation(violations: &mut Vec<String>, label: &str, usage: &CapacityUsage) {
+    if usage.used > usage.maximum {
+        violations.push(format!("{label} {}/{}", usage.used, usage.maximum));
+    }
+}
+
+fn capacity_recovery_hint(report: &ProfileCapacityReport) -> &'static str {
+    if report.elements.used > report.elements.maximum {
+        "Remove an unused detector region or consolidate a duplicate before retrying."
+    } else if report.largest_layer_element_usage.used > report.largest_layer_element_usage.maximum {
+        "This action copies detector references into a layer. Uncheck unused regions in that scene or overlay before retrying."
+    } else if report.interaction_targets.used > report.interaction_targets.maximum
+        || report.largest_layer_target_usage.used > report.largest_layer_target_usage.maximum
+    {
+        "Remove an existing interaction target from this layer or another layer before retrying."
+    } else if report.scenes.used > report.scenes.maximum {
+        "Remove an existing scene before retrying."
+    } else if report.overlays.used > report.overlays.maximum {
+        "Remove an existing overlay before retrying."
+    } else {
+        "Reduce the recognition expression before retrying."
+    }
+}
+
 fn default_interaction_target(region: NormalizedRegion, name: String) -> InteractionTarget {
     InteractionTarget {
         id: InteractionTargetId::new(),
@@ -4394,11 +4713,23 @@ fn element_membership_editor(
     salt: (&'static str, usize),
 ) -> bool {
     let mut changed = false;
+    let maximum = ProfileLimits::default().elements_per_layer;
+    if selected.len() >= maximum {
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            format!(
+                "Layer reference limit reached ({maximum}); uncheck a region before adding another."
+            ),
+        );
+    }
     ui.horizontal_wrapped(|ui| {
         for (element_id, name) in elements {
             let mut active = selected.contains(element_id);
+            let can_add = active || selected.len() < maximum;
             if ui
-                .push_id((salt, *element_id), |ui| ui.checkbox(&mut active, name))
+                .push_id((salt, *element_id), |ui| {
+                    ui.add_enabled(can_add, egui::Checkbox::new(&mut active, name))
+                })
                 .inner
                 .changed()
             {
@@ -4768,6 +5099,226 @@ fn default_element(region: NormalizedRegion) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polling_coalesces_while_manual_commands_and_queue_errors_remain_visible() {
+        let (requests, mut receiver) = tokio_mpsc::channel(2);
+        let (responses, response_receiver) = mpsc::sync_channel(2);
+        let worker = Worker {
+            requests,
+            responses: response_receiver,
+            pending_polls: RefCell::default(),
+            send_errors: RefCell::default(),
+        };
+        for _ in 0..1_000 {
+            worker.poll(RequestKind::Status, method::STATUS, Value::Null);
+        }
+        assert_eq!(receiver.try_recv().unwrap().method, method::STATUS);
+        assert!(receiver.try_recv().is_err());
+        worker.send(RequestKind::Capture, method::CAPTURE_STOP, Value::Null);
+        worker.send(
+            RequestKind::Commit,
+            method::PROFILE_COMMIT,
+            json!({"revision": 2}),
+        );
+        worker.send(RequestKind::Draft, method::PROFILE_DRAFT, Value::Null);
+        let failed = worker.try_recv().unwrap();
+        assert_eq!(failed.kind, RequestKind::Draft);
+        assert!(
+            matches!(failed.payload, Payload::Error(message) if message.contains("queue is full"))
+        );
+        assert_eq!(receiver.try_recv().unwrap().method, method::CAPTURE_STOP);
+        assert_eq!(receiver.try_recv().unwrap().method, method::PROFILE_COMMIT);
+        responses
+            .send(Response {
+                kind: RequestKind::Status,
+                payload: Payload::Json(json!({})),
+            })
+            .unwrap();
+        assert_eq!(worker.try_recv().unwrap().kind, RequestKind::Status);
+        worker.poll(RequestKind::Status, method::STATUS, Value::Null);
+        assert_eq!(receiver.try_recv().unwrap().method, method::STATUS);
+    }
+
+    #[test]
+    fn rejected_draft_is_retried_and_poll_success_preserves_its_error() {
+        let (requests, _receiver) = tokio_mpsc::channel(1);
+        let (responses, response_receiver) = mpsc::sync_channel(2);
+        let worker = Worker {
+            requests,
+            responses: response_receiver,
+            pending_polls: RefCell::default(),
+            send_errors: RefCell::default(),
+        };
+        worker.send(RequestKind::Status, method::STATUS, Value::Null);
+        worker.send(RequestKind::Draft, method::PROFILE_DRAFT, Value::Null);
+        responses
+            .send(Response {
+                kind: RequestKind::Status,
+                payload: Payload::Json(json!({"ok":true})),
+            })
+            .unwrap();
+        let mut app = App::with_worker(worker);
+        app.draft_saved = true;
+        app.dirty_since = Instant::now().checked_sub(Duration::from_secs(2));
+        let context = egui::Context::default();
+        app.drain(&context);
+        assert!(!app.draft_saved);
+        assert!(app.dirty_since.unwrap().elapsed() < Duration::from_secs(1));
+        assert!(app.error.as_deref().unwrap().contains("queue is full"));
+        assert_eq!(app.status["ok"], true);
+
+        responses
+            .send(Response {
+                kind: RequestKind::Draft,
+                payload: Payload::Json(json!({})),
+            })
+            .unwrap();
+        app.drain(&context);
+        assert!(app.draft_saved);
+        assert!(app.error.is_none());
+
+        app.test_pending = true;
+        responses
+            .send(Response {
+                kind: RequestKind::DetectorTest,
+                payload: Payload::Error("failed test".into()),
+            })
+            .unwrap();
+        app.drain(&context);
+        assert!(!app.test_pending);
+    }
+
+    #[test]
+    fn capacity_cache_tracks_unsaved_changes_and_profile_switches() {
+        let mut cache = CapacityCache::default();
+        let mut profile = profile_with_elements(1);
+        assert_eq!(cache.report(&profile).elements.used, 1);
+        let revision = profile.revision;
+        profile
+            .elements
+            .push(default_element(profile.elements[0].region));
+        assert_eq!(profile.revision, revision);
+        assert_eq!(cache.report(&profile).elements.used, 2);
+        let other = profile_with_elements(3);
+        assert_eq!(cache.report(&other).elements.used, 3);
+        assert_eq!(cache.report(&profile).elements.used, 2);
+    }
+
+    fn profile_with_elements(count: usize) -> Profile {
+        let mut profile = Profile::new("Game", "game", 1920, 1080);
+        profile.elements = (0..count)
+            .map(|_| {
+                default_element(NormalizedRegion {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.1,
+                    height: 0.1,
+                })
+            })
+            .collect();
+        profile
+    }
+
+    fn test_target() -> InteractionTarget {
+        default_interaction_target(
+            NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.1,
+                height: 0.1,
+            },
+            "target".into(),
+        )
+    }
+
+    #[test]
+    fn projected_capacity_rejects_a_new_detector_element() {
+        let profile = profile_with_elements(512);
+        let error = projected_capacity_error(&profile, "Draw region", |projected| {
+            projected.elements.push(default_element(NormalizedRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.1,
+                height: 0.1,
+            }));
+            Ok(())
+        })
+        .expect("the projected element should exceed the profile limit");
+
+        assert!(error.contains("detector elements 513/512"), "{error}");
+        assert!(error.contains("No changes were made"), "{error}");
+        assert_eq!(profile.elements.len(), 512);
+    }
+
+    #[test]
+    fn projected_capacity_rejects_duplicate_layer_references() {
+        let mut profile = profile_with_elements(256);
+        let original_id = profile.elements[0].id;
+        let mut scene = new_scene(&[]);
+        scene.element_ids = profile.elements.iter().map(|element| element.id).collect();
+        profile.scenes.push(scene);
+
+        let error = projected_capacity_error(&profile, "Duplicate region", |projected| {
+            ProfileStore::duplicate_element(projected, original_id, false)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .expect("the duplicated layer reference should exceed the layer limit");
+
+        assert!(error.contains("largest layer elements 257/256"), "{error}");
+        assert_eq!(profile.elements.len(), 256);
+        assert_eq!(profile.scenes[0].element_ids.len(), 256);
+    }
+
+    #[test]
+    fn projected_capacity_rejects_a_scene_that_copies_too_many_elements() {
+        let profile = profile_with_elements(257);
+        let elements = profile
+            .elements
+            .iter()
+            .map(|element| (element.id, element.name.clone()))
+            .collect::<Vec<_>>();
+        let scene = new_scene(&elements);
+        let error = projected_capacity_error(&profile, "Add scene", |projected| {
+            projected.scenes.push(scene.clone());
+            Ok(())
+        })
+        .expect("the new scene should exceed the layer limit");
+
+        assert!(error.contains("largest layer elements 257/256"), "{error}");
+        assert!(profile.scenes.is_empty());
+    }
+
+    #[test]
+    fn projected_capacity_rejects_target_layer_and_total_overflow() {
+        let mut profile = Profile::new("Game", "game", 1920, 1080);
+        let mut first_scene = new_scene(&[]);
+        let first_scene_id = first_scene.id;
+        first_scene.interaction_targets = (0..256).map(|_| test_target()).collect();
+        let mut second_scene = new_scene(&[]);
+        second_scene.interaction_targets = (0..256).map(|_| test_target()).collect();
+        profile.scenes = vec![first_scene, second_scene];
+
+        let error = projected_capacity_error(&profile, "Add interaction target", |projected| {
+            let Some(scene) = projected
+                .scenes
+                .iter_mut()
+                .find(|scene| scene.id == first_scene_id)
+            else {
+                return Err("scene missing".into());
+            };
+            scene.interaction_targets.push(test_target());
+            Ok(())
+        })
+        .expect("the projected target should exceed both target limits");
+
+        assert!(
+            error.contains("interaction targets total 513/512"),
+            "{error}"
+        );
+        assert!(error.contains("largest layer targets 257/256"), "{error}");
+    }
 
     #[test]
     fn scene_and_overlay_duplicates_rekey_interaction_targets() {

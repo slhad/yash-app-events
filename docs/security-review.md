@@ -20,6 +20,10 @@ Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output sch
   bounded; failures become error observations.
 - Portable exports exclude machine-local portal tokens, node identifiers, and capture
   bindings. Tokens remain in atomic local configuration below XDG config.
+- The daemon stores revision high-water marks in an atomic machine-local sidecar next
+  to the profile directories. The sidecar is excluded from portable exports and keeps
+  a same-ID replacement from publishing an older archive revision after trash or
+  permanent deletion.
 - Frame queues are bounded to the latest frame. Preview images are opt-in, bounded,
   compressed, per-connection leased, and discarded on disconnect. Detector diagnostic
   previews are bounded and returned in memory only.
@@ -35,6 +39,11 @@ Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output sch
   and 4096×4096 PNG decoder limits, bounds profiles/scenes/targets and timeout, mutates
   no daemon state/output, and returns no image bytes. Spatial JSON carries the exact
   frame SHA-256 so external crop materialization can reject stale geometry.
+- Profile-routing bundles are bounded to a 256 KiB ID-only JSON document and 32 members.
+  The daemon derives profile directories from UUIDs, validates the router and selected member's
+  pinned revision/game/layout and router references, evaluates at most one member, and never
+  executes a bundle path or activates a selected profile. Invalid, stale, unresolved, and
+  unmatched routes fail closed.
 - Schema-2 interaction targets are inert rectangles and optional safe points. Neither
   the daemon, CLI, GUI, nor Wayland adapter converts them into input automatically.
 - Diagnostic bundles require plan/review/export. The plan discloses every redacted

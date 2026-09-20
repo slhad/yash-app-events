@@ -43,7 +43,11 @@ pub struct ImportLimits {
 impl Default for ImportLimits {
     fn default() -> Self {
         Self {
-            maximum_files: 256,
+            // A complete schema-2 profile may carry one portable detector asset
+            // per element plus alternate templates and other declared assets.
+            // Keep the archive bounded, but large enough for the profile's own
+            // 512-element capacity and the current full Queen profile.
+            maximum_files: 2048,
             maximum_file_bytes: 32 * 1024 * 1024,
             maximum_total_bytes: 128 * 1024 * 1024,
         }
@@ -63,8 +67,14 @@ pub fn export_profile(
     validate_declared_assets(&profile, profile_directory)?;
     crate::store::load_output_recipes_from_profile_directory(profile_directory)
         .map_err(|error| ArchiveError::InvalidOutputRecipe(error.to_string()))?;
+    let referenced_assets = declared_asset_paths(&profile);
     let mut paths = Vec::new();
-    collect_portable_files(profile_directory, profile_directory, &mut paths)?;
+    collect_portable_files(
+        profile_directory,
+        profile_directory,
+        &referenced_assets,
+        &mut paths,
+    )?;
     paths.sort();
     let mut entries = Vec::with_capacity(paths.len());
     for relative in &paths {
@@ -240,6 +250,7 @@ fn extract_archive(
 fn collect_portable_files(
     root: &Path,
     directory: &Path,
+    referenced_assets: &HashSet<PathBuf>,
     paths: &mut Vec<PathBuf>,
 ) -> Result<(), ArchiveError> {
     for entry in fs::read_dir(directory)? {
@@ -262,12 +273,42 @@ fn collect_portable_files(
             return Err(ArchiveError::UnsafeEntry(portable_name(&relative)?));
         }
         if file_type.is_dir() {
-            collect_portable_files(root, &entry.path(), paths)?;
+            collect_portable_files(root, &entry.path(), referenced_assets, paths)?;
         } else if file_type.is_file() {
-            paths.push(relative);
+            let is_template_asset = relative
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == "templates");
+            if !is_template_asset || referenced_assets.contains(&relative) {
+                paths.push(relative);
+            }
         }
     }
     Ok(())
+}
+
+fn declared_asset_paths(profile: &Profile) -> HashSet<PathBuf> {
+    let mut assets = HashSet::new();
+    for element in &profile.elements {
+        match &element.detector {
+            crate::Detector::Template {
+                templates, masks, ..
+            } => {
+                assets.extend(templates.iter().cloned());
+                assets.extend(masks.iter().flatten().cloned());
+            }
+            crate::Detector::ColorBar {
+                mask: Some(mask), ..
+            } => {
+                assets.insert(mask.clone());
+            }
+            crate::Detector::Classifier { model, .. } => {
+                assets.insert(model.clone());
+            }
+            _ => {}
+        }
+    }
+    assets
 }
 
 fn validate_declared_assets(profile: &Profile, root: &Path) -> Result<(), ArchiveError> {
@@ -365,11 +406,31 @@ mod tests {
     };
 
     fn source_profile(root: &Path) -> Profile {
-        let profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        profile.elements.push(crate::Element {
+            id: crate::ElementId::new(),
+            name: "Icon".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: crate::NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: crate::Detector::Template {
+                id: crate::DetectorId::new(),
+                templates: vec!["templates/icon.bin".into()],
+                masks: Vec::new(),
+                threshold: 0.8,
+                preprocessing: Vec::new(),
+            },
+        });
         fs::create_dir_all(root).unwrap();
         crate::save_profile(&root.join(PROFILE_FILE), &profile).unwrap();
         fs::create_dir(root.join("templates")).unwrap();
         fs::write(root.join("templates/icon.bin"), b"portable asset").unwrap();
+        fs::write(root.join("templates/orphan.bin"), b"stale asset").unwrap();
         profile
     }
 
@@ -427,6 +488,14 @@ mod tests {
         let manifest = export_profile(&source, &archive).unwrap();
         assert_eq!(manifest.profile_id, profile.id);
         assert_eq!(manifest.files.len(), 2);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|file| file.path == "templates/icon.bin"));
+        assert!(!manifest
+            .files
+            .iter()
+            .any(|file| file.path == "templates/orphan.bin"));
         let imported = import_profile(
             &archive,
             &directory.path().join("profiles"),
@@ -445,6 +514,52 @@ mod tests {
             .unwrap(),
             b"portable asset"
         );
+        assert!(!directory
+            .path()
+            .join("profiles")
+            .join(profile.id.to_string())
+            .join("templates/orphan.bin")
+            .exists());
+    }
+
+    #[test]
+    fn export_filters_orphan_templates_without_touching_history_or_other_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let profile = source_profile(&source);
+        fs::create_dir_all(source.join("models")).unwrap();
+        fs::write(source.join("models/legacy.bin"), b"keep for compatibility").unwrap();
+
+        let history = source.join("revisions");
+        fs::create_dir_all(&history).unwrap();
+        let mut historical = profile.clone();
+        historical.revision = 4;
+        if let crate::Detector::Template { templates, .. } = &mut historical.elements[0].detector {
+            templates[0] = "templates/historical.bin".into();
+        }
+        fs::write(source.join("templates/historical.bin"), b"historical asset").unwrap();
+        crate::save_profile(&history.join("4.json"), &historical).unwrap();
+        fs::write(source.join("draft.json"), b"draft data").unwrap();
+
+        let archive = directory.path().join("filtered.hudprofile");
+        let manifest = export_profile(&source, &archive).unwrap();
+        let paths: HashSet<_> = manifest
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+
+        assert!(paths.contains(PROFILE_FILE));
+        assert!(paths.contains("templates/icon.bin"));
+        assert!(paths.contains("models/legacy.bin"));
+        assert!(!paths.contains("templates/orphan.bin"));
+        assert!(!paths.contains("templates/historical.bin"));
+        assert!(!paths.contains("revisions/4.json"));
+        assert!(!paths.contains("draft.json"));
+        assert!(source.join("templates/orphan.bin").is_file());
+        assert!(source.join("templates/historical.bin").is_file());
+        assert!(source.join("revisions/4.json").is_file());
+        assert!(source.join("draft.json").is_file());
     }
 
     #[test]

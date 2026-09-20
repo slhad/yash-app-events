@@ -8,7 +8,7 @@ Before changing code or documentation, read these files in order:
 
 1. `SPECS.md` — normative product and technical requirements; this is the source of truth.
 2. `PLAN.md` — implementation sequence, milestones, and verification gates.
-3. `GOAL.md` — autonomous execution objective and stopping conditions.
+3. `GOAL.md` — completed release objective and current document boundaries.
 4. `README.md` — user-facing description, setup, and currently supported behavior.
 
 If these documents disagree, `SPECS.md` wins. Resolve the disagreement in the same change rather than allowing documentation to remain contradictory.
@@ -41,7 +41,7 @@ For each implementation task:
 6. Update `PLAN.md` if sequencing or scope changed.
 7. Update `README.md` only for user-visible behavior that now works.
 
-Do not mark a requirement complete based only on code presence. Completion requires the verification evidence stated in `SPECS.md` or `PLAN.md`.
+Do not mark a requirement complete based only on code presence. Completion requires the verification evidence stated in `SPECS.md`.
 
 ## Intended workspace shape
 
@@ -67,4 +67,3 @@ Add targeted integration, replay, and schema-compatibility commands as those fac
 - Do not export portal restore tokens, local window identifiers, or other machine-specific capture data.
 - Never execute content from imported profiles.
 - Ensure debug captures are opt-in and make their storage and deletion visible to the user.
-

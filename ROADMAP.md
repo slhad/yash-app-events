@@ -1,176 +1,49 @@
-# Post-release Roadmap
+# Roadmap
 
-This roadmap begins after completion of the first usable Linux release recorded in
-`GOAL.md`. `SPECS.md` remains normative. Before implementation begins on a milestone,
-promote its requirements from deferred or future scope into explicit acceptance
-criteria in `SPECS.md`. Do not claim support until those criteria have evidence.
+`SPECS.md` defines committed behavior. Items in this file are ideas, not promises. Promote an
+item into `SPECS.md` and `PLAN.md` only after a concrete use case, compatibility review, and
+acceptance criteria exist.
 
-## Progress
+## Completed milestones
 
-- R0 — release handoff and documentation: complete (2026-07-11).
-- R1 — complete event-rule language: complete (2026-07-11). Typed predicates,
-  stable duration, bounded composition, initial/updated transitions, schema compatibility,
-  GUI authoring, and common live/image-replay coordination pass.
-- R2 — OCR detector: complete (2026-07-11). Fixtures, Tesseract/ONNX benchmark,
-  backend decision, typed Tesseract detector, change-triggered scheduling,
-  profile/daemon/GUI wiring, frozen diagnostics, and image replay event pass.
-- R3 — privacy-bounded diagnostic bundle: complete (2026-07-11). Protocol, CLI, and
-  GUI provide review-before-export; recursive redaction, explicit frozen-region crops,
-  limits, atomic ZIP output, and adversarial tests pass.
-- R4 — generic image classifier: complete for the validated generic workflow
-  (2026-07-11). Generated dataset/model, SHA and resource validation, bounded ONNX CPU
-  inference, scheduling/cache, GUI diagnostics/configuration, image replay, temporal
-  event integration, and recorded benchmark pass. Real game-specific models remain
-  profile assets requiring their own datasets and evidence.
-- R5 — performance and platform candidates: uncommitted; promote only from measured
-  need and a concrete use case.
-- R6 — profile-scoped output routes: complete (2026-07-17). Machine-local event/state
-  routes, JSON templates, file/direct-command sinks, bounded execution, shared controls,
-  GUI verification, portable inert recipe browse/edit/preview/install, archive/provenance
-  safety, and refreshed workspace quality gates pass.
-- R7 — scene-aware game understanding and JSON-first screenshot analysis: complete
-  (2026-08-02). Profile schema/migration, bounded two-stage scheduling, pure spatial
-  JSON, live/replay/GUI context, crop-first privacy, and the isolated-Wayland adapter
-  have concrete `SPEC-SCENE-001` through `008` evidence.
+- First usable Linux and Wayland release, 2026-07-11.
+- Complete temporal rule language, OCR, bounded diagnostic exports, and generic ONNX image
+  classification, 2026-07-11.
+- Profile-scoped output routes and portable inert recipes, 2026-07-17.
+- Public profile catalog with reviewed, versioned packages, 2026-07-18.
+- Scene-aware analysis, spatial JSON, crop-first escalation, and optional isolated-Wayland
+  adapter, 2026-08-03.
+- Long-suite operations, profiling, cancellation, focused evaluation, bounded inventory cache,
+  and profile capacity diagnostics, 2026-08-18 through 2026-09-04.
+- Lazy contextual detectors, profile-bundle routing, revision-lineage hardening, and bounded
+  transition context, 2026-09-04 through 2026-09-15.
+- Full application performance audit, 2026-09-20.
 
-## R1 — Complete event-rule language
+The specification evidence index and `docs/performance.md` contain the measurements and test
+results. Git history retains the implementation plans that produced these milestones.
 
-Implement the remaining behavior anticipated by `SPEC-EVENT-002` and
-`SPEC-EVENT-003` across profile schema, validation, engine, protocol, CLI/GUI,
-replay, and output:
+## Unscheduled candidates
 
-1. Boolean appearance/disappearance.
-2. String equality and substring matching.
-3. Stable-duration evidence.
-4. Conjunction and disjunction of observations.
-5. Explicit, rate-limited `updated` transitions.
-6. Configurable initial-state transition emission after startup.
-
-Exit gate:
-
-- Every primitive has schema round-trip, validation, deterministic engine, replay,
-  and GUI authoring coverage.
-- Composition has bounded history and evaluation cost and cannot introduce cycles.
-- Transition golden tests cover initial establishment, entered, updated, and left.
-- Existing schema-v1 profiles and protocol-v1 clients remain compatible, or a
-  versioned migration is supplied.
-
-## R2 — OCR detector
-
-Complete Phase 9 from `PLAN.md`:
-
-1. Add legally redistributable fixtures covering representative HUD fonts,
-   localization, scale, animation, glow, and background variation.
-2. Benchmark Tesseract and an ONNX recognition pipeline for field/event accuracy,
-   latency, confidence calibration, CPU, and memory.
-3. Record the backend decision and distribution consequences.
-4. Integrate the selected backend behind the detector boundary.
-5. Add bounded scheduling, including region-change-triggered evaluation where useful.
-6. Add profile validation, GUI configuration, preprocessing preview, replay metrics,
-   and regression tests.
-
-Exit gate:
-
-- The backend choice is justified by reproducible benchmark evidence.
-- OCR never blocks capture or the GUI render thread and has bounded resource use.
-- OCR observations use the common temporal-rule and output paths.
-- Localization, scaling, animation, and glow regressions pass.
-
-## R3 — Diagnostic bundle
-
-Promote `SPEC-OBS-003` and implement an explicit export workflow containing redacted
-logs, configuration, metrics, and only user-selected crops.
-
-Exit gate:
-
-- The UI presents the exact included files and a privacy warning before export.
-- Portal tokens, machine-local bindings, secrets, and full screenshots are excluded
-  by default and tested with adversarial fixtures.
-- Per-file, file-count, and total-size limits are enforced.
-- Bundle creation is atomic and does not run on the GUI render thread.
-
-## R4 — Generic image classifier
-
-Promote `SPEC-DET-006` only after representative, redistributable replay datasets and
-deterministic baselines exist. Then add validated model assets, bounded inference,
-GUI configuration and diagnostics, replay evaluation, and temporal-rule integration.
-
-Exit gate:
-
-- Dataset, accuracy, latency, confidence, CPU, and memory evidence justify the model.
-- Untrusted models and inputs have explicit validation and resource limits.
-- Classifier failures produce `unknown` or `error`, never fabricated negatives.
-- Installation and packaging of the selected runtime are verified.
-
-## R6 — Profile-scoped output routes
-
-Promote `SPEC-OUT-005` to let each active profile route selected events or rendered
-state changes into integration-specific outputs without coupling integrations to the
-detector engine.
-
-Exit gate:
-
-- Machine-local routes cannot enter portable archives or execute through a shell.
-- File and direct-command sinks support bounded, typed JSON templates.
-- Delivery runs through a bounded daemon worker and failures remain observable/non-fatal.
-- Shared RPC/CLI methods and GUI enable/test controls pass integration tests.
-- Portable recipe files are archive-validated and can only become hash-pinned, disabled
-  local routes after explicit GUI review, editing, preview, and sink selection.
-- A later BlazBlue stage-marker route can call the reviewed local `yash` IPC executable
-  without adding a game-specific sink to this repository.
-
-## R7 — Scene-aware game understanding and JSON-first screenshot analysis
-
-Implement `ENHANCE_PLAN.md` as the next post-release milestone. Promote profiles from a
-flat detector list to a versioned scene/overlay model with bounded anchor recognition,
-contextual detector scheduling, descriptive interaction geometry, and safe schema-1
-migration. Add pure PNG analysis through the daemon/protocol/CLI, live scene state and
-transitions, GUI authoring/diagnostics, and the optional isolated-Wayland adapter.
-
-The default AI handoff is structured JSON containing names, values, normalized and pixel
-rectangles, and explicitly configured safe points. Images remain an explicit crop-first
-fallback for unknown, ambiguous, novel, or geometrically unsafe states. Yash continues to
-observe only and never generates input.
-
-Exit gate:
-
-- Every `SPEC-SCENE-*` requirement is verified with concrete schema, migration, engine,
-  protocol, CLI, GUI, replay, security, privacy, performance, and adapter evidence.
-- Representative multi-scene profiles execute materially fewer irrelevant expensive
-  detectors than their flat equivalents.
-- Known frames are consumable as JSON only; uncertain frames provide bounded explicit
-  crop-first escalation without embedding image bytes in RPC.
-- All existing release gates and schema/protocol compatibility tests remain green.
-
-Completed 2026-08-03: 138 workspace tests and strict Clippy pass; v1/v2 profile
-goldens, resolver/gating/geometry/handoff/live/replay/GUI tests are green. A live
-558×992 isolated-Wayland run returned JSON without image bytes, produced an explicit
-209×10 hash-bound crop, materialized a mode-0600 full frame only on request, and
-rejected/cleaned a stale hash with exit 3.
-
-## R5 — Candidates requiring promotion
-
-The following are not scheduled commitments:
-
-- GNOME and KDE portal acceptance and broader distribution packaging.
-- Shared-memory preview, DMA-BUF, or GPU preprocessing.
-- OBS plugin/shared-texture integration.
-- X11 and Windows capture backends.
-- Authenticated remote WebSocket control.
-- MQTT, Home Assistant, and webhook adapters.
+- GNOME and KDE portal acceptance on additional distributions.
+- Shared-memory preview after transfer profiling shows a material benefit.
+- DMA-BUF or GPU preprocessing after CPU and copy measurements justify the complexity.
+- OBS plugin or shared-texture integration.
+- X11 capture.
+- Windows Graphics Capture.
+- Authenticated remote control. Local Unix control remains the default security boundary.
+- MQTT, Home Assistant, and webhook output adapters.
 - Multi-source simultaneous capture.
+- Bounded case parallelism after detector memory falls below the current single-worker budget.
 
-Promote a candidate only after documenting its user need, security boundary,
-compatibility impact, measurements, acceptance criteria, and ordering relative to the
-active milestone.
+## Promotion gate
 
-## Verification discipline
+Before scheduling a candidate:
 
-For every milestone:
+1. Describe the user problem and why existing behavior is insufficient.
+2. Define security, privacy, compatibility, and resource limits.
+3. Add normative requirements and acceptance evidence to `SPECS.md`.
+4. Add an ordered implementation slice to `PLAN.md`.
+5. Measure the current path before choosing a new dependency or architecture.
 
-1. Update `SPECS.md` before claiming the expanded behavior.
-2. Preserve bounded capture, subscriptions, scheduling, and image/model processing.
-3. Add schema/protocol golden and migration tests for external-contract changes.
-4. Run formatting, strict Clippy, workspace tests, targeted replay/benchmark tests,
-   README claim checks, and documentation generation.
-5. Record status and concrete evidence in `SPECS.md` and this roadmap.
+Keep a candidate deferred when its measured benefit does not cover its runtime, maintenance, or
+distribution cost.

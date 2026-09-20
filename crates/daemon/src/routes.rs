@@ -49,7 +49,7 @@ impl Router {
                                 .event
                                 .as_ref()
                                 .is_some_and(|event| route.accepts_event(event)),
-                            OutputTrigger::StateChange => true,
+                            OutputTrigger::StateChange => job.event.is_none(),
                         };
                         if !accepted {
                             continue;

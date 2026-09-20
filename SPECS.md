@@ -192,6 +192,13 @@ be able to list and inspect retained snapshots, compare them with the current pr
 and roll a selected snapshot forward as a new revision after optimistic-concurrency
 validation. Rollback shall never erase or overwrite the current revision.
 
+The daemon shall retain a machine-local high-water mark for each stable profile ID
+outside the portable profile directory. A daemon-owned import or catalog installation
+with a previously seen ID shall publish at a revision greater than that mark, even if
+the incoming archive carries revision 0 or the previous profile was moved to trash or
+permanently deleted. A fresh profile ID may retain the archive's revision. Duplication
+still receives a new ID and starts at revision 0.
+
 Profiles may define stable-ID derived text observations with an enabled state, a bounded
 format string, and named inputs referencing detector observations. The daemon shall own
 composition and publish derived values through the same state, rule, output, and JSON-RPC
@@ -392,6 +399,9 @@ Acceptance:
   geometry, and interaction points outside their target rectangle.
 - Profile/element duplication, revision history, archive import/export, and catalog
   validation preserve or rekey every new reference correctly.
+- Removing a detector shall disable scenes/overlays that lose recognition evidence
+  and hide targets that lose visibility evidence until the draft is repaired; removal
+  shall not silently turn a predicate into an unconditional match.
 - Golden fixtures prove schema-1 compatibility and schema-2 round trips.
 
 ### SPEC-SCENE-002 — Bounded scene and overlay recognition
@@ -419,6 +429,9 @@ After scene resolution, the second stage shall evaluate only global contextual e
 and detector elements owned by the recognized scene and overlays. Expensive OCR and model
 inference outside the active context shall be skipped. Scene changes shall reset detector
 or rule history whose semantics do not cross the context boundary.
+
+Recognition anchors referenced only by disabled scenes or overlays shall not be
+constructed or evaluated unless independently needed by an enabled context or global element.
 
 The number of scenes, overlays, anchors, condition leaves, active contextual detectors,
 interaction targets, candidates, diagnostics, and per-request processing time shall have
@@ -457,7 +470,11 @@ Acceptance:
 The daemon shall expose an additive protocol method and CLI command that evaluate one
 explicit bounded PNG against a selected profile without starting capture. The result
 shall use the same scene resolver, detector implementations, derived observations, and
-geometry conversion as live/replay analysis.
+geometry conversion as live/replay analysis. The command may alternatively accept a bounded
+profile-routing document containing a router profile and independently validated member profiles;
+the daemon shall evaluate the router first and at most one selected member, with pinned revisions,
+game/layout compatibility, deterministic route precedence, and an explicit fail-closed result
+when no route is available.
 
 The operation shall not publish events, deliver output routes, mutate current state, or
 persist image content by default. It shall accept only bounded 8-bit grayscale/RGB/RGBA
@@ -467,7 +484,8 @@ return `unknown` for detectors requiring unavailable temporal history.
 Acceptance:
 
 - CLI and JSON-RPC golden tests cover stable JSON and error categories.
-- Tests prove there are no durable state, event, route, or image side effects.
+- Tests prove there are no durable state, event, route, or image side effects, including when
+  bundle routing selects a member or returns an unresolved/no-match router result.
 - The implementation factors the existing validated replay/suite decoder rather than
   introducing a divergent image parser.
 
@@ -529,6 +547,32 @@ Acceptance:
   desktop dimensions.
 - Tests cover optional dependency behavior, cleanup, crop-first escalation, stale-frame
   rejection, and the absence of automatic input.
+
+### SPEC-SCENE-009 — Bounded transition-analysis context
+
+The one-shot analysis protocol may accept a bounded caller context containing the previous
+analysis identity (profile ID/revision, recognized scene and overlays, frame hash, and age)
+plus optional expected stable scene/overlay IDs or semantic scene/overlay names for the next
+frame. Names are resolved against the selected profile. The context shall be a soft prior: it may rank
+equal-confidence candidates and route analysis, but it shall never
+prune an enabled profile candidate, suppress whole-profile fallback, provide image bytes or
+coordinates, or authorize an interaction.
+
+Previous context shall be ignored when its profile identity does not match the selected
+profile, its age exceeds the bounded transition window, its hash is malformed, or its IDs are
+not present in the enabled profile. The response shall expose an auditable context status,
+the preferred IDs that were accepted, ignored reasons, and an explicit full-profile candidate
+scope/fallback. Bundle analysis shall apply the context to the router and preserve that report
+on the final response; a selected member remains independently analyzed and validated.
+
+Acceptance:
+
+- CLI and JSON-RPC tests cover bounded object parsing, expected IDs, previous identity, stale
+  and mismatched context, malformed hashes, unknown IDs, and bundle forwarding.
+- Engine tests prove the hint changes only ranking while every enabled scene and overlay stays
+  in the candidate result, including an ambiguous tie that remains fail-closed.
+- Queen controller tests prove only a fresh exact-layout recognized result seeds the next hint,
+  and that the wrapper forwards context without retaining images or safe points.
 
 ## 8. Event engine
 
@@ -608,6 +652,10 @@ Required fields:
 ### SPEC-OUT-002 — Current state
 
 The daemon shall atomically replace `state.json` with the latest capture status, active profile, observations, and event states. It shall include schema, daemon instance, sequence, and update timestamp.
+
+Live and replay processing shall publish one complete snapshot per analyzed frame,
+after updating detector and derived observations. Individual transitions shall retain
+their ordered event-log, subscription, and event-route deliveries.
 
 ### SPEC-OUT-003 — Output durability
 
@@ -790,6 +838,14 @@ Acceptance:
 
 On reference hardware to be documented, the daemon should analyze configured small regions at 10 FPS without degrading capture stability. Exact CPU/GPU targets shall be established after the first benchmark harness exists.
 
+Replay image decoding shall consume one frame at a time, with dimensions checked before
+allocating decoded pixels. Retained image memory shall not grow with replay length.
+
+CPU-heavy image work shall run outside the async control executor, with bounded
+foreground admission and one live frame job at a time. GUI refresh requests shall be
+bounded and coalesce while an earlier poll is outstanding; render-time capacity reports
+shall perform no filesystem access and be reused until draft content changes.
+
 ### SPEC-PERF-002 — Idle cost
 
 With capture stopped and no preview client, the daemon shall perform no periodic image work and should remain effectively idle.
@@ -836,14 +892,14 @@ No requirements are verified at repository initialization.
 SPEC-ARCH-002 | VERIFIED | Cargo workspace manifests and `docs/architecture.md`; `cargo fmt --all -- --check`, strict workspace Clippy, tests, and docs pass (2026-07-11)
 SPEC-OBS-001 | VERIFIED | daemon initializes `tracing` with configurable `RUST_LOG`, structured startup fields, and no frame/token logging paths; security review records redaction boundary (2026-07-11)
 SPEC-PROFILE-002 | VERIFIED | XDG resolution tests plus atomic `settings.toml` and separate `capture-bindings.toml` round trips; portal tokens never enter portable profile trees (2026-07-11)
-SPEC-PROFILE-003 | VERIFIED | typed UUID identities, stable-name validation, duplicate-ID and dangling-reference rejection in profile tests (2026-07-11)
-SPEC-PROFILE-004 | VERIFIED | normalized region/layout validation rejects unsafe geometry; shared schema limits now expose used/maximum and 80/90/100% warnings through profile API, offline CLI, and GUI, with actionable 513/512 validation, unreachable/disabled/duplicate analysis, per-scene cost estimates, generated-limit tests, and a measured decision to retain 512 (updated 2026-08-18)
+SPEC-PROFILE-003 | VERIFIED | typed UUID identities, stable-name validation, duplicate-ID and dangling-reference rejection, and validated schema-2 compatibility aliases for consolidated detector elements in profile/store/daemon tests (updated 2026-09-04)
+SPEC-PROFILE-004 | VERIFIED | normalized region/layout validation, shared capacity limits and warnings, dependency-complete duplicate/unreachable analysis, content-aware template analysis, enabled-layer anchor costs, per-scene estimates, projected GUI blockers, and over-limit analysis-only inspection pass; GUI reports avoid filesystem access and cache by full draft content, including unsaved changes; measured decision remains 512 (updated 2026-09-20)
 SPEC-PROFILE-005 | VERIFIED | same-directory temporary write, flush, sync, and rename; injected pre-rename failure test proves the prior document remains valid (2026-07-11)
-SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft separation, revision increment/history pruning, protocol list/get/rollback with expected-revision conflicts, roll-forward preservation tests, and GUI history/comparison/confirmation workflow (2026-07-12)
+SPEC-PROFILE-006 | VERIFIED | `ProfileStore` draft/history/rollback and optimistic concurrency, atomic high-water lineage, same-ID trash/backup import rebasing, permanent-deletion continuity, and revision-100 regression tests pass; active documents parse once, external backups do not appear in listings, directory/document IDs must match, and failed GUI autosaves retry (updated 2026-09-20)
 SPEC-PROFILE-007 | VERIFIED | stale-commit test proves structured expected/current revision conflict without overwrite (2026-07-11)
-SPEC-PROFILE-008 | VERIFIED | tests prove profile assets are deep-copied with all internal IDs rekeyed and element rules copy only on explicit request (2026-07-11)
+SPEC-PROFILE-008 | VERIFIED | tests prove profile assets are deep-copied with all internal IDs and compatibility-alias targets rekeyed, and element rules copy only on explicit request (updated 2026-09-04)
 SPEC-PROFILE-011 | VERIFIED | reversible application-managed trash/restore test; no implicit permanent deletion API (2026-07-11)
-SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata (2026-07-11)
+SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip includes schema-v1 manifest, profile document, portable assets, sizes, and SHA-256 integrity metadata; archive tests verify orphan-template filtering while preserving other allowed portable files and leaving source assets untouched (updated 2026-09-20)
 SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
 SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)
 SPEC-PROFILE-012 | VERIFIED | 124-test workspace suite and strict Clippy pass; `profiles` publication run 29623649827 produced immutable package SHA-256 `07efe534ec49d723cd4ce06fa6ea0becc085ee4b71ba63288e97ec9f612c05b4` plus `catalog-v1-r000001.json`; downloaded bytes match a local deterministic rebuild; a fresh daemon fetched, cached, verified, and installed the profile inactive with two inert recipes and zero routes; native workspace-4 GUI review passed without cua-driver (2026-07-18)
@@ -862,7 +918,7 @@ SPEC-EVENT-001 | VERIFIED | detector output becomes an observation, `NumericRule
 SPEC-EVENT-002 | VERIFIED | all first-usable-slice primitives—numeric threshold, confidence, N-of-M, hysteresis, and cooldown—are schema-backed, GUI-editable, and engine tested; boolean/string/composition remain post-release candidates under the normative “eventually” scope (2026-07-11)
 SPEC-EVENT-003 | VERIFIED | synthetic health history emits exactly `entered` then `left`; no per-frame output and low-confidence/unknown samples add no false evidence (2026-07-11)
 SPEC-OUT-001 | VERIFIED | `EventRecord` golden test proves one compact schema-v1 JSON object per transition with all required fields (2026-07-11)
-SPEC-OUT-002 | VERIFIED | schema-v1 snapshot includes daemon instance/sequence/timestamp/capture/profile/observations/events; atomic interruption and daemon `state.get` equality tests (2026-07-11)
+SPEC-OUT-002 | VERIFIED | atomic snapshots include instance/sequence/time/capture/profile/observations/events/context; 128-observation regression proves one complete snapshot per analyzed frame, disk/`state.get` equality, no unchanged-frame write, and separate event/state route delivery; publication benchmark improves 1684.281 to 21.217 ms (updated 2026-09-20)
 SPEC-OUT-003 | VERIFIED | configurable transition flush count and size-based single-generation rotation implemented; JSONL golden test flushes and reads output (2026-07-11)
 SPEC-OUT-004 | VERIFIED | typed sink failures never panic, failure injection preserves engine operation, daemon records status `output_error` and emits a live error notification consumed by protocol clients/GUI (2026-07-11)
 SPEC-OUT-005 | VERIFIED | machine-local schema-1 routes provide event filters, rendered-state deduplication, typed JSON and raw-text templates, configurable trailing line feed, append/atomic-replace files, direct bounded commands without a shell, capacity-64 background delivery, shared list/set/enable/remove/test RPC and CLI, GUI enable/test controls, and output/profile/daemon integration tests; configured profile replay publishes through the same output boundary, isolated workspace-4 GUI runs proved both the 13-byte `STAGE-3 : 04\n` file and exact 12-byte no-line-ending variant, and visual acceptance confirms the route section and individual routes are collapsed by default with enabled-count/actionable summaries while expanded Trigger/Sink metadata remains normal-sized (2026-07-18)
@@ -880,21 +936,21 @@ SPEC-EVENT-005 | VERIFIED | schema-v1-compatible typed predicates and bounded no
 SPEC-DET-003 | VERIFIED | multi-template normalized matching with masks/assets/best diagnostics and brightness test; profile replay integration asserts entered/left records identical in JSONL and RPC (2026-07-11)
 SPEC-DET-004 | VERIFIED | normalized change/stability unknown-baseline behavior plus profile replay integration asserts left/entered records identical in JSONL/RPC and final state (2026-07-11)
 SPEC-DET-007 | VERIFIED | schema-v1 serializable grayscale/resize/threshold/erode/dilate/invert pipeline reproduces preview pixels; `detector.test` returns bounded compressed PNG preview with no persistence (2026-07-11)
-SPEC-PERF-003 | VERIFIED | release-mode detector and generated 128..1024 profile baselines plus the 202-case private workload are recorded in `docs/performance.md`; case detector/OCR work dominates hashing/load/serialization, so async operations, focus, consolidation, and bounded caching precede transfer/GPU or case concurrency (updated 2026-08-18)
+SPEC-PERF-003 | VERIFIED | `docs/performance.md` records publication, template, and 4K capture before/after release benchmarks, exact-score differential testing, and 33-case game-suite latency/RSS evidence alongside historical capacity and Queen results; no GPU/shared-memory or case-concurrency change was needed (updated 2026-09-20)
 SPEC-PROD-002 | VERIFIED | supported CachyOS/Hyprland portal selection delivered 3840×2160 frames through PipeWire 1.6.6 and stopped cleanly; isolated fresh-permission cancellation returns an actionable error and typed policy denial is tested (2026-07-11)
 SPEC-CAP-002 | VERIFIED | live Hyprland create/select/start/open-remote/frame/session-close succeeds with hidden cursor; real isolated chooser cancellation, readiness-race propagation, and typed NotAllowed denial behavior pass (2026-07-11)
 SPEC-CAP-003 | VERIFIED | machine-local token persistence, portal ExplicitlyRevoked mode, reuse, stale-token explicit fallback tests, and live Hyprland restoration pass; a stopped 3840×2160 profile capture restored without a picker in 35 ms and reported `restore_token_saved: true` (2026-07-11)
-SPEC-CAP-004 | VERIFIED | live Hyprland exposed the need for BGR-family negotiation; RGB/RGBA/RGBx/BGR/BGRA/BGRx are supported with padded copies, channel/alpha normalization tests, and actionable short/unsupported diagnostics (2026-07-11)
+SPEC-CAP-004 | VERIFIED | historical Hyprland capture and RGB/RGBA/RGBx/BGR/BGRA/BGRx tests cover stride/offset/channel/alpha normalization and short/unsupported diagnostics; direct shared-buffer allocation preserves those checks and improves 4K RGBA copy 2.383 to 0.741 ms/frame, BGRx 6.215 to 4.820 ms/frame (updated 2026-09-20)
 SPEC-CAP-006 | VERIFIED | callback format/stride tests and daemon live-worker integration verify input/analysis rates, replacements, frame age, resolution, format/error and detector latency/error counters through status RPC/CLI/GUI (2026-07-11)
 SPEC-SEC-003 | VERIFIED | shared system/capture status and CLI expose active flag and selected portal node label (2026-07-11)
 SPEC-SEC-004 | VERIFIED | capture callback has no persistence path; snapshot/template RPCs require explicit actions/destinations and padded-frame PNG/atomic tests pass; security review enumerates all image persistence paths (2026-07-11)
-SPEC-PERF-001 | VERIFIED | reference Ryzen 7 5800X3D deterministic detectors remain below 0.52 ms/evaluation and live-worker input is bounded at 10 analysis FPS; long suites now leave the async executor, keep status responsive, cap running/retained operations, stream inventory, expose watchdog/cancellation, and retain a provisional 2 GiB single-worker budget instead of unsafe parallelism (updated 2026-08-18)
+SPEC-PERF-001 | VERIFIED | lazy replay/release and pre-decode dimension tests, bounded image-worker admission surviving caller cancellation, one live frame job, coalesced bounded GUI queues, and 4,096 bit-exact optimized template comparisons pass; all 197 workspace tests and strict Clippy pass; 33 game cases/126 assertions pass with 61 concurrent status requests at 4.245 ms median and 5.730 ms maximum; details and limitations in `docs/performance.md` (updated 2026-09-20)
 SPEC-PERF-002 | VERIFIED | release daemon with stopped capture/no preview measured 0 CPU scheduler ticks over two seconds at CLK_TCK=100; image task lifecycle and prompt stop are tested/documented in `docs/performance.md` (2026-07-11)
 SPEC-UI-001 | VERIFIED | `yash-app-events` uses eframe/egui 0.32 and completed a five-second native Wayland startup smoke with daemon connection (2026-07-11)
 SPEC-UI-002 | VERIFIED | GUI exposes list/create/rename-by-commit/duplicate/import/export/trash/restore/activate over the same revision-aware protocol methods tested by CLI/daemon integration; native Wayland startup smoke passes (2026-07-11)
 SPEC-UI-003 | VERIFIED | native GUI source selection, permission/capture state, live preview/freeze/metrics, interactive request progress, and daemon-late reconnect/profile recovery pass on Hyprland with screenshot/RPC evidence in `docs/gui-acceptance-report.md` (2026-07-11)
 SPEC-UI-004 | VERIFIED | normalized canvas supports draw/select/move/resize/duplicate/enable, explicit named zone listing/selection, aspect-preserving zoom/pan, labels/reference pixels, original and processed crop panels, and observation diagnostics; native screenshot evidence is in `docs/gui-acceptance-report.md` (2026-07-11)
-SPEC-UI-008 | VERIFIED | GUI render thread only mutates widget/texture state; dedicated worker owns RPC, reconnect/timeouts and PNG decode; daemon owns all capture/detection/I/O (2026-07-11)
+SPEC-UI-008 | VERIFIED | dedicated GUI worker owns RPC/reconnect/timeouts/PNG decode; capacity reports are memory-only, cached, and skipped when collapsed; polling coalesces with 64-entry request/response bounds, queue errors remain visible, and failed draft/test requests recover; GUI tests pass (updated 2026-09-20)
 SPEC-CAP-005 | VERIFIED | per-connection opt-in lease, bounded caller-sized PNG previews capped at 1600x900, frozen exact-frame testing, disconnect cleanup and no-detector-input path pass daemon/live-worker tests; live protocol acceptance returned 1600x900 independently of detector input (2026-07-11)
 SPEC-PROD-001 | VERIFIED | installed GUI selects a live source, lists/persists normalized zones and detector/rule configuration, exposes live observations, and the common engine E2E publishes resulting transitions to JSONL/state plus bounded IPC; native/replay evidence is recorded in `docs/gui-acceptance-report.md` (2026-07-11)
 SPEC-PROD-003 | VERIFIED | capture is portal-mediated and the codebase has no process-memory, injection, input synthesis, or anti-cheat interface; architecture/security review (2026-07-11)
@@ -908,11 +964,12 @@ SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis F
 SPEC-OBS-003 | VERIFIED | protocol-v1 plan/review/export is shared by CLI and GUI; exact entry/size disclosure, visible privacy confirmation, recursive secret/binding/token redaction, explicit frozen element crops, PNG/name/count/file/total limits, atomic ZIP output, failure cleanup, and daemon/output adversarial tests pass (2026-07-11)
 SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
 SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)
-SPEC-SCENE-001 | VERIFIED | profile schema 2 models bounded scenes, overlays, enabled anchors, contextual/required detectors, targets and safe points; deterministic non-writing schema-1 migration, v1/v2 golden fixtures, archive/catalog compatibility, complete reference rekeying, validation, and GUI authoring tests pass (2026-08-02)
+SPEC-SCENE-001 | VERIFIED | bounded schema-2 scenes/overlays/targets, deterministic non-writing schema-1 migration, golden fixtures, archives/catalog, reference rekeying and GUI authoring tests pass; deleting recognition/visibility evidence disables affected layers and hides targets, verified through profile validation and engine resolution (updated 2026-09-20)
 SPEC-SCENE-002 | VERIFIED | weighted typed recognition, unknown/false distinction, N-of-M hysteresis, ambiguity preservation, priority/transition-hint ranking, independent overlay expiry, and bounded histories pass engine tests (2026-08-02)
-SPEC-SCENE-003 | VERIFIED | the common live/replay/suite scheduler advances evidence only on newly scheduled anchors, gates unrelated contextual detectors, and publishes evaluated/gated/throttled counts; the three-detector regression proves 1 then 2 evaluations with unrelated work skipped (2026-08-02)
+SPEC-SCENE-003 | VERIFIED | common live/replay/suite scheduling advances newly scheduled anchors, lazily constructs/releases contextual processors and reports counts; the five-detector regression proves 1 then 4 evaluations, required/visibility dependencies, and exclusion of both disabled-scene and disabled-overlay anchors from construction, one-shot dependencies, crops, and capacity costs (updated 2026-09-20)
 SPEC-SCENE-004 | VERIFIED | one-shot OCR fixture response proves exact 640×120 frame identity, stable element/target names and IDs, normalized/pixel rectangles, and configured 320×75 center point; validation rejects unsafe geometry (2026-08-02)
-SPEC-SCENE-005 | VERIFIED | additive `analysis.evaluate_image` and `yash-eventsctl --json analyze` reuse the bounded suite PNG decoder and common detectors/resolver/geometry; valid/blank/layout fixtures prove deterministic output, timeout bounds, and no state/sequence side effects (2026-08-02)
+SPEC-SCENE-005 | VERIFIED | additive `analysis.evaluate_image` and `yash-eventsctl --json analyze` reuse the bounded suite PNG decoder and common detectors/resolver/geometry; pinned profile-bundle routing selects at most one member by stable router context, validates revision/game/layout/route references, and fails closed; valid/blank/layout/bundle fixtures prove deterministic output, timeout bounds, and no state/sequence side effects (updated 2026-09-04)
 SPEC-SCENE-006 | VERIFIED | deterministic handoff tests cover complete, unknown, ambiguous, uncertain-overlay, missing-required, and layout-incompatible reasons; responses contain no bytes, cap named crops at eight, and reserve full-frame recommendation for unknown-scene discovery or broad layout incompatibility (2026-08-03)
 SPEC-SCENE-007 | VERIFIED | live/replay state carries ranked scene/overlay context and detector scheduling metrics, emits stable scene/overlay transitions, and the GUI creates/duplicates/reorders scenes/layers, edits recognition/requirements/targets/safe points, draws targets from zones, diagnoses live/replay context, and provides tested scene/overlay/global/all canvas scopes with scoped hit-testing (2026-08-03)
 SPEC-SCENE-008 | VERIFIED | global skill validation and live `queen-blade` 558×992 E2E prove JSON-only default cleanup, explicit retained-frame crops, mode-0600 crop/full-frame materialization, stale-hash exit 3 cleanup, optional Yash doctor reporting, and no automatic input; the adapter was corrected to chmod named crop outputs to 0600 and reverified live (2026-08-03)
+SPEC-SCENE-009 | VERIFIED | bounded previous/expected transition context is implemented across engine, daemon, CLI, and Queen controller; full-profile candidate fallback, malformed/stale/mismatched context handling, 185 Yash workspace tests, 612 Queen tests, 19 offline scenarios, and the 285-case routed profile suite pass (2026-09-15)

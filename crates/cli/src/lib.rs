@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use yash_app_events_engine::ReplayManifest;
 use yash_app_events_profile::{
-    export_profile, load_profile, CollectionPolicy, OutputRoute, Profile,
+    export_profile, load_profile, load_profile_bundle, load_profile_for_capacity_analysis,
+    CollectionPolicy, OutputRoute, Profile, StorageError,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -41,8 +42,24 @@ pub enum Command {
     /// Analyze one PNG and return spatial JSON without embedding image bytes.
     Analyze {
         image: PathBuf,
-        #[arg(long)]
-        profile_id: String,
+        /// Analyze with one legacy monolithic profile.
+        #[arg(
+            long,
+            conflicts_with = "profile_bundle",
+            required_unless_present = "profile_bundle"
+        )]
+        profile_id: Option<String>,
+        /// Analyze through a bounded router plus independently validated member profiles.
+        #[arg(
+            long = "profile-bundle",
+            visible_alias = "bundle",
+            conflicts_with = "profile_id",
+            required_unless_present = "profile_id"
+        )]
+        profile_bundle: Option<PathBuf>,
+        /// Optional soft transition context as one bounded JSON object.
+        #[arg(long = "context-json", value_name = "JSON")]
+        context_json: Option<String>,
     },
     /// Ask the daemon to stop cleanly.
     Shutdown,
@@ -313,6 +330,16 @@ pub enum ProfileCommand {
     AnalyzeCapacity {
         path: PathBuf,
     },
+    /// Validate a read-only profile routing bundle without a daemon.
+    Bundle {
+        #[command(subcommand)]
+        command: ProfileBundleCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileBundleCommand {
+    Validate { path: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -362,6 +389,24 @@ pub enum CaptureCommand {
     },
 }
 
+const MAX_ANALYSIS_CONTEXT_JSON_BYTES: usize = 16 * 1024;
+
+fn parse_analysis_context_json(raw: &str) -> Result<Value, CliError> {
+    if raw.len() > MAX_ANALYSIS_CONTEXT_JSON_BYTES {
+        return Err(CliError::Validation(
+            "analysis context JSON exceeds 16 KiB".into(),
+        ));
+    }
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| CliError::Validation(format!("invalid analysis context JSON: {error}")))?;
+    if !value.is_object() {
+        return Err(CliError::Validation(
+            "analysis context JSON must be an object".into(),
+        ));
+    }
+    Ok(value)
+}
+
 /// Executes one finite command and returns its protocol-shaped value.
 ///
 /// # Errors
@@ -390,10 +435,22 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                 }));
             }
             ProfileCommand::AnalyzeCapacity { path } => {
-                let profile =
-                    load_profile(path).map_err(|error| CliError::Validation(error.to_string()))?;
-                return serde_json::to_value(profile.analyze_capacity())
-                    .map_err(|error| CliError::Validation(error.to_string()));
+                return analyze_capacity_path(path);
+            }
+            ProfileCommand::Bundle {
+                command: ProfileBundleCommand::Validate { path },
+            } => {
+                let bundle = load_profile_bundle(path)
+                    .map_err(|error| CliError::Validation(error.to_string()))?;
+                return Ok(json!({
+                    "valid": true,
+                    "schema": bundle.schema,
+                    "name": bundle.name,
+                    "game": bundle.game,
+                    "router_profile_id": bundle.router_profile_id,
+                    "router_profile_revision": bundle.router_profile_revision,
+                    "members": bundle.members.len(),
+                }));
             }
             _ => {}
         }
@@ -440,12 +497,44 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
             Command::Version => client.call(method::VERSION, Value::Null).await?,
             Command::Status => client.call(method::STATUS, Value::Null).await?,
             Command::State => client.call(method::STATE_GET, Value::Null).await?,
-            Command::Analyze { image, profile_id } => {
+            Command::Analyze {
+                image,
+                profile_id,
+                profile_bundle,
+                context_json,
+            } => {
                 let path = std::fs::canonicalize(image).map_err(|error| {
                     CliError::Replay(format!("cannot open analysis image: {error}"))
                 })?;
+                let context = context_json
+                    .as_deref()
+                    .map(parse_analysis_context_json)
+                    .transpose()?;
+                let params = if let Some(profile_id) = profile_id {
+                    json!({
+                        "profile_id": profile_id,
+                        "path": path,
+                        "timeout_ms": cli.timeout_ms,
+                        "context": context,
+                    })
+                } else {
+                    let bundle = profile_bundle.as_ref().ok_or_else(|| {
+                        CliError::Validation(
+                            "analyze requires --profile-id or --profile-bundle".into(),
+                        )
+                    })?;
+                    let bundle = std::fs::canonicalize(bundle).map_err(|error| {
+                        CliError::Replay(format!("cannot open analysis bundle: {error}"))
+                    })?;
+                    json!({
+                        "bundle": bundle,
+                        "path": path,
+                        "timeout_ms": cli.timeout_ms,
+                        "context": context,
+                    })
+                };
                 client
-                    .call(method::ANALYZE_IMAGE, json!({"profile_id":profile_id,"path":path,"timeout_ms":cli.timeout_ms}))
+                    .call(method::ANALYZE_IMAGE, params)
                     .await?
             }
             Command::Shutdown => client.call(method::SHUTDOWN, Value::Null).await?,
@@ -533,7 +622,8 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                 }
                 ProfileCommand::Validate { .. }
                 | ProfileCommand::Pack { .. }
-                | ProfileCommand::AnalyzeCapacity { .. } => unreachable!(),
+                | ProfileCommand::AnalyzeCapacity { .. }
+                | ProfileCommand::Bundle { .. } => unreachable!(),
             },
             Command::Catalog { command } => match command {
                 CatalogCommand::Status => {
@@ -897,6 +987,50 @@ fn write_suite_result(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliErr
         .map_err(|error| CliError::Replay(format!("cannot install suite result: {error}")))
 }
 
+/// Runs the read-only capacity report while preserving normal profile admission.
+///
+/// `load_profile` intentionally rejects profiles with more than 512 elements. The
+/// analyzer is also useful for deciding how to reduce such a profile, so this path
+/// permits only that one known validation error and deserializes the same JSON once
+/// more without calling `Profile::validate`. It never writes, activates, packs, or
+/// otherwise makes the over-limit profile usable.
+fn analyze_capacity_path(path: &std::path::Path) -> Result<Value, CliError> {
+    let profile = match load_profile(path) {
+        Ok(profile) => profile,
+        Err(error) if is_element_capacity_only(&error) => load_profile_for_capacity_analysis(path)
+            .map_err(|error| {
+                CliError::Validation(format!("cannot inspect over-limit profile: {error}"))
+            })?,
+        Err(error) => return Err(CliError::Validation(error.to_string())),
+    };
+
+    let asset_root = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut report = profile.analyze_capacity_with_asset_root(asset_root);
+    if report.elements.used > report.elements.maximum {
+        let excess = report.elements.used - report.elements.maximum;
+        report.suggestions.insert(
+            0,
+            format!(
+                "analysis only: profile has {} detector element(s) over the {}-element admission limit; normal load, save, pack, and activation still reject it; remove, consolidate, or split {} element(s)",
+                report.elements.used,
+                report.elements.maximum,
+                excess,
+            ),
+        );
+    }
+    serde_json::to_value(report).map_err(|error| CliError::Validation(error.to_string()))
+}
+
+fn is_element_capacity_only(error: &StorageError) -> bool {
+    let StorageError::Validation(errors) = error else {
+        return false;
+    };
+    errors.0.len() == 1
+        && errors.0[0].path == "elements"
+        && errors.0[0].message.contains("detector elements requested")
+        && errors.0[0].message.contains("capacity limit")
+}
+
 async fn execute_capture(
     client: &mut UnixRpcClient,
     command: &CaptureCommand,
@@ -1064,6 +1198,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use yash_app_events_profile::{Detector, DetectorId, Element, ElementId, NormalizedRegion};
 
     #[test]
     fn analyze_command_requires_image_and_profile() {
@@ -1076,11 +1211,93 @@ mod tests {
             "00000000-0000-0000-0000-000000000001",
         ])
         .unwrap();
-        let Command::Analyze { image, profile_id } = cli.command else {
+        let Command::Analyze {
+            image,
+            profile_id,
+            profile_bundle,
+            ..
+        } = cli.command
+        else {
             panic!("analyze command was not parsed");
         };
         assert_eq!(image, PathBuf::from("/tmp/frame.png"));
-        assert_eq!(profile_id, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(
+            profile_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(profile_bundle, None);
+    }
+
+    #[test]
+    fn analyze_command_accepts_a_profile_bundle_alias() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "analyze",
+            "/tmp/frame.png",
+            "--bundle",
+            "/tmp/queen.profile-bundle.json",
+        ])
+        .unwrap();
+        let Command::Analyze {
+            profile_id,
+            profile_bundle,
+            ..
+        } = cli.command
+        else {
+            panic!("analyze command was not parsed");
+        };
+        assert_eq!(profile_id, None);
+        assert_eq!(
+            profile_bundle,
+            Some(PathBuf::from("/tmp/queen.profile-bundle.json"))
+        );
+    }
+
+    #[test]
+    fn analyze_command_accepts_bounded_context_json() {
+        let cli = Cli::try_parse_from([
+            "yash-eventsctl",
+            "analyze",
+            "/tmp/frame.png",
+            "--profile-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--context-json",
+            r#"{"expected_scene_ids":[]}"#,
+        ])
+        .unwrap();
+        let Command::Analyze { context_json, .. } = cli.command else {
+            panic!("analyze command was not parsed");
+        };
+        assert_eq!(
+            context_json.as_deref(),
+            Some(r#"{"expected_scene_ids":[]}"#)
+        );
+        assert_eq!(
+            parse_analysis_context_json(context_json.as_deref().unwrap()).unwrap(),
+            json!({"expected_scene_ids": []})
+        );
+    }
+
+    #[test]
+    fn analysis_context_json_must_be_a_small_object() {
+        assert!(parse_analysis_context_json("[]").is_err());
+        assert!(parse_analysis_context_json("not-json").is_err());
+        assert!(parse_analysis_context_json(&"x".repeat(16 * 1024 + 1)).is_err());
+    }
+
+    #[test]
+    fn analyze_command_rejects_missing_or_conflicting_profile_selector() {
+        assert!(Cli::try_parse_from(["yash-eventsctl", "analyze", "/tmp/frame.png"]).is_err());
+        assert!(Cli::try_parse_from([
+            "yash-eventsctl",
+            "analyze",
+            "/tmp/frame.png",
+            "--profile-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--profile-bundle",
+            "/tmp/bundle.json",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1295,7 +1512,7 @@ mod tests {
         let path = directory.path().join("profile.json");
         let profile = Profile::new("Demo", "demo_game", 1920, 1080);
         yash_app_events_profile::save_profile(&path, &profile).unwrap();
-        let cli = Cli {
+        let mut cli = Cli {
             json: true,
             socket: Some(directory.path().join("missing.sock")),
             timeout_ms: 1,
@@ -1306,6 +1523,163 @@ mod tests {
         let result = execute(&cli).await.unwrap();
         assert_eq!(result["valid"], true);
         assert_eq!(result["profile_id"], profile.id.to_string());
+
+        let bundle_path = directory.path().join("bundle.json");
+        std::fs::write(
+            &bundle_path,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "name": "Demo control",
+                "game": "demo_game",
+                "router_profile_id": profile.id,
+                "router_profile_revision": profile.revision,
+                "members": [{
+                    "profile_id": profile.id,
+                    "profile_revision": profile.revision,
+                    "fallback": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        cli.command = Command::Profile {
+            command: ProfileCommand::Bundle {
+                command: ProfileBundleCommand::Validate { path: bundle_path },
+            },
+        };
+        let result = execute(&cli).await.unwrap();
+        assert_eq!(result["valid"], true);
+        assert_eq!(result["members"], 1);
+    }
+
+    fn write_over_limit_profile(path: &Path, name: &str) -> Profile {
+        let mut profile = Profile::new(name, "demo_game", 1920, 1080);
+        for index in 0..513 {
+            profile.elements.push(Element {
+                id: ElementId::new(),
+                name: format!("element-{index}"),
+                enabled: true,
+                color: "#fff".into(),
+                region: NormalizedRegion {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1,
+                },
+                detector: Detector::RegionChange {
+                    id: DetectorId::new(),
+                    threshold: 0.1,
+                    preprocessing: Vec::new(),
+                },
+            });
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&profile).unwrap()).unwrap();
+        profile
+    }
+
+    #[tokio::test]
+    async fn analyze_capacity_inspects_over_limit_profile_without_admitting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("over-limit.json");
+        let profile = write_over_limit_profile(&path, "Overflow");
+        let mut cli = Cli {
+            json: true,
+            socket: Some(directory.path().join("missing.sock")),
+            timeout_ms: 1,
+            command: Command::Profile {
+                command: ProfileCommand::AnalyzeCapacity { path: path.clone() },
+            },
+        };
+
+        let report = execute(&cli).await.unwrap();
+        assert_eq!(report["elements"]["used"], 513);
+        assert_eq!(report["elements"]["maximum"], 512);
+        assert_eq!(report["elements"]["warning"], "limit_reached");
+        assert_eq!(report["always_evaluated_anchor_count"], 0);
+        assert_eq!(report["always_evaluated_anchor_cost"], 0);
+        assert!(report["suggestions"][0]
+            .as_str()
+            .unwrap()
+            .contains("analysis only"));
+
+        cli.command = Command::Profile {
+            command: ProfileCommand::Validate { path },
+        };
+        let validation = execute(&cli).await.unwrap_err();
+        assert!(matches!(validation, CliError::Validation(_)));
+        assert_eq!(profile.elements.len(), 513);
+    }
+
+    #[tokio::test]
+    async fn analyze_capacity_resolves_relative_template_assets_from_profile_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let templates = directory.path().join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("first.png"), b"same template bytes").unwrap();
+        std::fs::write(templates.join("second.png"), b"same template bytes").unwrap();
+
+        let mut profile = Profile::new("Templates", "demo_game", 1920, 1080);
+        profile.elements = ["first", "second"]
+            .into_iter()
+            .map(|name| Element {
+                id: ElementId::new(),
+                name: name.into(),
+                enabled: true,
+                color: "#fff".into(),
+                region: NormalizedRegion {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1,
+                },
+                detector: Detector::Template {
+                    id: DetectorId::new(),
+                    templates: vec![format!("templates/{name}.png").into()],
+                    masks: Vec::new(),
+                    threshold: 0.9,
+                    preprocessing: Vec::new(),
+                },
+            })
+            .collect();
+        let path = directory.path().join("profile.json");
+        std::fs::write(path.clone(), serde_json::to_vec_pretty(&profile).unwrap()).unwrap();
+
+        let cli = Cli {
+            json: true,
+            socket: Some(directory.path().join("missing.sock")),
+            timeout_ms: 1,
+            command: Command::Profile {
+                command: ProfileCommand::AnalyzeCapacity { path },
+            },
+        };
+
+        let report = execute(&cli).await.unwrap();
+        assert_eq!(report["elements"]["used"], 2);
+        assert_eq!(
+            report["duplicate_detector_groups"],
+            json!([["first", "second"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_capacity_does_not_bypass_other_validation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-over-limit.json");
+        write_over_limit_profile(&path, "");
+        let cli = Cli {
+            json: true,
+            socket: Some(directory.path().join("missing.sock")),
+            timeout_ms: 1,
+            command: Command::Profile {
+                command: ProfileCommand::AnalyzeCapacity { path },
+            },
+        };
+
+        let error = execute(&cli).await.unwrap_err();
+        assert!(matches!(
+            error,
+            CliError::Validation(message) if message.contains("2 error(s)")
+        ));
     }
 
     #[tokio::test]

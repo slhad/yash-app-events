@@ -111,6 +111,39 @@ capture resolution/rates/errors, current observations, event states, daemon/GUI 
 resident memory, and the most recent manual detector-test value, confidence, status,
 and diagnostic.
 
+The **Profile capacity** panel shows detector, scene, overlay, layer-reference, recognition,
+and interaction-target usage before a commit fails. Drawing, duplication, layer membership,
+and scene/overlay authoring use a read-only projection first, so an over-limit action leaves
+the draft unchanged and reports the exact resource and projected count. Removing a region
+also removes dependent derived observations, rules, recognition anchors, and target-visibility
+references from the draft so capacity can be recovered without creating dangling IDs. The panel
+also reports the always-evaluated anchor count and weighted detector cost, exposing runtime work
+hidden behind a scene's local element count.
+
+For large profiles, prefer these bounded consolidation patterns in order: reuse shared global
+or scene anchors, put rarely needed detectors in contextual layers, compose text with derived
+observations, combine stable alternatives in one multi-template detector, and remove unreachable
+or exact-duplicate regions. Use a profile bundle when unrelated HUD families need separate
+profiles: a small router profile recognizes the screen family, then `analyze` evaluates only one
+independently validated member. Keep the router and every member below 512 elements, preferably
+below 450 to leave authoring headroom. The capacity report is advisory; it does not rewrite stable
+IDs automatically.
+
+When equivalent detector elements are consolidated, schema-2 profiles may retain
+`element_aliases` so older suite and integration names continue resolving to the canonical
+stable element ID. `profile pack` exports the current profile's declared detector assets and
+omits stale template files without deleting anything from the source directory.
+
+Removing a region also removes its dependent references. Scenes and overlays that lose
+recognition evidence are disabled, and affected interaction targets are hidden until their
+visibility conditions are repaired in the draft.
+
+For schema-2 profiles with scenes or overlays, the daemon retains and prewarms only the global
+and enabled-layer recognition-anchor detectors. Contextual detector configurations are kept as lightweight
+slots, constructed when their layer becomes active, and released when it becomes inactive.
+This preserves the existing anchor-first JSON/RPC behavior while bounding resident OCR,
+classifier, and decoded-template state; profiles without a scene model retain eager behavior.
+
 Implemented CLI usage:
 
 ```bash
@@ -119,10 +152,14 @@ yash-eventsctl profile list
 yash-eventsctl profile create "My game" my_game
 yash-eventsctl profile validate ./profile.json
 yash-eventsctl profile pack ./portable-profile ./portable-profile.hudprofile
+yash-eventsctl --json profile bundle validate ./queen.profile-bundle.json
 yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
 yash-eventsctl --json analyze /path/to/frame.png --profile-id <profile-uuid>
+yash-eventsctl --json analyze /path/to/frame.png --profile-bundle /path/to/queen.profile-bundle.json
+yash-eventsctl --json analyze /path/to/frame.png --profile-id <profile-uuid> \
+  --context-json '{"expected_scene_names":["guild_battle_opponent"]}'
 yash-eventsctl --json replay ./manifest.json
 yash-eventsctl --json suite evaluate /path/to/blazblue-entropy-effect
 yash-eventsctl --json suite evaluate /path/to/package --case exact-case-id --timings
@@ -144,6 +181,12 @@ packing do not require a running daemon. `profile pack` validates a portable pro
 directory and builds the same inert `.hudprofile` archive accepted by daemon import.
 All commands accept `--json`, `--socket`, and `--timeout-ms`.
 
+`profile analyze-capacity` is read-only. It compares template assets by content when the profile
+directory is available and reports always-evaluated recognition anchors. If the only validation problem is that a profile already
+contains more than 512 detector elements, the command still produces a diagnostic so the author
+can identify unreachable, duplicate, or consolidation candidates. That analysis-only path never
+admits the profile to normal load, save, pack, or activation.
+
 Schema-2 profiles recognize one base scene plus independent overlays through bounded
 N-of-M anchor evidence. Live analysis runs global/anchor detectors first and gates
 contextual detectors to active layers. `state` includes the current context, and scene
@@ -159,6 +202,58 @@ then appears under `ai_handoff.retry` with a delay and maximum attempt count. Fu
 reserved for unknown scenes or broad layout/aspect incompatibility. Profiles that need
 pixel-exact execution can opt into strict reference dimensions while existing normalized
 profiles remain aspect-compatible across resolutions.
+
+When a game needs more than one independently maintained HUD family, `analyze` also accepts
+`--profile-bundle` (or its `--bundle` alias). A bundle is a bounded JSON routing document with
+one router profile, pinned profile revisions, a shared game slug, and members selected by the
+router's stable scene/overlay IDs. Member detector assets are initialized and evaluated only after
+a route wins by priority and specificity; only that member is loaded for the second stage. An
+unresolved or unmatched route falls back to the optional fallback member, otherwise the router
+result is returned with `profile_selection.status` set to
+`unresolved` or `no_match`. The bundle path contains IDs only; profile directories and assets are
+still owned by the daemon's profile store. `profile bundle validate` checks the document offline,
+while the daemon checks the router and selected member's revisions, game, layout, and router
+scene/overlay IDs. Bundle analysis remains pure and never activates a profile or publishes an
+event.
+
+For consecutive one-shot frames, `--context-json` can carry the previous recognized
+profile/scene/overlay IDs and optional expected scene/overlay names or stable IDs for the next
+frame. Names are resolved against the selected profile, which lets a controller describe a
+reviewed destination without hard-coding profile-specific UUIDs. Yash uses this only to rank
+equal-confidence candidates; it always keeps full-profile detection and reports whether the
+context was applied or ignored. The context contains no image bytes, coordinates, or permission
+to act, so callers can safely fall back to ordinary profile analysis when a transition is
+unexpected.
+
+Example bundle shape:
+
+```json
+{
+  "schema": 1,
+  "name": "Queen Blade control",
+  "game": "queens_blade_limit_break",
+  "router_profile_id": "00000000-0000-0000-0000-000000000001",
+  "router_profile_revision": 3,
+  "members": [
+    {
+      "profile_id": "00000000-0000-0000-0000-000000000002",
+      "profile_revision": 12,
+      "scene_ids": ["00000000-0000-0000-0000-000000000011"],
+      "overlay_ids": [],
+      "priority": 100,
+      "fallback": false
+    },
+    {
+      "profile_id": "00000000-0000-0000-0000-000000000003",
+      "profile_revision": 8,
+      "scene_ids": [],
+      "overlay_ids": [],
+      "priority": 0,
+      "fallback": true
+    }
+  ]
+}
+```
 
 Post-release detector work adds typed boolean/text rules, Tesseract OCR, deterministic
 fixed-layout seven-segment recognition, and portable ONNX classifiers. OCR and classifiers use change-triggered bounded scheduling and the
@@ -190,7 +285,7 @@ separately below the XDG config directory.
 Runtime output provides:
 
 - `events.jsonl`: append-only meaningful state transitions.
-- `state.json`: atomically replaced current state snapshot.
+- `state.json`: atomically replaced current state snapshot, published once per analyzed frame.
 - JSON-RPC subscriptions: live events for connected clients.
 - Machine-local profile output routes: filtered event/state JSON or raw-text templates delivered to
   append/replace files or direct bounded commands, with GUI enable/test controls.
@@ -236,7 +331,12 @@ Stop the daemon before a filesystem backup. Portable profiles are below
 bindings are below `${XDG_CONFIG_HOME:-~/.config}/yash-app-events`; events and state
 are below `${XDG_STATE_HOME:-~/.local/state}/yash-app-events`. Prefer `profile export`
 for portable backups. Trashed profiles can be restored through the GUI or CLI, and
-bounded revision history protects earlier committed documents.
+bounded revision history protects earlier committed documents. The daemon also keeps
+an atomic machine-local revision high-water file beside the profiles. It is not part
+of exports. A fresh profile ID keeps the archive revision, while an import for a
+previously seen ID is rebased to the next known revision, including after trash,
+permanent deletion, or a manually named profile backup. This prevents an import from
+making a profile appear to jump backward to revision 0.
 
 To upgrade, pull the desired revision and rerun `scripts/install-user.sh`, then restart
 the user service. To uninstall, disable the service and remove the three installed
@@ -264,6 +364,11 @@ The CI-safe replay vertical slice is covered by the daemon test
 `synthetic_health_replay_reaches_files_state_and_live_subscription`; it asserts that
 the same two transitions appear in `events.jsonl`, atomic `state.json`, `state.get`,
 and a live protocol subscription.
+
+Replay decodes one frame at a time. Image analysis and preview encoding use bounded
+background workers so control requests remain responsive. GUI polling coalesces pending
+requests during long operations. See [performance evidence](docs/performance.md) for the
+audit, workload limits, and reproducible publication, capture, and detector benchmarks.
 
 Interactive Wayland capture is verified on the documented Hyprland environment. The
 daemon owns capture; `yash-eventsctl capture select` opens the picker, `capture status`

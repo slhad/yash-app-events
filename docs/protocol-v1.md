@@ -53,11 +53,40 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
 Profile IDs are UUID strings. `profile.commit` accepts `profile` and
 `expected_revision`; error `-32009` includes both expected and current revisions.
 Import/export paths are local filesystem paths supplied by the current-user client.
+The daemon-owned `profile.import` and catalog installation paths keep a fresh
+archive's revision for a new profile ID. If the ID already has local lineage, they
+rebase the imported document to the next known revision before publishing it. The
+returned profile contains that final revision; portable archive contents are not
+changed.
 
-`analysis.evaluate_image` accepts `profile_id`, an explicit local PNG `path`, and a
-bounded `timeout_ms`. Its response includes the exact frame dimensions and SHA-256,
-ranked scene/overlay evidence, stable names and IDs, normalized and pixel rectangles,
-optional profile-authored safe points, detector scheduling metrics, and `ai_handoff`.
+`analysis.evaluate_image` accepts exactly one of `profile_id` or `bundle`, an explicit local PNG
+`path`, and a bounded `timeout_ms`. `profile_id` keeps the legacy single-profile behavior.
+`bundle` names a bounded local profile-routing JSON document; the daemon derives all profile
+directories from its pinned UUIDs and never executes paths from that document. The bundle pins
+the router/member revisions and game slug, and maps member profiles to stable router scene and
+overlay IDs. The daemon validates the router and selected member's revision, game, layout, and
+route IDs before evaluating the selected member. Its response retains the normal selected-profile fields and adds
+`profile_selection` with the router ID, route index, selected profile ID, matched context, and a
+status of `selected`, `fallback`, `unresolved`, or `no_match`.
+
+The request may also include one bounded `context` object. Its optional `previous` member carries
+the prior profile ID/revision, recognized scene and overlay IDs, the prior frame SHA-256, and
+`age_ms`; `expected_scene_ids`/`expected_overlay_ids` or
+`expected_scene_names`/`expected_overlay_names` carry stable IDs or semantic names expected for
+the next frame. Names are resolved against the selected profile. These values are only a soft
+ranking prior. Every enabled scene and overlay is still evaluated, and the response's
+`analysis_context` reports `status`, accepted preferred IDs and names, ignored reasons, and
+`candidate_scope`/`fallback` set to `full_profile`. Profile/revision mismatches, stale context,
+malformed hashes, over-limit values, and unknown IDs/names are ignored rather than treated as
+recognition evidence. Context is never an image, coordinate, or action authorization.
+
+Bundle analysis applies the context to the router; the router's `analysis_context` report is
+preserved on the final response even when a specialized member is selected. Member analysis
+remains independently bounded and validated.
+
+The response includes the exact frame dimensions and SHA-256, ranked scene/overlay evidence,
+stable names and IDs, normalized and pixel rectangles, optional profile-authored safe points,
+detector scheduling metrics, and `ai_handoff`.
 The handoff is JSON-only when the scene is unambiguous, layout-compatible, and every
 explicitly required observation/visibility condition is valid. Otherwise it names at
 most eight minimal crops; only a broad layout mismatch recommends a full frame. An OCR
@@ -65,6 +94,13 @@ detector may include a bounded `retry` policy with `after_ms`, `maximum_attempts
 an `expected_format`. When its required observation is missing or malformed,
 `ai_handoff.retry.recommended` is true and `requests` names the affected element without
 executing or scheduling the retry itself.
+
+Bundle routing is bounded and deterministic: the highest `priority` matching member wins, then
+the route with the most constrained scene/overlay dimensions, then manifest order. A fallback
+member is used only when no constrained member matches. If no member matches and no fallback is
+present, the router result is returned unchanged apart from `profile_selection`; the operation
+does not activate a profile, mutate current state, publish events, execute output routes, or
+persist the image.
 
 Revision history is exposed without a GUI-only path. `profile.revisions` accepts
 `profile_id` and returns retained profile snapshots from oldest to current.
@@ -107,6 +143,15 @@ terminal error. Requesting a completed result consumes the retained operation. P
 is also emitted as bounded `suite_progress` notifications. `suite.cancel` is cooperative
 and returns whether cancellation was accepted. At most four unconsumed operations are
 retained.
+
+`suite.start` admits at most one image workload and returns an error while another
+foreground image job holds that slot. Synchronous image RPCs wait for the same slot
+and run off the async control executor; status and cancellation remain available.
+Native work retains its slot until it actually finishes, including after caller cancellation.
+
+`state.get`, durable `state.json`, and state-triggered output routes receive one complete
+snapshot after each analyzed frame with new observations. Individual transitions still
+produce separate durable events, subscription notifications, and event-triggered output.
 
 Collection policies are keyed by profile ID and remain machine-local. A policy contains
 an absolute dataset root, enabled flag, interval/jitter, perceptual threshold, item/byte

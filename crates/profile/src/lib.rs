@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write as _};
+use std::io::{self, BufReader, BufWriter, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,9 +12,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod archive;
+mod bundle;
 mod local;
 mod store;
 pub use archive::{export_profile, import_profile, ArchiveError, ImportLimits, Manifest};
+pub use bundle::{
+    load_profile_bundle, ProfileBundle, ProfileBundleError, ProfileBundleMember,
+    PROFILE_BUNDLE_SCHEMA_VERSION,
+};
 pub use local::{CaptureBinding, CollectionPolicy, LocalConfig, LocalConfigError, Settings};
 pub use store::{OutputRecipeEntry, ProfileStore, StoreError};
 pub use yash_app_events_output::OutputRoute;
@@ -29,6 +34,7 @@ const MAXIMUM_LAYER_ELEMENTS: usize = 256;
 const MAXIMUM_INTERACTION_TARGETS: usize = 256;
 const MAXIMUM_TOTAL_INTERACTION_TARGETS: usize = 512;
 const MAXIMUM_RECOGNITION_CONDITIONS: usize = 32;
+const MAXIMUM_ELEMENT_ALIASES: usize = 4096;
 
 /// Shared validated profile resource limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -64,6 +70,70 @@ pub struct CapacityUsage {
     pub warning: Option<&'static str>,
 }
 
+/// Resources that have an explicit profile capacity bound.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityResource {
+    Elements,
+    Scenes,
+    Overlays,
+    ElementsPerLayer,
+    InteractionTargetsPerLayer,
+    InteractionTargetsTotal,
+    RecognitionConditionsPerExpression,
+}
+
+/// A proposed mutation to a profile's bounded resources.
+///
+/// `elements_per_layer`, `interaction_targets_per_layer`, and
+/// `recognition_conditions_per_expression` describe the largest single layer or
+/// expression affected by the mutation. They are intentionally separate from
+/// the profile-wide counts so callers can diagnose a new scene or overlay in
+/// one request.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapacityAddition {
+    pub elements: usize,
+    pub scenes: usize,
+    pub overlays: usize,
+    pub elements_per_layer: usize,
+    pub interaction_targets_per_layer: usize,
+    pub interaction_targets_total: usize,
+    pub recognition_conditions_per_expression: usize,
+}
+
+/// Capacity usage for all resources considered by [`Profile::diagnose_capacity`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CapacityResourceUsage {
+    pub elements: CapacityUsage,
+    pub scenes: CapacityUsage,
+    pub overlays: CapacityUsage,
+    pub elements_per_layer: CapacityUsage,
+    pub interaction_targets_per_layer: CapacityUsage,
+    pub interaction_targets_total: CapacityUsage,
+    pub recognition_conditions_per_expression: CapacityUsage,
+}
+
+/// One resource that a projected profile mutation would exceed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapacityDiagnosticIssue {
+    pub resource: CapacityResource,
+    pub current: usize,
+    pub requested: usize,
+    pub projected: usize,
+    pub maximum: usize,
+    pub message: String,
+}
+
+/// Structured result for a projected profile mutation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProfileCapacityDiagnostic {
+    pub allowed: bool,
+    pub additions: CapacityAddition,
+    pub current: CapacityResourceUsage,
+    pub projected: CapacityResourceUsage,
+    pub blockers: Vec<CapacityDiagnosticIssue>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ProfileCapacityReport {
     pub limits: ProfileLimits,
@@ -81,6 +151,15 @@ pub struct ProfileCapacityReport {
     pub unreachable_elements: Vec<String>,
     pub disabled_layer_only_elements: Vec<String>,
     pub duplicate_detector_groups: Vec<Vec<String>>,
+    /// Unique enabled elements that the scene-aware runtime evaluates before
+    /// it can select a scene or overlay.
+    pub always_evaluated_anchor_count: usize,
+    /// Weighted detector cost for [`Self::always_evaluated_anchor_count`].
+    /// Templates contribute one unit per template image, while OCR and
+    /// classifier detectors use the same weights as the scene cost report.
+    pub always_evaluated_anchor_cost: u64,
+    /// Detector families represented by the always-evaluated anchor set.
+    pub always_evaluated_anchor_families: BTreeMap<String, usize>,
     pub estimated_cost_by_scene: BTreeMap<String, u64>,
     pub suggestions: Vec<String>,
 }
@@ -127,9 +206,9 @@ fn capacity_usage(used: usize, maximum: usize) -> CapacityUsage {
     let percent = used as f64 * 100.0 / maximum as f64;
     let warning = if used >= maximum {
         Some("limit_reached")
-    } else if used * 100 >= maximum * 90 {
+    } else if used.saturating_mul(100) >= maximum.saturating_mul(90) {
         Some("ninety_percent")
-    } else if used * 100 >= maximum * 80 {
+    } else if used.saturating_mul(100) >= maximum.saturating_mul(80) {
         Some("eighty_percent")
     } else {
         None
@@ -139,6 +218,116 @@ fn capacity_usage(used: usize, maximum: usize) -> CapacityUsage {
         maximum,
         percent,
         warning,
+    }
+}
+
+fn project_capacity_usage(current: &CapacityUsage, additional: usize) -> CapacityUsage {
+    capacity_usage(current.used.saturating_add(additional), current.maximum)
+}
+
+fn capacity_resource_usage(report: &ProfileCapacityReport) -> CapacityResourceUsage {
+    CapacityResourceUsage {
+        elements: report.elements.clone(),
+        scenes: report.scenes.clone(),
+        overlays: report.overlays.clone(),
+        elements_per_layer: report.largest_layer_element_usage.clone(),
+        interaction_targets_per_layer: report.largest_layer_target_usage.clone(),
+        interaction_targets_total: report.interaction_targets.clone(),
+        recognition_conditions_per_expression: report.largest_recognition_usage.clone(),
+    }
+}
+
+fn capacity_resource_label(resource: CapacityResource) -> &'static str {
+    match resource {
+        CapacityResource::Elements => "detector elements",
+        CapacityResource::Scenes => "scenes",
+        CapacityResource::Overlays => "overlays",
+        CapacityResource::ElementsPerLayer => "detector elements in one layer",
+        CapacityResource::InteractionTargetsPerLayer => "interaction targets in one layer",
+        CapacityResource::InteractionTargetsTotal => "interaction targets",
+        CapacityResource::RecognitionConditionsPerExpression => {
+            "recognition conditions in one expression"
+        }
+    }
+}
+
+fn capacity_diagnostic_issue(
+    resource: CapacityResource,
+    current: &CapacityUsage,
+    requested: usize,
+    projected: &CapacityUsage,
+) -> Option<CapacityDiagnosticIssue> {
+    if projected.used <= projected.maximum {
+        return None;
+    }
+    let label = capacity_resource_label(resource);
+    let message = if current.used > current.maximum {
+        format!(
+            "{label} are already over the {maximum} limit at {used}; the requested addition of {requested} projects to {projected}",
+            maximum = current.maximum,
+            used = current.used,
+            projected = projected.used,
+        )
+    } else {
+        format!(
+            "adding {requested} {label} would project {projected} against the {maximum} limit",
+            maximum = projected.maximum,
+            projected = projected.used,
+        )
+    };
+    Some(CapacityDiagnosticIssue {
+        resource,
+        current: current.used,
+        requested,
+        projected: projected.used,
+        maximum: projected.maximum,
+        message,
+    })
+}
+
+/// A requested profile mutation that would exceed one of the bounded resources.
+///
+/// This is deliberately separate from [`ValidationErrors`]. A draft can use this
+/// value to reject an operation before it mutates the profile, while validation
+/// remains the authoritative commit-time check.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapacityViolation {
+    pub resource: String,
+    pub used: usize,
+    pub requested: usize,
+    pub maximum: usize,
+    pub available: usize,
+}
+
+impl fmt::Display for CapacityViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot add {}: {}/{} used, {} requested, {} remaining",
+            self.resource, self.used, self.maximum, self.requested, self.available
+        )
+    }
+}
+
+impl std::error::Error for CapacityViolation {}
+
+fn check_capacity(
+    resource: impl Into<String>,
+    used: usize,
+    requested: usize,
+    maximum: usize,
+) -> Result<(), CapacityViolation> {
+    let available = maximum.saturating_sub(used);
+    if requested > available {
+        Err(CapacityViolation {
+            resource: resource.into(),
+            used,
+            requested,
+            maximum,
+            available,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -170,12 +359,173 @@ fn detector_cost(detector: &Detector) -> u64 {
     }
 }
 
-fn detector_signature(element: &Element) -> String {
+fn asset_content_signature(
+    asset_root: Option<&Path>,
+    path: &Path,
+    cache: &mut HashMap<PathBuf, String>,
+) -> String {
+    // The in-memory analyzer also runs on the GUI thread. Filesystem access is
+    // permitted only for the explicitly file-backed CLI report.
+    let Some(asset_root) = asset_root else {
+        return format!("path:{}", path.to_string_lossy());
+    };
+    let resolved = asset_root.join(path);
+    if let Some(signature) = cache.get(&resolved) {
+        return signature.clone();
+    }
+
+    let signature = File::open(&resolved)
+        .map(BufReader::new)
+        .and_then(|mut reader| {
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 8 * 1024];
+            let mut size = 0_u64;
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                size = size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            }
+            Ok(format!("content:{size}:{:x}", hasher.finalize()))
+        })
+        .unwrap_or_else(|_| format!("path:{}", path.to_string_lossy()));
+    cache.insert(resolved, signature.clone());
+    signature
+}
+
+fn detector_signature(
+    element: &Element,
+    asset_root: Option<&Path>,
+    asset_signatures: &mut HashMap<PathBuf, String>,
+) -> String {
     let mut detector = serde_json::to_value(&element.detector).unwrap_or_default();
     if let Some(object) = detector.as_object_mut() {
         object.remove("id");
+        if let Detector::Template {
+            templates, masks, ..
+        } = &element.detector
+        {
+            object.insert(
+                "templates".into(),
+                serde_json::Value::Array(
+                    templates
+                        .iter()
+                        .map(|path| {
+                            serde_json::Value::String(asset_content_signature(
+                                asset_root,
+                                path,
+                                asset_signatures,
+                            ))
+                        })
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "masks".into(),
+                serde_json::Value::Array(
+                    masks
+                        .iter()
+                        .map(|path| {
+                            path.as_ref().map_or(serde_json::Value::Null, |path| {
+                                serde_json::Value::String(asset_content_signature(
+                                    asset_root,
+                                    path,
+                                    asset_signatures,
+                                ))
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
     }
     serde_json::to_string(&(element.region, detector)).unwrap_or_default()
+}
+
+#[derive(Default)]
+struct CapacityReferences {
+    referenced: HashSet<ElementId>,
+    enabled_referenced: HashSet<ElementId>,
+}
+
+impl CapacityReferences {
+    fn add(
+        &mut self,
+        id: ElementId,
+        enabled: bool,
+        derived_inputs: &HashMap<ElementId, Vec<ElementId>>,
+    ) {
+        let mut pending = vec![(id, enabled)];
+        let mut visited = HashSet::new();
+        while let Some((current, current_enabled)) = pending.pop() {
+            if !visited.insert((current, current_enabled)) {
+                continue;
+            }
+            self.referenced.insert(current);
+            if current_enabled {
+                self.enabled_referenced.insert(current);
+            }
+            if let Some(inputs) = derived_inputs.get(&current) {
+                pending.extend(inputs.iter().copied().map(|input| (input, current_enabled)));
+            }
+        }
+    }
+
+    fn add_many(
+        &mut self,
+        ids: impl IntoIterator<Item = ElementId>,
+        enabled: bool,
+        derived_inputs: &HashMap<ElementId, Vec<ElementId>>,
+    ) {
+        for id in ids {
+            self.add(id, enabled, derived_inputs);
+        }
+    }
+}
+
+fn add_recognition_references(
+    expression: &RecognitionExpression,
+    enabled: bool,
+    derived_inputs: &HashMap<ElementId, Vec<ElementId>>,
+    references: &mut CapacityReferences,
+) {
+    references.add_many(
+        recognition_conditions(expression)
+            .iter()
+            .map(|condition| condition.element_id),
+        enabled,
+        derived_inputs,
+    );
+}
+
+fn add_rule_references(
+    rule: &EventRule,
+    derived_inputs: &HashMap<ElementId, Vec<ElementId>>,
+    references: &mut CapacityReferences,
+) {
+    references.add(rule.element_id, true, derived_inputs);
+    if let RulePredicate::All { conditions } | RulePredicate::Any { conditions } = &rule.predicate {
+        references.add_many(
+            conditions.iter().map(|condition| condition.element_id),
+            true,
+            derived_inputs,
+        );
+    }
+}
+
+fn add_target_visibility_references(
+    targets: &[InteractionTarget],
+    enabled: bool,
+    derived_inputs: &HashMap<ElementId, Vec<ElementId>>,
+    references: &mut CapacityReferences,
+) {
+    for target in targets {
+        if let Some(visibility) = &target.visibility {
+            add_recognition_references(visibility, enabled, derived_inputs, references);
+        }
+    }
 }
 
 /// Current portable profile document.
@@ -200,6 +550,13 @@ pub struct Profile {
     pub derived_observations: Vec<DerivedObservation>,
     /// Temporal rules consuming element observations.
     pub rules: Vec<EventRule>,
+    /// Legacy or context-specific names resolving to a canonical detector element.
+    ///
+    /// Aliases preserve suite and integration compatibility when equivalent
+    /// detectors are consolidated. They do not allocate detector capacity and
+    /// never replace the stable element ID in runtime observations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub element_aliases: BTreeMap<String, ElementId>,
     /// Elements evaluated independently of scene selection.
     #[serde(default)]
     pub global_elements: Vec<ElementId>,
@@ -231,16 +588,180 @@ impl Profile {
             elements: Vec::new(),
             derived_observations: Vec::new(),
             rules: Vec::new(),
+            element_aliases: BTreeMap::new(),
             global_elements: Vec::new(),
             scenes: Vec::new(),
             overlays: Vec::new(),
         }
     }
 
+    /// Checks whether a draft may add the requested number of detector elements.
+    ///
+    /// The check is advisory for drafts; [`Profile::validate`] remains the
+    /// authoritative guard before a profile is saved or activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested and available element capacity when the addition
+    /// would exceed the hard profile limit.
+    pub fn check_element_capacity(&self, additional: usize) -> Result<(), CapacityViolation> {
+        Self::check_capacity(
+            "detector elements",
+            self.elements.len(),
+            additional,
+            ProfileLimits::default().elements,
+        )
+    }
+
+    /// Checks whether a draft may add interaction targets to all layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested and available total target capacity when the
+    /// addition would exceed the hard profile limit.
+    pub fn check_interaction_target_capacity(
+        &self,
+        additional: usize,
+    ) -> Result<(), CapacityViolation> {
+        let used = self
+            .scenes
+            .iter()
+            .map(|scene| scene.interaction_targets.len())
+            .chain(
+                self.overlays
+                    .iter()
+                    .map(|overlay| overlay.interaction_targets.len()),
+            )
+            .sum();
+        Self::check_capacity(
+            "interaction targets across scenes and overlays",
+            used,
+            additional,
+            ProfileLimits::default().interaction_targets_total,
+        )
+    }
+
+    /// Checks a per-layer element-reference mutation before it is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested and available per-layer capacity when the
+    /// addition would exceed the hard profile limit.
+    pub fn check_layer_element_capacity(
+        layer_name: impl Into<String>,
+        used: usize,
+        additional: usize,
+    ) -> Result<(), CapacityViolation> {
+        Self::check_capacity(
+            format!("{} detector references", layer_name.into()),
+            used,
+            additional,
+            ProfileLimits::default().elements_per_layer,
+        )
+    }
+
+    /// Checks a per-layer interaction-target mutation before it is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested and available per-layer capacity when the
+    /// addition would exceed the hard profile limit.
+    pub fn check_layer_target_capacity(
+        layer_name: impl Into<String>,
+        used: usize,
+        additional: usize,
+    ) -> Result<(), CapacityViolation> {
+        Self::check_capacity(
+            format!("{} interaction targets", layer_name.into()),
+            used,
+            additional,
+            ProfileLimits::default().interaction_targets_per_layer,
+        )
+    }
+
+    /// Checks all bounded references affected by the GUI's duplicate-element operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first element or layer capacity that the duplication would
+    /// exceed.
+    pub fn check_duplicate_element_capacity(
+        &self,
+        element_id: ElementId,
+    ) -> Result<(), CapacityViolation> {
+        self.check_element_capacity(1)?;
+        for scene in &self.scenes {
+            if scene.element_ids.contains(&element_id) {
+                Self::check_layer_element_capacity(
+                    format!("scene '{}'", scene.name),
+                    scene.element_ids.len(),
+                    1,
+                )?;
+            }
+            if scene.required_element_ids.contains(&element_id) {
+                Self::check_layer_element_capacity(
+                    format!("scene '{}' required", scene.name),
+                    scene.required_element_ids.len(),
+                    1,
+                )?;
+            }
+        }
+        for overlay in &self.overlays {
+            if overlay.element_ids.contains(&element_id) {
+                Self::check_layer_element_capacity(
+                    format!("overlay '{}'", overlay.name),
+                    overlay.element_ids.len(),
+                    1,
+                )?;
+            }
+            if overlay.required_element_ids.contains(&element_id) {
+                Self::check_layer_element_capacity(
+                    format!("overlay '{}' required", overlay.name),
+                    overlay.required_element_ids.len(),
+                    1,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks an arbitrary bounded resource using the shared profile limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested and available capacity when the projection would
+    /// exceed the supplied limit.
+    pub fn check_capacity(
+        resource: impl Into<String>,
+        used: usize,
+        requested: usize,
+        maximum: usize,
+    ) -> Result<(), CapacityViolation> {
+        check_capacity(resource, used, requested, maximum)
+    }
+
     /// Reports bounded profile usage and read-only consolidation opportunities.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn analyze_capacity(&self) -> ProfileCapacityReport {
+        self.analyze_capacity_with_asset_root_inner(None)
+    }
+
+    /// Reports capacity while resolving relative detector assets below `asset_root`.
+    ///
+    /// The plain [`Profile::analyze_capacity`] method remains path-independent for
+    /// callers that only have an in-memory profile. The CLI uses this method so
+    /// template files with different paths but identical bytes share a duplicate
+    /// signature.
+    #[must_use]
+    pub fn analyze_capacity_with_asset_root(&self, asset_root: &Path) -> ProfileCapacityReport {
+        self.analyze_capacity_with_asset_root_inner(Some(asset_root))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn analyze_capacity_with_asset_root_inner(
+        &self,
+        asset_root: Option<&Path>,
+    ) -> ProfileCapacityReport {
         let limits = ProfileLimits::default();
         let all_layers = self
             .scenes
@@ -295,52 +816,102 @@ impl Profile {
             )
             .max()
             .unwrap_or(0);
-        let mut referenced = self.global_elements.iter().copied().collect::<HashSet<_>>();
-        let mut enabled_referenced = referenced.clone();
+        let derived_inputs = self
+            .derived_observations
+            .iter()
+            .map(|derived| {
+                (
+                    derived.id,
+                    derived
+                        .inputs
+                        .iter()
+                        .map(|input| input.element_id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut references = CapacityReferences::default();
+        references.add_many(self.global_elements.iter().copied(), true, &derived_inputs);
+        for rule in &self.rules {
+            add_rule_references(rule, &derived_inputs, &mut references);
+        }
+        for derived in &self.derived_observations {
+            references.add(derived.id, derived.enabled, &derived_inputs);
+        }
         for scene in &self.scenes {
-            referenced.extend(scene.element_ids.iter().copied());
-            referenced.extend(
-                recognition_conditions(&scene.recognition)
+            references.add_many(
+                scene
+                    .element_ids
                     .iter()
-                    .map(|condition| condition.element_id),
+                    .chain(scene.required_element_ids.iter())
+                    .copied(),
+                scene.enabled,
+                &derived_inputs,
             );
-            if scene.enabled {
-                enabled_referenced.extend(scene.element_ids.iter().copied());
-            }
+            add_recognition_references(
+                &scene.recognition,
+                scene.enabled,
+                &derived_inputs,
+                &mut references,
+            );
+            add_target_visibility_references(
+                &scene.interaction_targets,
+                scene.enabled,
+                &derived_inputs,
+                &mut references,
+            );
         }
         for overlay in &self.overlays {
-            referenced.extend(overlay.element_ids.iter().copied());
-            referenced.extend(
-                recognition_conditions(&overlay.recognition)
+            references.add_many(
+                overlay
+                    .element_ids
                     .iter()
-                    .map(|condition| condition.element_id),
+                    .chain(overlay.required_element_ids.iter())
+                    .copied(),
+                overlay.enabled,
+                &derived_inputs,
             );
-            if overlay.enabled {
-                enabled_referenced.extend(overlay.element_ids.iter().copied());
-            }
+            add_recognition_references(
+                &overlay.recognition,
+                overlay.enabled,
+                &derived_inputs,
+                &mut references,
+            );
+            add_target_visibility_references(
+                &overlay.interaction_targets,
+                overlay.enabled,
+                &derived_inputs,
+                &mut references,
+            );
         }
         let unreachable_elements = self
             .elements
             .iter()
-            .filter(|element| !referenced.contains(&element.id))
+            .filter(|element| !references.referenced.contains(&element.id))
             .map(|element| element.name.clone())
             .collect::<Vec<_>>();
         let disabled_layer_only_elements = self
             .elements
             .iter()
             .filter(|element| {
-                referenced.contains(&element.id) && !enabled_referenced.contains(&element.id)
+                references.referenced.contains(&element.id)
+                    && !references.enabled_referenced.contains(&element.id)
             })
             .map(|element| element.name.clone())
             .collect::<Vec<_>>();
         let mut families = BTreeMap::new();
         let mut duplicate_candidates: HashMap<String, Vec<String>> = HashMap::new();
+        let mut asset_signatures = HashMap::new();
         for element in &self.elements {
             *families
                 .entry(detector_family(&element.detector).to_owned())
                 .or_insert(0) += 1;
             duplicate_candidates
-                .entry(detector_signature(element))
+                .entry(detector_signature(
+                    element,
+                    asset_root,
+                    &mut asset_signatures,
+                ))
                 .or_default()
                 .push(element.name.clone());
         }
@@ -354,17 +925,83 @@ impl Profile {
             .iter()
             .map(|element| (element.id, element))
             .collect::<HashMap<_, _>>();
+        let always_evaluated_anchor_ids = self
+            .global_elements
+            .iter()
+            .copied()
+            .chain(
+                self.scenes
+                    .iter()
+                    .filter(|scene| scene.enabled)
+                    .flat_map(|scene| recognition_conditions(&scene.recognition))
+                    .map(|condition| condition.element_id),
+            )
+            .chain(
+                self.overlays
+                    .iter()
+                    .filter(|overlay| overlay.enabled)
+                    .flat_map(|overlay| recognition_conditions(&overlay.recognition))
+                    .map(|condition| condition.element_id),
+            )
+            .filter(|id| {
+                elements_by_id
+                    .get(id)
+                    .is_some_and(|element| element.enabled)
+            })
+            .collect::<HashSet<_>>();
+        let mut always_evaluated_anchor_families = BTreeMap::new();
+        let always_evaluated_anchor_cost = always_evaluated_anchor_ids
+            .iter()
+            .filter_map(|id| elements_by_id.get(id))
+            .fold(0_u64, |cost, element| {
+                *always_evaluated_anchor_families
+                    .entry(detector_family(&element.detector).to_owned())
+                    .or_insert(0) += 1;
+                cost.saturating_add(detector_cost(&element.detector))
+            });
         let estimated_cost_by_scene = self
             .scenes
             .iter()
             .map(|scene| {
-                let ids = self
-                    .global_elements
+                let mut scene_references = CapacityReferences::default();
+                scene_references.add_many(
+                    self.global_elements.iter().copied(),
+                    true,
+                    &derived_inputs,
+                );
+                for rule in &self.rules {
+                    add_rule_references(rule, &derived_inputs, &mut scene_references);
+                }
+                for derived in self
+                    .derived_observations
                     .iter()
-                    .chain(scene.element_ids.iter())
-                    .copied()
-                    .collect::<HashSet<_>>();
-                let cost = ids
+                    .filter(|derived| derived.enabled)
+                {
+                    scene_references.add(derived.id, true, &derived_inputs);
+                }
+                scene_references.add_many(
+                    scene
+                        .element_ids
+                        .iter()
+                        .chain(scene.required_element_ids.iter())
+                        .copied(),
+                    true,
+                    &derived_inputs,
+                );
+                add_recognition_references(
+                    &scene.recognition,
+                    true,
+                    &derived_inputs,
+                    &mut scene_references,
+                );
+                add_target_visibility_references(
+                    &scene.interaction_targets,
+                    true,
+                    &derived_inputs,
+                    &mut scene_references,
+                );
+                let cost = scene_references
+                    .referenced
                     .iter()
                     .filter_map(|id| elements_by_id.get(id))
                     .map(|element| detector_cost(&element.detector))
@@ -381,7 +1018,7 @@ impl Profile {
                 "review duplicate regions/configurations and consolidate stable references".into(),
             );
         }
-        if self.elements.len() * 100 >= limits.elements * 80 {
+        if self.elements.len().saturating_mul(100) >= limits.elements.saturating_mul(80) {
             suggestions.push(
                 "prefer shared anchors, contextual elements, derived observations, and multi-template detectors before adding elements".into(),
             );
@@ -414,8 +1051,103 @@ impl Profile {
             unreachable_elements,
             disabled_layer_only_elements,
             duplicate_detector_groups,
+            always_evaluated_anchor_count: always_evaluated_anchor_ids.len(),
+            always_evaluated_anchor_cost,
+            always_evaluated_anchor_families,
             estimated_cost_by_scene,
             suggestions,
+        }
+    }
+
+    /// Projects a bounded mutation without changing the profile.
+    ///
+    /// The per-layer and per-expression additions apply to the largest affected
+    /// layer or expression. Callers can therefore describe a compound edit, such
+    /// as adding a scene with ten element references and two recognition
+    /// conditions, in one diagnostic request. This method is useful for drafts
+    /// and UI preflight; [`Profile::validate`] remains the commit-time guard.
+    #[must_use]
+    pub fn diagnose_capacity(&self, additions: CapacityAddition) -> ProfileCapacityDiagnostic {
+        let report = self.analyze_capacity();
+        let current = capacity_resource_usage(&report);
+        let projected = CapacityResourceUsage {
+            elements: project_capacity_usage(&current.elements, additions.elements),
+            scenes: project_capacity_usage(&current.scenes, additions.scenes),
+            overlays: project_capacity_usage(&current.overlays, additions.overlays),
+            elements_per_layer: project_capacity_usage(
+                &current.elements_per_layer,
+                additions.elements_per_layer,
+            ),
+            interaction_targets_per_layer: project_capacity_usage(
+                &current.interaction_targets_per_layer,
+                additions.interaction_targets_per_layer,
+            ),
+            interaction_targets_total: project_capacity_usage(
+                &current.interaction_targets_total,
+                additions.interaction_targets_total,
+            ),
+            recognition_conditions_per_expression: project_capacity_usage(
+                &current.recognition_conditions_per_expression,
+                additions.recognition_conditions_per_expression,
+            ),
+        };
+        let mut blockers = Vec::new();
+        let candidates = [
+            (
+                CapacityResource::Elements,
+                &current.elements,
+                additions.elements,
+                &projected.elements,
+            ),
+            (
+                CapacityResource::Scenes,
+                &current.scenes,
+                additions.scenes,
+                &projected.scenes,
+            ),
+            (
+                CapacityResource::Overlays,
+                &current.overlays,
+                additions.overlays,
+                &projected.overlays,
+            ),
+            (
+                CapacityResource::ElementsPerLayer,
+                &current.elements_per_layer,
+                additions.elements_per_layer,
+                &projected.elements_per_layer,
+            ),
+            (
+                CapacityResource::InteractionTargetsPerLayer,
+                &current.interaction_targets_per_layer,
+                additions.interaction_targets_per_layer,
+                &projected.interaction_targets_per_layer,
+            ),
+            (
+                CapacityResource::InteractionTargetsTotal,
+                &current.interaction_targets_total,
+                additions.interaction_targets_total,
+                &projected.interaction_targets_total,
+            ),
+            (
+                CapacityResource::RecognitionConditionsPerExpression,
+                &current.recognition_conditions_per_expression,
+                additions.recognition_conditions_per_expression,
+                &projected.recognition_conditions_per_expression,
+            ),
+        ];
+        for (resource, current, requested, projected) in candidates {
+            if let Some(issue) = capacity_diagnostic_issue(resource, current, requested, projected)
+            {
+                blockers.push(issue);
+            }
+        }
+        ProfileCapacityDiagnostic {
+            allowed: blockers.is_empty(),
+            additions,
+            current,
+            projected,
+            blockers,
         }
     }
 
@@ -457,13 +1189,42 @@ impl Profile {
             "elements",
             &mut errors,
         );
-        let mut element_ids: HashSet<_> = self.elements.iter().map(|element| element.id).collect();
+        let detector_element_ids: HashSet<_> =
+            self.elements.iter().map(|element| element.id).collect();
+        let mut element_ids = detector_element_ids.clone();
         for (index, derived) in self.derived_observations.iter().enumerate() {
             derived.validate(index, &element_ids, &mut errors);
             if !element_ids.insert(derived.id) {
                 errors.push(ValidationError::new(
                     format!("derived_observations[{index}].id"),
                     "must be unique across detector and derived observations",
+                ));
+            }
+        }
+        if self.element_aliases.len() > MAXIMUM_ELEMENT_ALIASES {
+            errors.push(ValidationError::new(
+                "element_aliases",
+                format!("contains more than {MAXIMUM_ELEMENT_ALIASES} compatibility aliases"),
+            ));
+        }
+        for (alias, target) in &self.element_aliases {
+            let path = format!("element_aliases.{alias}");
+            validate_identifier(&path, alias, &mut errors);
+            if !detector_element_ids.contains(target) {
+                errors.push(ValidationError::new(
+                    path,
+                    "must reference an existing detector element",
+                ));
+            }
+            if self.elements.iter().any(|element| element.name == *alias)
+                || self
+                    .derived_observations
+                    .iter()
+                    .any(|derived| derived.name == *alias)
+            {
+                errors.push(ValidationError::new(
+                    format!("element_aliases.{alias}"),
+                    "must not shadow a canonical element or derived-observation name",
                 ));
             }
         }
@@ -1910,6 +2671,25 @@ pub enum StorageError {
 ///
 /// Returns I/O, JSON, or profile validation errors.
 pub fn load_profile(path: &Path) -> Result<Profile, StorageError> {
+    let profile = parse_profile(path)?;
+    profile.validate()?;
+    Ok(profile)
+}
+
+/// Loads and migrates a profile for read-only capacity analysis without validating it.
+///
+/// This entry point exists so an author can inspect a draft that has just crossed a
+/// capacity boundary. The returned profile must not be activated, executed, packed,
+/// or saved until [`Profile::validate`] succeeds.
+///
+/// # Errors
+///
+/// Returns I/O, JSON, or unsupported-schema errors.
+pub fn load_profile_for_capacity_analysis(path: &Path) -> Result<Profile, StorageError> {
+    parse_profile(path)
+}
+
+fn parse_profile(path: &Path) -> Result<Profile, StorageError> {
     let document: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(path)?))?;
     let schema = document
         .get("schema")
@@ -1920,7 +2700,6 @@ pub fn load_profile(path: &Path) -> Result<Profile, StorageError> {
         2 => serde_json::from_value(document)?,
         version => return Err(StorageError::UnsupportedSchema(version)),
     };
-    profile.validate()?;
     Ok(profile)
 }
 
@@ -1994,6 +2773,85 @@ mod tests {
         }
     }
 
+    fn region_change_element(name: &str) -> Element {
+        Element {
+            id: ElementId::new(),
+            name: name.into(),
+            enabled: true,
+            color: "#ffffff".into(),
+            region: NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+            detector: Detector::RegionChange {
+                id: DetectorId::new(),
+                threshold: 0.2,
+                preprocessing: Vec::new(),
+            },
+        }
+    }
+
+    fn template_element(name: &str, template: &str) -> Element {
+        Element {
+            id: ElementId::new(),
+            name: name.into(),
+            enabled: true,
+            color: "#ffffff".into(),
+            region: NormalizedRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.2,
+                height: 0.2,
+            },
+            detector: Detector::Template {
+                id: DetectorId::new(),
+                templates: vec![template.into()],
+                masks: Vec::new(),
+                threshold: 0.9,
+                preprocessing: Vec::new(),
+            },
+        }
+    }
+
+    fn test_event_rule(element_id: ElementId, predicate: RulePredicate) -> EventRule {
+        EventRule {
+            id: RuleId::new(),
+            element_id,
+            event: "test_event".into(),
+            enter_below: 0.2,
+            leave_above: 0.3,
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            cooldown_ms: 0,
+            predicate,
+            stable_for_ms: 0,
+            emit_initial: false,
+            update_interval_ms: None,
+        }
+    }
+
+    fn visibility_target(expression: RecognitionExpression) -> InteractionTarget {
+        InteractionTarget {
+            id: InteractionTargetId::new(),
+            name: "action".into(),
+            role: InteractionRole::Action,
+            region: NormalizedRegion {
+                x: 0.5,
+                y: 0.5,
+                width: 0.2,
+                height: 0.2,
+            },
+            interaction_point: None,
+            visibility: Some(expression),
+            required_for_json: false,
+            caution_class: None,
+            caution: None,
+        }
+    }
+
     #[test]
     fn schema_round_trip_preserves_semantics() {
         let directory = tempfile::tempdir().unwrap();
@@ -2001,6 +2859,31 @@ mod tests {
         let profile = Profile::new("Demo", "demo_game", 1920, 1080);
         save_profile(&path, &profile).unwrap();
         assert_eq!(load_profile(&path).unwrap(), profile);
+    }
+
+    #[test]
+    fn element_aliases_round_trip_and_require_detector_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let element = region_change_element("canonical");
+        let element_id = element.id;
+        profile.elements.push(element);
+        profile
+            .element_aliases
+            .insert("legacy_canonical".into(), element_id);
+        save_profile(&path, &profile).unwrap();
+        assert_eq!(load_profile(&path).unwrap(), profile);
+
+        let mut invalid = profile.clone();
+        invalid
+            .element_aliases
+            .insert("missing_target".into(), ElementId::new());
+        let errors = invalid.validate().unwrap_err();
+        assert!(errors
+            .0
+            .iter()
+            .any(|error| error.path == "element_aliases.missing_target"));
     }
 
     #[test]
@@ -2094,6 +2977,323 @@ mod tests {
                 && error.message.contains("513/512")
                 && error.message.contains("analyze-capacity")
         }));
+    }
+
+    #[test]
+    fn capacity_analysis_reports_unique_enabled_runtime_anchors() {
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let global = region_change_element("global");
+        let recognition = region_change_element("recognition");
+        let disabled_layer_anchor = region_change_element("disabled_layer_anchor");
+        let disabled_layer_anchor_id = disabled_layer_anchor.id;
+        let disabled_global = {
+            let mut element = region_change_element("disabled_global");
+            element.enabled = false;
+            element
+        };
+        let global_id = global.id;
+        let recognition_id = recognition.id;
+        let disabled_global_id = disabled_global.id;
+        profile.elements = vec![global, recognition, disabled_global, disabled_layer_anchor];
+        profile.global_elements = vec![global_id, disabled_global_id, global_id];
+        profile.scenes.push(Scene {
+            id: SceneId::new(),
+            name: "scene".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: RecognitionExpression::All {
+                conditions: vec![RecognitionCondition {
+                    element_id: recognition_id,
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.0,
+            ambiguity_margin: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![global_id, recognition_id],
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+            transition_hints: Vec::new(),
+        });
+
+        let mut disabled_scene = profile.scenes[0].clone();
+        disabled_scene.id = SceneId::new();
+        disabled_scene.name = "disabled_scene".into();
+        disabled_scene.enabled = false;
+        disabled_scene.recognition = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: disabled_layer_anchor_id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        profile.overlays.push(Overlay {
+            id: OverlayId::new(),
+            name: "disabled_overlay".into(),
+            description: String::new(),
+            enabled: false,
+            priority: 0,
+            blocks_scene_targets: false,
+            recognition: disabled_scene.recognition.clone(),
+            minimum_confidence: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+        });
+        profile.scenes.push(disabled_scene);
+        let report = profile.analyze_capacity();
+        assert_eq!(report.always_evaluated_anchor_count, 2);
+        assert_eq!(report.always_evaluated_anchor_cost, 2);
+        assert_eq!(
+            report.always_evaluated_anchor_families,
+            BTreeMap::from([(String::from("region_change"), 2)])
+        );
+
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["elements"]["used"], 4);
+        assert_eq!(json["always_evaluated_anchor_count"], 2);
+        assert_eq!(json["always_evaluated_anchor_cost"], 2);
+        assert_eq!(json["always_evaluated_anchor_families"]["region_change"], 2);
+    }
+
+    #[test]
+    fn in_memory_capacity_analysis_does_not_resolve_template_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.json");
+        let second = directory.path().join("second.json");
+        fs::write(&first, b"identical template bytes").unwrap();
+        fs::write(&second, b"identical template bytes").unwrap();
+        let mut profile = Profile::new("In-memory", "demo_game", 100, 100);
+        profile.elements = vec![
+            template_element("first", first.to_str().unwrap()),
+            template_element("second", second.to_str().unwrap()),
+        ];
+        assert!(profile
+            .analyze_capacity()
+            .duplicate_detector_groups
+            .is_empty());
+        assert_eq!(
+            profile
+                .analyze_capacity_with_asset_root(directory.path())
+                .duplicate_detector_groups
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn capacity_analysis_groups_template_detectors_by_asset_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let templates = directory.path().join("templates");
+        fs::create_dir_all(&templates).unwrap();
+        fs::write(templates.join("first.png"), b"same template bytes").unwrap();
+        fs::write(templates.join("second.png"), b"same template bytes").unwrap();
+        fs::write(templates.join("different.png"), b"different template bytes").unwrap();
+
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        profile.elements = vec![
+            template_element("same-first", "templates/first.png"),
+            template_element("same-second", "templates/second.png"),
+            template_element("different", "templates/different.png"),
+        ];
+
+        let report = profile.analyze_capacity_with_asset_root(directory.path());
+        assert_eq!(
+            report.duplicate_detector_groups,
+            vec![vec![
+                String::from("same-first"),
+                String::from("same-second")
+            ]]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn capacity_analysis_follows_all_stable_element_dependencies() {
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let names = [
+            "orphan",
+            "rule_only",
+            "composite_condition",
+            "derived_source",
+            "recognition_anchor",
+            "visibility_dependency",
+            "disabled_layer_only",
+        ];
+        let ids = names
+            .into_iter()
+            .map(|name| {
+                let element = region_change_element(name);
+                let id = element.id;
+                profile.elements.push(element);
+                (name, id)
+            })
+            .collect::<HashMap<_, _>>();
+        let derived_parent = ElementId::new();
+        let derived_nested = ElementId::new();
+        profile.derived_observations.extend([
+            DerivedObservation {
+                id: derived_parent,
+                detector_id: DetectorId::new(),
+                name: "derived_parent".into(),
+                enabled: false,
+                format: "{source}".into(),
+                inputs: vec![DerivedInput {
+                    name: "source".into(),
+                    element_id: ids["derived_source"],
+                }],
+            },
+            DerivedObservation {
+                id: derived_nested,
+                detector_id: DetectorId::new(),
+                name: "derived_nested".into(),
+                enabled: false,
+                format: "{parent}".into(),
+                inputs: vec![DerivedInput {
+                    name: "parent".into(),
+                    element_id: derived_parent,
+                }],
+            },
+        ]);
+        profile.rules.push(test_event_rule(
+            ids["rule_only"],
+            RulePredicate::NumericBelow,
+        ));
+        profile.rules.push(test_event_rule(
+            derived_nested,
+            RulePredicate::All {
+                conditions: vec![ObservationCondition {
+                    element_id: ids["composite_condition"],
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                }],
+            },
+        ));
+        profile.scenes.push(Scene {
+            id: SceneId::new(),
+            name: "enabled_scene".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: RecognitionExpression::All {
+                conditions: vec![RecognitionCondition {
+                    element_id: ids["recognition_anchor"],
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            },
+            minimum_confidence: 0.0,
+            ambiguity_margin: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: vec![visibility_target(RecognitionExpression::Any {
+                conditions: vec![RecognitionCondition {
+                    element_id: ids["visibility_dependency"],
+                    predicate: AtomicRulePredicate::Boolean { expected: true },
+                    weight: 1.0,
+                }],
+            })],
+            transition_hints: Vec::new(),
+        });
+        profile.scenes.push(Scene {
+            id: SceneId::new(),
+            name: "disabled_scene".into(),
+            description: String::new(),
+            enabled: false,
+            priority: 0,
+            recognition: RecognitionExpression::default(),
+            minimum_confidence: 0.0,
+            ambiguity_margin: 0.0,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![ids["disabled_layer_only"]],
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+            transition_hints: Vec::new(),
+        });
+
+        let report = profile.analyze_capacity();
+        assert_eq!(report.unreachable_elements, vec!["orphan"]);
+        assert_eq!(
+            report.disabled_layer_only_elements,
+            vec!["disabled_layer_only"]
+        );
+        assert_eq!(report.estimated_cost_by_scene["enabled_scene"], 5);
+        for name in [
+            "rule_only",
+            "composite_condition",
+            "derived_source",
+            "recognition_anchor",
+            "visibility_dependency",
+        ] {
+            assert!(!report.unreachable_elements.iter().any(|item| item == name));
+        }
+    }
+
+    #[test]
+    fn capacity_diagnostic_projects_additions_and_reports_blockers() {
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        for index in 0..511 {
+            profile
+                .elements
+                .push(region_change_element(&format!("element_{index}")));
+        }
+        let allowed = profile.diagnose_capacity(CapacityAddition {
+            elements: 1,
+            ..CapacityAddition::default()
+        });
+        assert!(allowed.allowed);
+        assert_eq!(allowed.current.elements.used, 511);
+        assert_eq!(allowed.projected.elements.used, 512);
+        assert!(allowed.blockers.is_empty());
+
+        let blocked = profile.diagnose_capacity(CapacityAddition {
+            elements: 2,
+            scenes: 129,
+            ..CapacityAddition::default()
+        });
+        assert!(!blocked.allowed);
+        assert_eq!(blocked.projected.elements.used, 513);
+        assert_eq!(blocked.projected.scenes.used, 129);
+        assert_eq!(
+            blocked
+                .blockers
+                .iter()
+                .map(|issue| issue.resource)
+                .collect::<Vec<_>>(),
+            vec![CapacityResource::Elements, CapacityResource::Scenes]
+        );
+        assert!(blocked.blockers[0].message.contains("project 513"));
+    }
+
+    #[test]
+    fn over_capacity_draft_can_be_loaded_for_read_only_analysis() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("over-capacity.json");
+        let mut profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        for index in 0..513 {
+            profile
+                .elements
+                .push(region_change_element(&format!("element_{index}")));
+        }
+        fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+
+        assert!(matches!(
+            load_profile(&path),
+            Err(StorageError::Validation(_))
+        ));
+        let draft = load_profile_for_capacity_analysis(&path).unwrap();
+        assert_eq!(draft.elements.len(), 513);
+        let diagnostic = draft.diagnose_capacity(CapacityAddition::default());
+        assert!(!diagnostic.allowed);
+        assert_eq!(diagnostic.blockers[0].resource, CapacityResource::Elements);
+        assert_eq!(diagnostic.blockers[0].projected, 513);
     }
 
     #[test]

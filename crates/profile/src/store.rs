@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -9,12 +10,14 @@ use thiserror::Error;
 use yash_app_events_output::OutputRecipe;
 
 use crate::{
-    save_profile, ElementId, InteractionTarget, OverlayId, Profile, ProfileId,
-    RecognitionExpression, RuleId, RulePredicate, SceneId, StorageError,
+    save_profile, DetectorId, ElementId, ImportLimits, InteractionTarget, OverlayId, Profile,
+    ProfileId, RecognitionExpression, RuleId, RulePredicate, SceneId, StorageError,
 };
 
 const PROFILE_FILE: &str = "profile.json";
 const DRAFT_FILE: &str = "draft.json";
+const REVISION_LINEAGE_FILE: &str = ".revision-lineage.json";
+const REVISION_LINEAGE_SCHEMA: u16 = 1;
 const OUTPUT_RECIPES_DIRECTORY: &str = "output-recipes";
 const MAXIMUM_OUTPUT_RECIPES: usize = 32;
 const MAXIMUM_OUTPUT_RECIPE_BYTES: u64 = 64 * 1024;
@@ -25,6 +28,21 @@ pub struct OutputRecipeEntry {
     pub path: String,
     pub sha256: String,
     pub recipe: OutputRecipe,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RevisionLineage {
+    schema: u16,
+    revisions: BTreeMap<String, u64>,
+}
+
+impl Default for RevisionLineage {
+    fn default() -> Self {
+        Self {
+            schema: REVISION_LINEAGE_SCHEMA,
+            revisions: BTreeMap::new(),
+        }
+    }
 }
 
 /// State-owning profile repository used only by the daemon.
@@ -54,11 +72,74 @@ impl ProfileStore {
     /// Returns validation, collision, or durable storage errors.
     pub fn create(&self, profile: &Profile) -> Result<(), StoreError> {
         let directory = self.profile_directory(profile.id);
-        if directory.exists() {
+        if directory.exists() || self.trash_directory(profile.id).exists() {
             return Err(StoreError::AlreadyExists(profile.id));
         }
+        if let Some(floor) = self.import_revision_floor(profile.id)? {
+            if profile.revision <= floor {
+                return Err(StoreError::RevisionRegression {
+                    id: profile.id,
+                    revision: profile.revision,
+                    floor,
+                });
+            }
+        }
         save_profile(&directory.join(PROFILE_FILE), profile)?;
+        self.record_revision(profile.id, profile.revision)?;
         Ok(())
+    }
+
+    /// Imports a portable archive through the daemon-owned store boundary.
+    ///
+    /// A fresh profile ID keeps the archive's revision. When the same stable ID
+    /// has already existed locally, the imported document is rebased to the next
+    /// revision after the local high-water mark. This preserves monotonic
+    /// revisions even when the previous directory was moved to trash or an
+    /// external backup before the import.
+    ///
+    /// # Errors
+    ///
+    /// Returns archive, collision, lineage, validation, or durable storage errors.
+    pub fn import_archive(
+        &self,
+        archive_path: &Path,
+        limits: ImportLimits,
+    ) -> Result<Profile, StoreError> {
+        fs::create_dir_all(&self.profiles)?;
+        let staging = self
+            .profiles
+            .join(format!(".import-lineage-{}.tmp", Uuid::new_v4()));
+        fs::create_dir(&staging)?;
+        let result = (|| {
+            let mut profile = crate::import_profile(archive_path, &staging, limits)?;
+            let destination = self.profile_directory(profile.id);
+            if destination.exists() {
+                return Err(StoreError::AlreadyExists(profile.id));
+            }
+
+            if let Some(floor) = self.import_revision_floor(profile.id)? {
+                let next_revision = floor
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted { id: profile.id })?;
+                if profile.revision < next_revision {
+                    profile.revision = next_revision;
+                    save_profile(
+                        &staging.join(profile.id.to_string()).join(PROFILE_FILE),
+                        &profile,
+                    )?;
+                }
+            }
+
+            self.record_revision(profile.id, profile.revision)?;
+            fs::rename(staging.join(profile.id.to_string()), destination)?;
+            Ok(profile)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        } else {
+            let _ = fs::remove_dir(&staging);
+        }
+        result
     }
 
     /// Loads a committed profile.
@@ -67,9 +148,15 @@ impl ProfileStore {
     ///
     /// Returns parsing, validation, or storage errors.
     pub fn load(&self, id: ProfileId) -> Result<Profile, StoreError> {
-        Ok(crate::load_profile(
-            &self.profile_directory(id).join(PROFILE_FILE),
-        )?)
+        let profile = crate::load_profile(&self.profile_directory(id).join(PROFILE_FILE))?;
+        if profile.id != id {
+            return Err(StoreError::ProfileIdentityMismatch {
+                expected: id,
+                actual: profile.id,
+            });
+        }
+        self.ensure_tracked_revision(&profile)?;
+        Ok(profile)
     }
 
     /// Lists committed profiles in stable identity order.
@@ -83,9 +170,19 @@ impl ProfileStore {
         }
         let mut profiles = Vec::new();
         for entry in fs::read_dir(&self.profiles)? {
-            let path = entry?.path().join(PROFILE_FILE);
-            if path.is_file() {
-                profiles.push(crate::load_profile(&path)?);
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Ok(uuid) = Uuid::parse_str(&name.to_string_lossy()) else {
+                continue;
+            };
+            let id = ProfileId(uuid);
+            if entry.path() == self.profile_directory(id)
+                && entry.path().join(PROFILE_FILE).is_file()
+            {
+                profiles.push(self.load(id)?);
             }
         }
         profiles.sort_by_key(|profile| profile.id.to_string());
@@ -167,6 +264,10 @@ impl ProfileStore {
                 current: current.revision,
             });
         }
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::RevisionExhausted { id: profile.id })?;
         let directory = self.profile_directory(profile.id);
         let history = directory.join("revisions");
         fs::create_dir_all(&history)?;
@@ -174,8 +275,9 @@ impl ProfileStore {
             &history.join(format!("{}.json", current.revision)),
             &current,
         )?;
-        profile.revision = current.revision.saturating_add(1);
+        profile.revision = next_revision;
         save_profile(&directory.join(PROFILE_FILE), &profile)?;
+        self.record_revision(profile.id, profile.revision)?;
         self.prune_revisions(&history)?;
         let draft = directory.join(DRAFT_FILE);
         if draft.exists() {
@@ -222,6 +324,7 @@ impl ProfileStore {
         for derived in &mut duplicate.derived_observations {
             let old = derived.id;
             derived.id = ElementId::new();
+            derived.detector_id = DetectorId::new();
             element_ids.insert(old, derived.id);
             for input in &mut derived.inputs {
                 if let Some(id) = element_ids.get(&input.element_id) {
@@ -240,6 +343,11 @@ impl ProfileStore {
             .global_elements
             .iter()
             .filter_map(|id| element_ids.get(id).copied())
+            .collect();
+        duplicate.element_aliases = duplicate
+            .element_aliases
+            .iter()
+            .filter_map(|(alias, id)| element_ids.get(id).copied().map(|id| (alias.clone(), id)))
             .collect();
         let scene_ids = duplicate
             .scenes
@@ -277,6 +385,7 @@ impl ProfileStore {
             fs::remove_file(draft)?;
         }
         save_profile(&destination.join(PROFILE_FILE), &duplicate)?;
+        self.record_revision(duplicate.id, duplicate.revision)?;
         Ok(duplicate)
     }
 
@@ -340,14 +449,90 @@ impl ProfileStore {
         Ok(new_id)
     }
 
+    /// Removes a detector element and its dependent derived observations.
+    ///
+    /// References that cannot survive the removal are pruned from rules,
+    /// layers, recognition expressions, and target visibility expressions.
+    /// Affected recognition layers are disabled and affected targets hidden
+    /// until the user supplies new evidence in the draft.
+    /// This keeps an explicit authoring removal reversible through the draft
+    /// workflow while preserving profile validation invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested detector element is absent.
+    pub fn remove_element(profile: &mut Profile, element_id: ElementId) -> Result<(), StoreError> {
+        if !profile
+            .elements
+            .iter()
+            .any(|element| element.id == element_id)
+        {
+            return Err(StoreError::ElementNotFound(element_id));
+        }
+
+        let mut removed = HashSet::from([element_id]);
+        loop {
+            let newly_removed = profile
+                .derived_observations
+                .iter()
+                .filter(|derived| {
+                    derived
+                        .inputs
+                        .iter()
+                        .any(|input| removed.contains(&input.element_id))
+                })
+                .map(|derived| derived.id)
+                .filter(|id| !removed.contains(id))
+                .collect::<Vec<_>>();
+            if newly_removed.is_empty() {
+                break;
+            }
+            removed.extend(newly_removed);
+        }
+
+        profile
+            .elements
+            .retain(|element| !removed.contains(&element.id));
+        profile
+            .derived_observations
+            .retain(|derived| !removed.contains(&derived.id));
+        profile
+            .element_aliases
+            .retain(|_, id| !removed.contains(id));
+        profile.global_elements.retain(|id| !removed.contains(id));
+        profile.rules.retain(|rule| {
+            !removed.contains(&rule.element_id) && !rule_references_any(rule, &removed)
+        });
+
+        for scene in &mut profile.scenes {
+            remove_element_references(&mut scene.element_ids, &removed);
+            remove_element_references(&mut scene.required_element_ids, &removed);
+            if remove_recognition_references(&mut scene.recognition, &removed) {
+                scene.enabled = false;
+            }
+            remove_target_visibility_references(&mut scene.interaction_targets, &removed);
+        }
+        for overlay in &mut profile.overlays {
+            remove_element_references(&mut overlay.element_ids, &removed);
+            remove_element_references(&mut overlay.required_element_ids, &removed);
+            if remove_recognition_references(&mut overlay.recognition, &removed) {
+                overlay.enabled = false;
+            }
+            remove_target_visibility_references(&mut overlay.interaction_targets, &removed);
+        }
+        Ok(())
+    }
+
     /// Moves a profile to application-managed trash.
     ///
     /// # Errors
     ///
     /// Returns an I/O error when the move cannot complete.
     pub fn trash(&self, id: ProfileId) -> Result<(), StoreError> {
+        let profile = self.load(id)?;
+        self.record_revision(id, profile.revision)?;
         fs::create_dir_all(&self.trash)?;
-        fs::rename(self.profile_directory(id), self.trash.join(id.to_string()))?;
+        fs::rename(self.profile_directory(id), self.trash_directory(id))?;
         Ok(())
     }
 
@@ -361,8 +546,26 @@ impl ProfileStore {
         if destination.exists() {
             return Err(StoreError::AlreadyExists(id));
         }
+        let source = self.trash_directory(id);
+        let profile = crate::load_profile(&source.join(PROFILE_FILE))?;
+        if profile.id != id {
+            return Err(StoreError::ProfileIdentityMismatch {
+                expected: id,
+                actual: profile.id,
+            });
+        }
+        if let Some(floor) = self.import_revision_floor(id)? {
+            if profile.revision < floor {
+                return Err(StoreError::RevisionRegression {
+                    id,
+                    revision: profile.revision,
+                    floor,
+                });
+            }
+        }
         fs::create_dir_all(&self.profiles)?;
-        fs::rename(self.trash.join(id.to_string()), destination)?;
+        self.record_revision(id, profile.revision)?;
+        fs::rename(source, destination)?;
         Ok(())
     }
 
@@ -382,6 +585,10 @@ impl ProfileStore {
         self.profiles.join(id.to_string())
     }
 
+    fn trash_directory(&self, id: ProfileId) -> PathBuf {
+        self.trash.join(id.to_string())
+    }
+
     /// Returns the root containing all portable profiles.
     #[must_use]
     pub fn profiles_root(&self) -> &Path {
@@ -397,6 +604,119 @@ impl ProfileStore {
     pub fn output_recipes(&self, id: ProfileId) -> Result<Vec<OutputRecipeEntry>, StoreError> {
         self.load(id)?;
         load_output_recipes_from_profile_directory(&self.profile_directory(id))
+    }
+
+    fn lineage_path(&self) -> PathBuf {
+        self.profiles.join(REVISION_LINEAGE_FILE)
+    }
+
+    fn read_lineage(&self) -> Result<RevisionLineage, StoreError> {
+        let path = self.lineage_path();
+        if !path.exists() {
+            return Ok(RevisionLineage::default());
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(StoreError::InvalidRevisionLineage(
+                "lineage metadata must be a regular file".into(),
+            ));
+        }
+        let bytes = fs::read(path)?;
+        let lineage: RevisionLineage = serde_json::from_slice(&bytes)
+            .map_err(|error| StoreError::InvalidRevisionLineage(error.to_string()))?;
+        if lineage.schema != REVISION_LINEAGE_SCHEMA {
+            return Err(StoreError::InvalidRevisionLineage(format!(
+                "unsupported lineage schema {}",
+                lineage.schema
+            )));
+        }
+        Ok(lineage)
+    }
+
+    fn write_lineage(&self, lineage: &RevisionLineage) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec_pretty(lineage)
+            .map_err(|error| StoreError::InvalidRevisionLineage(error.to_string()))?;
+        crate::atomic_write(&self.lineage_path(), &bytes)?;
+        Ok(())
+    }
+
+    fn record_revision(&self, id: ProfileId, revision: u64) -> Result<(), StoreError> {
+        let mut lineage = self.read_lineage()?;
+        let key = id.to_string();
+        if let Some(floor) = lineage.revisions.get(&key).copied() {
+            if revision < floor {
+                return Err(StoreError::RevisionRegression {
+                    id,
+                    revision,
+                    floor,
+                });
+            }
+            if revision == floor {
+                return Ok(());
+            }
+        }
+        lineage.revisions.insert(key, revision);
+        self.write_lineage(&lineage)
+    }
+
+    fn ensure_tracked_revision(&self, profile: &Profile) -> Result<(), StoreError> {
+        let lineage = self.read_lineage()?;
+        let mut floor = lineage.revisions.get(&profile.id.to_string()).copied();
+        let trash_path = self.trash_directory(profile.id).join(PROFILE_FILE);
+        if trash_path.is_file() {
+            let trashed = crate::load_profile(&trash_path)?;
+            if trashed.id == profile.id {
+                floor = Some(floor.map_or(trashed.revision, |known| known.max(trashed.revision)));
+            }
+        }
+        if let Some(floor) = floor {
+            if profile.revision < floor {
+                return Err(StoreError::RevisionRegression {
+                    id: profile.id,
+                    revision: profile.revision,
+                    floor,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn import_revision_floor(&self, id: ProfileId) -> Result<Option<u64>, StoreError> {
+        let lineage = self.read_lineage()?;
+        let key = id.to_string();
+        let mut floor = lineage.revisions.get(&key).copied();
+        for path in self.revision_document_paths()? {
+            let profile = crate::load_profile(&path)?;
+            if profile.id == id {
+                floor = Some(floor.map_or(profile.revision, |known| known.max(profile.revision)));
+            }
+        }
+        Ok(floor)
+    }
+
+    fn revision_document_paths(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let mut paths = Vec::new();
+        for root in [&self.profiles, &self.trash] {
+            if !root.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                let name = entry.file_name();
+                if root == &self.profiles && name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let path = entry.path().join(PROFILE_FILE);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        Ok(paths)
     }
 
     fn prune_revisions(&self, history: &Path) -> io::Result<()> {
@@ -427,6 +747,10 @@ fn remap_scene_elements(
         .collect();
 }
 
+fn remove_element_references(references: &mut Vec<ElementId>, removed: &HashSet<ElementId>) {
+    references.retain(|id| !removed.contains(id));
+}
+
 fn remap_recognition(
     expression: &mut RecognitionExpression,
     element_ids: &HashMap<ElementId, ElementId>,
@@ -443,6 +767,20 @@ fn remap_recognition(
     }
 }
 
+fn remove_recognition_references(
+    expression: &mut RecognitionExpression,
+    removed: &HashSet<ElementId>,
+) -> bool {
+    let conditions = match expression {
+        RecognitionExpression::All { conditions } | RecognitionExpression::Any { conditions } => {
+            conditions
+        }
+    };
+    let previous_count = conditions.len();
+    conditions.retain(|condition| !removed.contains(&condition.element_id));
+    conditions.len() != previous_count
+}
+
 fn remap_interaction_targets(
     targets: &mut [InteractionTarget],
     element_ids: &HashMap<ElementId, ElementId>,
@@ -451,6 +789,21 @@ fn remap_interaction_targets(
         target.id = crate::InteractionTargetId::new();
         if let Some(visibility) = &mut target.visibility {
             remap_recognition(visibility, element_ids);
+        }
+    }
+}
+
+fn remove_target_visibility_references(
+    targets: &mut [InteractionTarget],
+    removed: &HashSet<ElementId>,
+) {
+    for target in targets {
+        if let Some(visibility) = &mut target.visibility {
+            if remove_recognition_references(visibility, removed) {
+                *visibility = RecognitionExpression::Any {
+                    conditions: Vec::new(),
+                };
+            }
         }
     }
 }
@@ -539,6 +892,19 @@ fn remap_composition_elements(
     }
 }
 
+fn rule_references_any(rule: &crate::EventRule, removed: &HashSet<ElementId>) -> bool {
+    match &rule.predicate {
+        RulePredicate::All { conditions } | RulePredicate::Any { conditions } => conditions
+            .iter()
+            .any(|condition| removed.contains(&condition.element_id)),
+        RulePredicate::NumericBelow
+        | RulePredicate::Boolean { .. }
+        | RulePredicate::TextEquals { .. }
+        | RulePredicate::TextContains { .. }
+        | RulePredicate::RapidIncrease { .. } => false,
+    }
+}
+
 fn copy_portable_tree(source: &Path, destination: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     let excluded = HashSet::from([PROFILE_FILE, DRAFT_FILE, "revisions"]);
@@ -563,12 +929,29 @@ fn copy_portable_tree(source: &Path, destination: &Path) -> io::Result<()> {
 pub enum StoreError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Archive(#[from] crate::ArchiveError),
     #[error("profile I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("profile {0} already exists")]
     AlreadyExists(ProfileId),
     #[error("stale profile revision: expected {expected}, current {current}")]
     RevisionConflict { expected: u64, current: u64 },
+    #[error("profile {id} revision {revision} is below its recorded lineage floor {floor}")]
+    RevisionRegression {
+        id: ProfileId,
+        revision: u64,
+        floor: u64,
+    },
+    #[error("profile {id} revision cannot advance beyond u64::MAX")]
+    RevisionExhausted { id: ProfileId },
+    #[error("profile identity mismatch: expected {expected}, found {actual}")]
+    ProfileIdentityMismatch {
+        expected: ProfileId,
+        actual: ProfileId,
+    },
+    #[error("revision lineage metadata is invalid: {0}")]
+    InvalidRevisionLineage(String),
     #[error("element {0} was not found")]
     ElementNotFound(ElementId),
     #[error("profile {id} revision {revision} was not found")]
@@ -580,10 +963,10 @@ pub enum StoreError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AtomicRulePredicate, BarDirection, Detector, DetectorId, Element, EventRule,
-        InteractionPoint, InteractionRole, InteractionTarget, InteractionTargetId,
-        NormalizedRegion, ObservationCondition, Overlay, OverlayId, RecognitionCondition,
-        RecognitionExpression, RulePredicate, Scene, SceneId,
+        AtomicRulePredicate, BarDirection, DerivedInput, DerivedObservation, Detector, DetectorId,
+        Element, EventRule, InteractionPoint, InteractionRole, InteractionTarget,
+        InteractionTargetId, NormalizedRegion, ObservationCondition, Overlay, OverlayId,
+        RecognitionCondition, RecognitionExpression, RulePredicate, Scene, SceneId,
     };
 
     use super::*;
@@ -689,6 +1072,169 @@ mod tests {
     }
 
     #[test]
+    fn revisions_cross_100_without_wrapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let mut profile = populated_profile();
+        profile.revision = 99;
+        store.create(&profile).unwrap();
+
+        let hundred = store.commit(profile, 99).unwrap();
+        assert_eq!(hundred.revision, 100);
+        let one_hundred_one = store.commit(hundred, 100).unwrap();
+        assert_eq!(one_hundred_one.revision, 101);
+        assert!(store
+            .profile_directory(one_hundred_one.id)
+            .join("revisions/100.json")
+            .is_file());
+    }
+
+    #[test]
+    fn import_rebases_after_trash_and_keeps_the_old_lineage_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = populated_profile();
+        let id = profile.id;
+        store.create(&profile).unwrap();
+
+        let mut high_revision = profile.clone();
+        high_revision.name = "High revision".into();
+        let high_revision = store.commit(high_revision, 0).unwrap();
+        store.trash(id).unwrap();
+
+        let mut imported_source = profile;
+        imported_source.name = "Imported replacement".into();
+        let source = directory.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        crate::save_profile(&source.join(PROFILE_FILE), &imported_source).unwrap();
+        let archive = directory.path().join("replacement.hudprofile");
+        crate::export_profile(&source, &archive).unwrap();
+
+        let imported = store
+            .import_archive(&archive, ImportLimits::default())
+            .unwrap();
+        assert_eq!(imported.id, id);
+        assert_eq!(imported.revision, high_revision.revision + 1);
+        assert_eq!(store.load(id).unwrap().name, "Imported replacement");
+        assert_eq!(
+            crate::load_profile(
+                &directory
+                    .path()
+                    .join("trash")
+                    .join(id.to_string())
+                    .join(PROFILE_FILE)
+            )
+            .unwrap()
+            .revision,
+            high_revision.revision
+        );
+        assert!(!store
+            .profiles_root()
+            .join(".import-lineage-leftover.tmp")
+            .exists());
+    }
+
+    #[test]
+    fn lineage_survives_permanent_trash_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = populated_profile();
+        let id = profile.id;
+        store.create(&profile).unwrap();
+        let mut high_revision = profile.clone();
+        high_revision.name = "High revision".into();
+        let high_revision = store.commit(high_revision, 0).unwrap();
+        store.trash(id).unwrap();
+        store.permanently_delete_trashed(id).unwrap();
+        drop(store);
+        let store = ProfileStore::new(directory.path(), 20);
+
+        let source = directory.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let mut imported_source = high_revision.clone();
+        imported_source.name = "Imported after deletion".into();
+        imported_source.revision = 0;
+        crate::save_profile(&source.join(PROFILE_FILE), &imported_source).unwrap();
+        let archive = directory.path().join("replacement.hudprofile");
+        crate::export_profile(&source, &archive).unwrap();
+
+        let imported = store
+            .import_archive(&archive, ImportLimits::default())
+            .unwrap();
+        assert_eq!(imported.revision, high_revision.revision + 1);
+    }
+
+    #[test]
+    fn import_accounts_for_external_backup_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = populated_profile();
+        let id = profile.id;
+        let backup = store.profiles_root().join("backup-before-profile-import");
+        fs::create_dir_all(&backup).unwrap();
+        let mut backed_up = profile.clone();
+        backed_up.revision = 7;
+        crate::save_profile(&backup.join(PROFILE_FILE), &backed_up).unwrap();
+
+        let source = directory.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        crate::save_profile(&source.join(PROFILE_FILE), &profile).unwrap();
+        let archive = directory.path().join("replacement.hudprofile");
+        crate::export_profile(&source, &archive).unwrap();
+
+        let imported = store
+            .import_archive(&archive, ImportLimits::default())
+            .unwrap();
+        assert_eq!(imported.id, id);
+        assert_eq!(imported.revision, 8);
+        assert_eq!(store.list().unwrap(), vec![imported]);
+        assert_eq!(
+            crate::load_profile(&backup.join(PROFILE_FILE)).unwrap(),
+            backed_up
+        );
+    }
+
+    #[test]
+    fn load_and_list_reject_a_mismatched_profile_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = populated_profile();
+        let id = profile.id;
+        store.create(&profile).unwrap();
+        let mut replaced = profile;
+        replaced.id = ProfileId::new();
+        crate::save_profile(&store.profile_directory(id).join(PROFILE_FILE), &replaced).unwrap();
+        for result in [store.load(id).map(|profile| vec![profile]), store.list()] {
+            assert!(
+                matches!(result, Err(StoreError::ProfileIdentityMismatch { expected, actual })
+                if expected == id && actual == replaced.id)
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_a_manually_regressed_active_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let profile = populated_profile();
+        let id = profile.id;
+        store.create(&profile).unwrap();
+        let committed = store.commit(profile, 0).unwrap();
+
+        let mut regressed = committed;
+        regressed.revision = 0;
+        crate::save_profile(&store.profile_directory(id).join(PROFILE_FILE), &regressed).unwrap();
+        assert!(matches!(
+            store.load(id),
+            Err(StoreError::RevisionRegression {
+                id: error_id,
+                revision: 0,
+                floor: 1,
+            }) if error_id == id
+        ));
+    }
+
+    #[test]
     fn rollback_preserves_history_and_creates_new_revision() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 10);
@@ -719,6 +1265,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 20);
         let mut profile = populated_profile();
+        profile
+            .element_aliases
+            .insert("legacy_signal".into(), profile.elements[0].id);
         profile.rules[0].predicate = RulePredicate::All {
             conditions: vec![ObservationCondition {
                 element_id: profile.elements[0].id,
@@ -808,6 +1357,10 @@ mod tests {
         let duplicate = store.duplicate_profile(profile.id, "Copy").unwrap();
         assert_ne!(duplicate.id, profile.id);
         assert_ne!(duplicate.elements[0].id, profile.elements[0].id);
+        assert_eq!(
+            duplicate.element_aliases.get("legacy_signal"),
+            Some(&duplicate.elements[0].id)
+        );
         assert_eq!(duplicate.rules[0].element_id, duplicate.elements[0].id);
         let RulePredicate::All { conditions } = &duplicate.rules[0].predicate else {
             panic!("composition was not preserved");
@@ -861,6 +1414,33 @@ mod tests {
     }
 
     #[test]
+    fn deep_duplicate_rekeys_derived_detector_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let mut profile = populated_profile();
+        let derived_detector_id = DetectorId::new();
+        profile.derived_observations.push(DerivedObservation {
+            id: ElementId::new(),
+            detector_id: derived_detector_id,
+            name: "stage_label".into(),
+            enabled: true,
+            format: "{Health}".into(),
+            inputs: vec![DerivedInput {
+                name: "Health".into(),
+                element_id: profile.elements[0].id,
+            }],
+        });
+        store.create(&profile).unwrap();
+
+        let duplicate = store.duplicate_profile(profile.id, "Copy").unwrap();
+
+        assert_ne!(
+            duplicate.derived_observations[0].detector_id,
+            derived_detector_id
+        );
+    }
+
+    #[test]
     fn trash_and_restore_are_reversible() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(directory.path(), 20);
@@ -880,5 +1460,128 @@ mod tests {
         assert_eq!(profile.rules.len(), 1);
         ProfileStore::duplicate_element(&mut profile, original, true).unwrap();
         assert_eq!(profile.rules.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn removing_element_prunes_dependent_profile_references() {
+        let mut profile = populated_profile();
+        let raw_id = profile.elements[0].id;
+        let derived_id = ElementId::new();
+        let chained_id = ElementId::new();
+        profile.derived_observations = vec![
+            DerivedObservation {
+                id: derived_id,
+                detector_id: DetectorId::new(),
+                name: "stage".into(),
+                enabled: true,
+                format: "{health}".into(),
+                inputs: vec![DerivedInput {
+                    name: "health".into(),
+                    element_id: raw_id,
+                }],
+            },
+            DerivedObservation {
+                id: chained_id,
+                detector_id: DetectorId::new(),
+                name: "summary".into(),
+                enabled: true,
+                format: "{stage}".into(),
+                inputs: vec![DerivedInput {
+                    name: "stage".into(),
+                    element_id: derived_id,
+                }],
+            },
+        ];
+        profile.global_elements = vec![raw_id, chained_id];
+        profile.rules[0].element_id = chained_id;
+        profile.rules[0].predicate = RulePredicate::All {
+            conditions: vec![ObservationCondition {
+                element_id: raw_id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+            }],
+        };
+
+        let recognition = RecognitionExpression::All {
+            conditions: vec![RecognitionCondition {
+                element_id: raw_id,
+                predicate: AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        let target = InteractionTarget {
+            id: InteractionTargetId::new(),
+            name: "confirm".into(),
+            role: InteractionRole::Action,
+            region: NormalizedRegion {
+                x: 0.4,
+                y: 0.4,
+                width: 0.2,
+                height: 0.1,
+            },
+            interaction_point: Some(InteractionPoint::Center),
+            visibility: Some(recognition.clone()),
+            required_for_json: true,
+            caution_class: None,
+            caution: None,
+        };
+        profile.scenes.push(Scene {
+            id: SceneId::new(),
+            name: "menu".into(),
+            description: String::new(),
+            enabled: true,
+            priority: 0,
+            recognition: recognition.clone(),
+            minimum_confidence: 0.8,
+            ambiguity_margin: 0.1,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![raw_id],
+            required_element_ids: vec![raw_id],
+            interaction_targets: vec![target.clone()],
+            transition_hints: Vec::new(),
+        });
+        let mut overlay_target = target;
+        overlay_target.id = InteractionTargetId::new();
+        profile.overlays.push(Overlay {
+            id: OverlayId::new(),
+            name: "dialog".into(),
+            description: String::new(),
+            enabled: true,
+            blocks_scene_targets: true,
+            priority: 0,
+            recognition,
+            minimum_confidence: 0.8,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: vec![raw_id],
+            required_element_ids: vec![raw_id],
+            interaction_targets: vec![overlay_target],
+        });
+        profile.validate().unwrap();
+        profile.element_aliases.insert("raw_alias".into(), raw_id);
+
+        ProfileStore::remove_element(&mut profile, raw_id).unwrap();
+
+        assert!(profile.elements.is_empty());
+        assert!(profile.derived_observations.is_empty());
+        assert!(profile.element_aliases.is_empty());
+        assert!(profile.global_elements.is_empty());
+        assert!(profile.rules.is_empty());
+        assert!(profile.scenes[0].element_ids.is_empty());
+        assert!(profile.scenes[0].required_element_ids.is_empty());
+        assert!(!profile.scenes[0].enabled);
+        assert!(profile.scenes[0].interaction_targets[0]
+            .visibility
+            .as_ref()
+            .is_some_and(|expression| matches!(expression, RecognitionExpression::Any { conditions } if conditions.is_empty())));
+        assert!(profile.overlays[0].element_ids.is_empty());
+        assert!(profile.overlays[0].required_element_ids.is_empty());
+        assert!(!profile.overlays[0].enabled);
+        assert!(profile.overlays[0].interaction_targets[0]
+            .visibility
+            .as_ref()
+            .is_some_and(|expression| matches!(expression, RecognitionExpression::Any { conditions } if conditions.is_empty())));
+        profile.validate().unwrap();
     }
 }

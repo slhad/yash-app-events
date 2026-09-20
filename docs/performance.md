@@ -1,5 +1,92 @@
 # Performance baselines
 
+## Application audit, 2026-09-20
+
+The audit covers capture, vision, scheduling, live/replay publication, suite evaluation,
+IPC, GUI refresh, profile persistence, archives, and catalog access. Fixes are applied in
+descending impact order. Existing uncommitted profile and routing work is preserved.
+
+1. Replay previously decoded up to 10,000 PNGs into a retained vector before processing.
+   A 4096×4096 RGBA frame uses 64 MiB, so permitted input could exhaust memory. Image and
+   synthetic replay now consume fallible frame iterators. Replay and suite PNGs share
+   the bounded decoder, which checks dimensions before allocating or inflating pixels.
+   Tests verify lazy decoding, release of consumed pixels, traversal rejection, and
+   rejection of an oversized header before reading its truncated pixel stream. The
+   daemon's 36 tests pass, including OCR/classifier replay and durable output tests.
+2. Live and replay publication serialized and durably replaced the entire state after
+   every detector observation, then queued another full copy for output routes. State
+   is now published once after each analyzed frame. Transitions retain individual
+   JSONL, subscription, and event-route delivery; state routes see complete frames.
+   The 128-detector, 20-frame release benchmark fell from 1684.281 ms to 21.217 ms,
+   about 79 times faster on this host. This synthetic result isolates publication
+   overhead and does not predict OCR or real-game speed. The regression test verifies
+   that no partial state reaches disk or `state.get`, all 128 observations survive,
+   and a frame with no new observations causes no write.
+3. Image analysis, replay, preview encoding, and detector setup ran directly on async
+   control threads. They now use blocking workers with one shared foreground admission
+   permit, including both suite entry points. Live analysis awaits one blocking frame
+   job at a time and keeps the latest-frame input. A current-thread runtime test proves
+   status remains responsive during blocked work and cancelling an awaiting task does
+   not release the permit before native work finishes. All 38 daemon tests and strict
+   workspace Clippy pass. This follows [Tokio's guidance for blocking CPU work](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html).
+4. Capacity analysis could open and hash template files from the GUI render thread.
+   The in-memory API now compares paths without filesystem access; only the explicit
+   asset-root API hashes files. The GUI skips analysis when its panel is collapsed
+   and retains one report until the draft content changes. Tests cover path-only versus
+   content-aware reports, unsaved edits at the same revision, and profile switches.
+   All 61 profile/GUI tests pass.
+5. Template matching allocated two vectors and recomputed template statistics at every
+   search position. It now retains count/mean/variance per template and scores directly
+   from the image, without temporary pixel buffers. The existing release benchmark fell
+   from 473.840 to 47.929 microseconds per evaluation. A differential test checks exact
+   `f32` equality with the original algorithm over 4,096 masked, constant, empty-mask,
+   single-pixel-mask, and varied search positions. All 22 vision tests pass. Malformed
+   template dimensions are rejected at construction instead of reaching pixel indexing.
+6. The GUI queued six more status requests every two seconds during long operations.
+   Polls now retain at most one outstanding request of each kind, request and response
+   channels hold at most 64 entries, and rejected manual requests produce a visible
+   retry error. The test queues 1,000 polls, verifies one request, checks manual-command
+   ordering and overload reporting, then confirms polling resumes after a response.
+   Failed draft saves retry after a delay, failed detector tests release their pending
+   flag, and unrelated successful polls do not erase the error message.
+7. Packed capture frames were copied into a vector and then copied again into their
+   shared buffer. Capture now allocates the shared buffer directly and normalizes
+   channels in place. For 60 3840×2160 release-mode frames, RGBA fell from 2.383 to
+   0.741 ms/frame and BGRx from 6.215 to 4.820 ms/frame. Existing stride, offset, channel,
+   alpha, and short-buffer tests pass. Full-frame suite fixtures also skip allocation
+   of an unused blank canvas before accepting the decoded pixels.
+8. Disabled scenes and overlays still prewarmed and evaluated their recognition
+   anchors. Scheduling, one-shot dependency selection, suggested anchor crops, and
+   capacity accounting now exclude those layers. The five-detector regression retains
+   its one-then-four evaluations even when the unused detector is referenced by both
+   a disabled scene and a disabled overlay.
+9. Profile loads parsed their active document a second time during lineage validation.
+   They now compare the loaded revision against the lineage and any trashed document.
+   Listing visits only canonical profile directories: an external backup can inform
+   import rebasing without breaking the subsequent profile list. Tests retain the
+   backup unchanged and reject a document whose ID differs from its directory.
+
+The review also caught an authoring regression: deleting recognition evidence could
+leave an empty `all` expression, making a scene or interaction target match without
+evidence. Removal now disables affected scenes/overlays and hides affected targets until
+their draft configuration is repaired. Profile and engine tests verify the behavior.
+
+Final automated validation: formatting, strict workspace Clippy, all 197 workspace
+tests, README claim checks, and documentation generation pass. The two ignored benchmarks
+were run explicitly. An isolated release daemon passed the available BlazBlue suite's
+33 cases, 50 frames, and 126 assertions in 12.476 seconds, with a cold inventory cache.
+During that run, 61 CLI status requests took 4.245 ms median and 5.730 ms maximum;
+sampled daemon RSS peaked at 308.57 MiB. These measurements cover this workload only.
+No fresh interactive portal/GUI capture test or full Queen Blade suite was run in this
+audit; earlier evidence below is historical.
+
+Reproduce the publication and capture benchmarks with:
+
+```bash
+cargo test --release -p yash-app-eventsd replay_publication_benchmark -- --ignored --nocapture
+cargo test --release -p yash-app-events-capture-pw packed_capture_copy_benchmark -- --ignored --nocapture
+```
+
 ## Deterministic detector microbenchmark
 
 Recorded 2026-07-11 on an AMD Ryzen 7 5800X3D (8 cores / 16 threads), using
@@ -38,10 +125,11 @@ second, records 59 replacements, and emits the expected transition without backl
 Schema-2 scheduling adds no frame queue. Resolver histories are capped at 32 samples,
 scene/overlay candidate counts are bounded by profile validation, and N-of-M history
 advances only when an anchor detector produces a newly scheduled observation. The
-scene-pipeline test uses three enabled detectors and proves that the unknown scene
-evaluates only its one anchor, then the recognized scene evaluates the anchor plus one
-contextual detector while permanently gating the unrelated third detector. Live state
-reports evaluated, gated, and rate-throttled counts for direct profiling.
+scene-pipeline test uses five enabled detectors and proves that the unknown scene
+evaluates only its one anchor, then the recognized scene evaluates the anchor plus its
+ordinary, required, and target-visibility contextual dependencies while permanently
+gating the unrelated fifth detector. Live state reports evaluated, gated, and
+rate-throttled counts for direct profiling.
 
 ## External suite phase timings
 
@@ -106,3 +194,19 @@ rejected by the current bound. The real 512-element workload is already dominate
 runtime detector cost and exceeds one GiB RSS, so the limit remains **512**. Raising it
 would enlarge worst-case runtime and authoring complexity without solving the measured
 bottleneck. Capacity warnings and consolidation analysis are the selected remedy.
+
+The capacity analyzer now reports the unique enabled anchors evaluated before scene/overlay
+selection, including weighted detector cost and family breakdown. It also recognizes template
+duplicates by content rather than only by path, so copied or renamed assets appear as
+consolidation candidates. Portable exports omit template files unreferenced by the current
+profile; other allowed portable files and source directories are left untouched. The daemon's scene-aware pipeline now keeps those
+anchors resident, constructs contextual processors only after a matching scene/overlay is
+selected, and releases inactive contextual processors. The no-context/active-context regression
+test proves that this changes construction and residency without changing detector results,
+including required and target-visibility dependencies.
+
+For unrelated HUD families, a profile bundle bounds the second stage to one selected member:
+the request pays for the small router plus the chosen profile, never for every member. The
+router and each member retain the existing 512-element admission bound; the bundle manifest is
+limited to 256 KiB and 32 members. Revision pins and a shared request timeout prevent a stale
+or unexpectedly expensive member from silently extending an analysis indefinitely.

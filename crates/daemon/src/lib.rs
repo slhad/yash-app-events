@@ -21,10 +21,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::{broadcast, oneshot, Notify, Semaphore};
 use uuid::Uuid;
 use yash_app_events_capture::LatestFrameSlot;
-use yash_app_events_capture::{Frame, FrameLayout, PixelFormat, ReplaySource};
+use yash_app_events_capture::{Frame, FrameLayout, PixelFormat};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
 use yash_app_events_catalog::{Catalog, CatalogError, CatalogService};
 use yash_app_events_engine::collection::{
@@ -36,11 +36,11 @@ use yash_app_events_engine::suite::{
     SuiteTimingSummary,
 };
 use yash_app_events_engine::{
-    evaluate_replay, normalized_to_pixels, recognition_confidence, AnalysisScheduler,
-    CompositeRule, CompositeRuleConfig, FrameProcessor, NoopRule, NumericRule, NumericRuleConfig,
-    Observation, ObservationRule, ObservationValue, ProcessedFrame, ReplayManifest,
-    ReplayRegression, SceneResolution, SceneResolver, TemporalRule, TemporalRuleConfig, Transition,
-    TransitionState, ValuePredicate,
+    evaluate_replay, normalized_to_pixels, recognition_confidence, recognition_matches,
+    AnalysisScheduler, CompositeRule, CompositeRuleConfig, FrameProcessor, NoopRule, NumericRule,
+    NumericRuleConfig, Observation, ObservationRule, ObservationValue, ProcessedFrame,
+    ReplayManifest, ReplayRegression, SceneResolution, SceneResolutionHints, SceneResolver,
+    TemporalRule, TemporalRuleConfig, Transition, TransitionState, ValuePredicate,
 };
 use yash_app_events_output::{
     execute_route, export_diagnostic_bundle, plan_diagnostic_bundle, render_payload,
@@ -51,10 +51,10 @@ use yash_app_events_output::{
 #[cfg(test)]
 use yash_app_events_output::{FileMode, OutputRecipe, OutputRecipeSink};
 use yash_app_events_profile::{
-    export_profile, import_profile, load_profile, BarDirection, CollectionPolicy,
+    export_profile, load_profile, load_profile_bundle, BarDirection, CollectionPolicy,
     Detector as ProfileDetector, DetectorId, ElementId, ImportLimits, LocalConfig,
-    NormalizedRegion, OcrExpectedFormat, OverlayId, Profile, ProfileId, ProfileStore, RuleId,
-    RulePredicate, SceneId, StoreError,
+    NormalizedRegion, OcrExpectedFormat, OverlayId, Profile, ProfileBundle, ProfileBundleMember,
+    ProfileId, ProfileStore, RuleId, RulePredicate, SceneId, StoreError,
 };
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
@@ -104,6 +104,7 @@ struct State {
     diagnostic_logs: Mutex<VecDeque<Value>>,
     collector: Mutex<collection::Runtime>,
     output_routes: routes::Router,
+    image_work: Arc<Semaphore>,
     suite_operations: Mutex<HashMap<Uuid, Arc<SuiteOperation>>>,
     suite_inventory_cache: Mutex<HashMap<PathBuf, SuiteInventoryCacheEntry>>,
 }
@@ -259,6 +260,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         })])),
         collector: Mutex::new(collection::Runtime::default()),
         output_routes,
+        image_work: Arc::new(Semaphore::new(1)),
         suite_operations: Mutex::new(HashMap::new()),
         suite_inventory_cache: Mutex::new(HashMap::new()),
     });
@@ -630,13 +632,11 @@ async fn dispatch(
                 .map_err(internal_error)
         }),
         method::PROFILE_IMPORT => parse::<PathParam>(request.params).and_then(|params| {
-            import_profile(
-                &params.path,
-                state.profiles.profiles_root(),
-                ImportLimits::default(),
-            )
-            .and_then(|profile| serde_json::to_value(profile).map_err(Into::into))
-            .map_err(internal_error)
+            state
+                .profiles
+                .import_archive(&params.path, ImportLimits::default())
+                .map_err(store_error)
+                .and_then(|profile| serde_json::to_value(profile).map_err(internal_error))
         }),
         method::PROFILE_EXPORT => parse::<ExportParams>(request.params).and_then(|params| {
             export_profile(
@@ -692,32 +692,23 @@ async fn dispatch(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()),
-        method::ANALYZE_IMAGE => parse::<AnalyzeImageParams>(request.params)
-            .and_then(|params| analyze_image(state, &params)),
-        method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(request.params)
-            .and_then(|params| run_synthetic_health(state, params)),
-        method::DETECTOR_TEST => parse::<DetectorTestParams>(request.params)
-            .and_then(|params| test_detector(state, &params, frozen_frame)),
-        method::DETECTOR_CAPTURE_TEMPLATE => parse::<CaptureTemplateParams>(request.params)
-            .and_then(|params| capture_template(state, &params)),
-        method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(request.params)
-            .and_then(|params| run_profile_replay(state, &params)),
-        method::REPLAY_EVALUATE => parse::<ReplayManifest>(request.params)
-            .and_then(|manifest| evaluate_profile_replay(state, &manifest)),
-        method::SUITE_EVALUATE => match parse::<SuiteEvaluateParams>(request.params) {
-            Ok(params) => {
-                let state = Arc::clone(state);
-                match tokio::task::spawn_blocking(move || {
-                    evaluate_regression_suite(&state, &params, None)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(internal_error(error)),
-                }
-            }
-            Err(error) => Err(error),
-        },
+        method::ANALYZE_IMAGE
+        | method::REPLAY_SYNTHETIC_HEALTH
+        | method::DETECTOR_TEST
+        | method::DETECTOR_CAPTURE_TEMPLATE
+        | method::REPLAY_PROFILE_DETECTOR
+        | method::REPLAY_EVALUATE
+        | method::SUITE_EVALUATE
+        | method::PREVIEW_FRAME
+        | method::CAPTURE_SNAPSHOT => {
+            let worker_state = Arc::clone(state);
+            let method_name = request.method;
+            let params = request.params;
+            run_image_work(state, move || {
+                dispatch_image_work(&worker_state, &method_name, params, frozen_frame)
+            })
+            .await
+        }
         method::SUITE_START => match parse::<SuiteEvaluateParams>(request.params) {
             Ok(params) => start_suite_operation(Arc::clone(state), params),
             Err(error) => Err(error),
@@ -756,16 +747,12 @@ async fn dispatch(
         method::CAPTURE_AUTO_GET => auto_capture_status(state),
         method::CAPTURE_AUTO_SET => parse::<AutoCaptureParams>(request.params)
             .and_then(|params| set_auto_capture(state, params)),
-        method::CAPTURE_SNAPSHOT => parse::<PathParam>(request.params)
-            .and_then(|params| snapshot_capture(state, &params.path)),
         method::PREVIEW_START => {
             Ok(json!({"enabled":true,"clients":state.preview_clients.load(Ordering::Relaxed)}))
         }
         method::PREVIEW_STOP => {
             Ok(json!({"enabled":false,"clients":state.preview_clients.load(Ordering::Relaxed)}))
         }
-        method::PREVIEW_FRAME => parse::<PreviewFrameParams>(request.params)
-            .and_then(|params| preview_frame(state, &params)),
         method::PREVIEW_FREEZE => Ok(
             json!({"frozen":frozen_frame.is_some(),"sequence":frozen_frame.as_ref().map(|frame|frame.sequence)}),
         ),
@@ -810,6 +797,58 @@ async fn dispatch(
     }
 }
 
+/// Hold admission until the synchronous work finishes, even if its awaiting client leaves.
+async fn run_image_work<T: Send + 'static>(
+    state: &Arc<State>,
+    work: impl FnOnce() -> Result<T, RpcError> + Send + 'static,
+) -> Result<T, RpcError> {
+    let permit = Arc::clone(&state.image_work)
+        .acquire_owned()
+        .await
+        .map_err(internal_error)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(internal_error)?
+}
+
+fn dispatch_image_work(
+    state: &State,
+    method_name: &str,
+    params: Value,
+    frozen_frame: Option<Arc<Frame>>,
+) -> Result<Value, RpcError> {
+    match method_name {
+        method::ANALYZE_IMAGE => {
+            parse::<AnalyzeImageParams>(params).and_then(|params| analyze_image(state, &params))
+        }
+        method::REPLAY_SYNTHETIC_HEALTH => parse::<SyntheticReplayParams>(params)
+            .and_then(|params| run_synthetic_health(state, params)),
+        method::DETECTOR_TEST => parse::<DetectorTestParams>(params)
+            .and_then(|params| test_detector(state, &params, frozen_frame)),
+        method::DETECTOR_CAPTURE_TEMPLATE => parse::<CaptureTemplateParams>(params)
+            .and_then(|params| capture_template(state, &params)),
+        method::REPLAY_PROFILE_DETECTOR => parse::<ProfileReplayParams>(params)
+            .and_then(|params| run_profile_replay(state, &params)),
+        method::REPLAY_EVALUATE => parse::<ReplayManifest>(params)
+            .and_then(|manifest| evaluate_profile_replay(state, &manifest)),
+        method::SUITE_EVALUATE => parse::<SuiteEvaluateParams>(params)
+            .and_then(|params| evaluate_regression_suite(state, &params, None)),
+        method::PREVIEW_FRAME => {
+            parse::<PreviewFrameParams>(params).and_then(|params| preview_frame(state, &params))
+        }
+        method::CAPTURE_SNAPSHOT => {
+            parse::<PathParam>(params).and_then(|params| snapshot_capture(state, &params.path))
+        }
+        _ => Err(RpcError::new(
+            error_code::METHOD_NOT_FOUND,
+            "method not found",
+        )),
+    }
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
     serde_json::from_value(value).map_err(|error| RpcError {
         code: error_code::INVALID_PARAMS,
@@ -819,14 +858,32 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
 }
 
 fn store_error(error: StoreError) -> RpcError {
-    if let StoreError::RevisionConflict { expected, current } = error {
-        RpcError {
+    match error {
+        StoreError::RevisionConflict { expected, current } => RpcError {
             code: error_code::REVISION_CONFLICT,
             message: "profile revision conflict".into(),
             data: Some(json!({"expected": expected, "current": current})),
-        }
-    } else {
-        internal_error(error)
+        },
+        StoreError::RevisionRegression {
+            id,
+            revision,
+            floor,
+        } => RpcError {
+            code: error_code::REVISION_CONFLICT,
+            message: "profile lineage would move backwards".into(),
+            data: Some(json!({
+                "profile_id": id,
+                "incoming_revision": revision,
+                "high_water_revision": floor,
+                "recovery": "importing this profile will rebase it to the next revision"
+            })),
+        },
+        StoreError::RevisionExhausted { id } => RpcError {
+            code: error_code::REVISION_CONFLICT,
+            message: "profile revision cannot advance further".into(),
+            data: Some(json!({"profile_id": id, "revision": u64::MAX})),
+        },
+        other => internal_error(other),
     }
 }
 
@@ -920,12 +977,10 @@ async fn install_catalog_profile(
         .download_package(entry)
         .await
         .map_err(catalog_error)?;
-    let profile = import_profile(
-        &package,
-        state.profiles.profiles_root(),
-        ImportLimits::default(),
-    )
-    .map_err(internal_error)?;
+    let profile = state
+        .profiles
+        .import_archive(&package, ImportLimits::default())
+        .map_err(store_error)?;
     Ok(json!({
         "installed": true,
         "catalog_id": entry.id,
@@ -984,13 +1039,10 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
         element_id,
         rule,
     );
-    let frames = params
-        .fills
-        .into_iter()
-        .enumerate()
-        .map(|(index, fill)| synthetic_health_frame(u64::try_from(index).unwrap_or(u64::MAX), fill))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(internal_error)?;
+    let frames = params.fills.into_iter().enumerate().map(|(index, fill)| {
+        synthetic_health_frame(u64::try_from(index).unwrap_or(u64::MAX), fill)
+            .map_err(internal_error)
+    });
     publish_replay(
         state,
         &mut processor,
@@ -1003,7 +1055,7 @@ fn run_synthetic_health(state: &State, params: SyntheticReplayParams) -> Result<
 fn publish_replay<D: VisionDetector>(
     state: &State,
     processor: &mut FrameProcessor<D>,
-    frames: Vec<Arc<Frame>>,
+    frames: impl IntoIterator<Item = Result<Arc<Frame>, RpcError>>,
     profile_id: &str,
     game: &str,
 ) -> Result<Value, RpcError> {
@@ -1014,7 +1066,8 @@ fn publish_replay<D: VisionDetector>(
     let mut publication = PublicationState::default();
     let mut emitted = Vec::new();
     let mut processed_count = 0_usize;
-    for frame in ReplaySource::new(frames) {
+    for frame in frames {
+        let frame = frame?;
         let Some(processed) = processor.process(&frame) else {
             continue;
         };
@@ -1034,6 +1087,13 @@ fn publish_replay<D: VisionDetector>(
         )? {
             emitted.push(record);
         }
+        publish_current_state(
+            state,
+            profile_id,
+            timestamp,
+            json!({"active":false,"source":"replay"}),
+            &mut publication,
+        )?;
     }
     Ok(json!({"frames": processed_count, "events": emitted}))
 }
@@ -1043,6 +1103,7 @@ struct PublicationState {
     observations: serde_json::Map<String, Value>,
     event_states: serde_json::Map<String, Value>,
     context: Value,
+    dirty: bool,
 }
 
 fn publish_context_transition(
@@ -1112,6 +1173,7 @@ fn publish_processed(
         processed.observation.element_id.to_string(),
         serde_json::to_value(&processed.observation).map_err(internal_error)?,
     );
+    publication.dirty = true;
     let mut emitted = None;
     let mut event_record = None;
     if let Some(transition) = processed.transition {
@@ -1155,7 +1217,29 @@ fn publish_processed(
         event_record = Some(record);
         emitted = Some(record_value);
     }
-    let snapshot = StateSnapshot {
+    if let Some(record) = event_record {
+        if let Ok(route_profile_id) = serde_json::from_value::<ProfileId>(json!(profile_id)) {
+            let snapshot = publication_snapshot(state, profile_id, timestamp, capture, publication);
+            if let Err(error) =
+                state
+                    .output_routes
+                    .publish(route_profile_id, Some(record), snapshot)
+            {
+                set_output_error(state, error);
+            }
+        }
+    }
+    Ok(emitted)
+}
+
+fn publication_snapshot(
+    state: &State,
+    profile_id: &str,
+    timestamp: DateTime<Utc>,
+    capture: Value,
+    publication: &PublicationState,
+) -> StateSnapshot {
+    StateSnapshot {
         schema: 1,
         daemon_instance: state.instance,
         sequence: state.sequence.load(Ordering::Relaxed),
@@ -1165,7 +1249,21 @@ fn publish_processed(
         observations: Value::Object(publication.observations.clone()),
         events: Value::Object(publication.event_states.clone()),
         context: publication.context.clone(),
-    };
+    }
+}
+
+/// Publishes a complete analyzed frame once, after all detector and derived observations.
+fn publish_current_state(
+    state: &State,
+    profile_id: &str,
+    timestamp: DateTime<Utc>,
+    capture: Value,
+    publication: &mut PublicationState,
+) -> Result<bool, RpcError> {
+    if !publication.dirty {
+        return Ok(false);
+    }
+    let snapshot = publication_snapshot(state, profile_id, timestamp, capture, publication);
     let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
     if let Err(error) = state
         .output
@@ -1176,10 +1274,9 @@ fn publish_processed(
         set_output_error(state, &error.to_string());
     }
     if let Ok(route_profile_id) = serde_json::from_value::<ProfileId>(json!(profile_id)) {
-        if let Err(error) =
-            state
-                .output_routes
-                .publish(route_profile_id, event_record, snapshot.clone())
+        if let Err(error) = state
+            .output_routes
+            .publish(route_profile_id, None, snapshot)
         {
             set_output_error(state, error);
         }
@@ -1188,7 +1285,8 @@ fn publish_processed(
         .latest_snapshot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_value;
-    Ok(emitted)
+    publication.dirty = false;
+    Ok(true)
 }
 
 fn synthetic_health_frame(
@@ -1489,6 +1587,102 @@ impl VisionDetector for ConfiguredDetector {
     }
 }
 
+/// A detector configuration whose native/image-heavy state is created on demand.
+///
+/// Scene recognition must keep its anchors resident, but contextual detectors do
+/// not need a Tesseract handle, ONNX session, or decoded template set while their
+/// scene/overlay is inactive. The slot retains only the portable profile
+/// configuration until it becomes active, and releases the constructed processor
+/// again when the context is no longer active.
+#[derive(Debug)]
+struct LazyProcessor {
+    id: ElementId,
+    detector_id: DetectorId,
+    detector: ProfileDetector,
+    region: NormalizedRegion,
+    processor: Option<FrameProcessor<ConfiguredDetector, NoopRule>>,
+    initialization_error: Option<RpcError>,
+    initialization_error_reported: bool,
+}
+
+impl LazyProcessor {
+    fn new(element: &yash_app_events_profile::Element) -> Self {
+        Self {
+            id: element.id,
+            detector_id: detector_id(&element.detector),
+            detector: element.detector.clone(),
+            region: element.region,
+            processor: None,
+            initialization_error: None,
+            initialization_error_reported: false,
+        }
+    }
+
+    fn ensure_processor(
+        &mut self,
+        directory: &Path,
+        analysis_fps: u8,
+    ) -> Result<&mut FrameProcessor<ConfiguredDetector, NoopRule>, RpcError> {
+        if self.processor.is_none() && self.initialization_error.is_none() {
+            let result = configured_detector(&self.detector, directory).and_then(|detector| {
+                let scheduler = AnalysisScheduler::new(analysis_fps).map_err(internal_error)?;
+                Ok(FrameProcessor::new(
+                    scheduler,
+                    detector,
+                    self.region,
+                    self.detector_id,
+                    self.id,
+                    NoopRule,
+                ))
+            });
+            match result {
+                Ok(processor) => self.processor = Some(processor),
+                Err(error) => self.initialization_error = Some(error),
+            }
+        }
+        if let Some(error) = &self.initialization_error {
+            return Err(error.clone());
+        }
+        self.processor
+            .as_mut()
+            .ok_or_else(|| internal_error("lazy detector construction produced no processor"))
+    }
+
+    fn prewarm(&mut self, directory: &Path, analysis_fps: u8) -> Result<(), RpcError> {
+        self.ensure_processor(directory, analysis_fps).map(|_| ())
+    }
+
+    fn process(
+        &mut self,
+        frame: &Frame,
+        directory: &Path,
+        analysis_fps: u8,
+    ) -> Result<Option<ProcessedFrame>, RpcError> {
+        if self.initialization_error.is_some() {
+            if self.initialization_error_reported {
+                return Ok(None);
+            }
+            self.initialization_error_reported = true;
+        }
+        match self.ensure_processor(directory, analysis_fps) {
+            Ok(processor) => Ok(processor.process(frame)),
+            Err(error) => {
+                self.initialization_error_reported = self.initialization_error.is_some();
+                Err(error)
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        self.processor = None;
+    }
+
+    #[cfg(test)]
+    fn is_constructed(&self) -> bool {
+        self.processor.is_some()
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn configured_detector(
     detector: &ProfileDetector,
@@ -1667,7 +1861,7 @@ fn run_profile_replay(state: &State, params: &ProfileReplayParams) -> Result<Val
         })?;
     let directory = state.profiles.profile_directory(profile.id);
     let detector = configured_detector(&element.detector, &directory)?;
-    let frames = replay_fixture_frames(&element.detector, &directory, &params.values)?;
+    let frames = replay_fixture_frames(&element.detector, &directory, &params.values);
     let numeric_rule = NumericRule::new(NumericRuleConfig {
         id: rule.id,
         event: rule.event.clone(),
@@ -1722,11 +1916,16 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
         .find(|element| element.id == manifest.element_id)
         .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "element not found"))?;
     let directory = state.profiles.profile_directory(profile.id);
-    let frames = if manifest.image_frames.is_empty() {
-        replay_fixture_frames(&element.detector, &directory, &manifest.values)?
-    } else {
-        replay_png_frames(&directory, &manifest.image_frames)?
-    };
+    let frames: Box<dyn Iterator<Item = Result<Arc<Frame>, RpcError>> + '_> =
+        if manifest.image_frames.is_empty() {
+            Box::new(replay_fixture_frames(
+                &element.detector,
+                &directory,
+                &manifest.values,
+            ))
+        } else {
+            Box::new(replay_png_frames(&directory, &manifest.image_frames))
+        };
     let mut pipeline = build_live_pipeline(state, profile.id)?;
     let start = Utc
         .with_ymd_and_hms(2026, 7, 11, 16, 43, 27)
@@ -1749,8 +1948,9 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
     );
     let mut observations = Vec::new();
     let mut transitions = Vec::new();
-    for frame in ReplaySource::new(frames) {
-        let processed_frames = pipeline.process_scene_aware(&frame);
+    for frame in frames {
+        let frame = frame?;
+        let processed_frames = pipeline.process_scene_aware(&frame)?;
         publication.context = json!({
             "scene":pipeline.scene_resolution.scene,
             "overlays":pipeline.scene_resolution.overlays,
@@ -1827,6 +2027,17 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
                 observations.push(observation);
             }
         }
+        let timestamp = start
+            + TimeDelta::milliseconds(
+                i64::try_from(frame.timestamp.as_millis()).unwrap_or(i64::MAX),
+            );
+        publish_current_state(
+            state,
+            &pipeline.profile_id,
+            timestamp,
+            capture.clone(),
+            &mut publication,
+        )?;
     }
     let metrics = evaluate_replay(
         &manifest.expected_events,
@@ -1891,6 +2102,14 @@ fn start_suite_operation(
     state: Arc<State>,
     params: SuiteEvaluateParams,
 ) -> Result<Value, RpcError> {
+    let permit = Arc::clone(&state.image_work)
+        .try_acquire_owned()
+        .map_err(|_| {
+            RpcError::new(
+                error_code::INVALID_REQUEST,
+                "image analysis is busy; retry after the current operation finishes",
+            )
+        })?;
     let operation = Arc::new(SuiteOperation {
         id: Uuid::new_v4(),
         started: Instant::now(),
@@ -1962,6 +2181,7 @@ fn start_suite_operation(
         }
     });
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let result = evaluate_regression_suite(&state, &params, Some(&operation));
         let mut snapshot = operation
             .state
@@ -2611,6 +2831,15 @@ fn profile_aliases(profile: &Profile) -> Result<HashMap<String, ElementId>, RpcE
             ));
         }
     }
+    for (legacy_name, id) in &profile.element_aliases {
+        let alias = suite_alias(legacy_name);
+        if aliases.insert(alias.clone(), *id).is_some() {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                format!("profile contains ambiguous suite alias: {alias}"),
+            ));
+        }
+    }
     Ok(aliases)
 }
 
@@ -2673,6 +2902,7 @@ fn evaluate_suite_case(
                 profile_directory,
                 &image_path,
                 120_000,
+                None,
             )?)
         } else {
             None
@@ -2689,7 +2919,7 @@ fn evaluate_suite_case(
                     .unwrap_or(0),
             );
         }
-        let processed_frame = pipeline.process_scene_aware(&frame);
+        let processed_frame = pipeline.process_scene_aware(&frame)?;
         evaluated_detectors = evaluated_detectors.saturating_add(pipeline.last_evaluated_detectors);
         gated_detectors = gated_detectors.saturating_add(pipeline.last_gated_detectors);
         throttled_detectors = throttled_detectors.saturating_add(pipeline.last_throttled_detectors);
@@ -3130,13 +3360,17 @@ fn prepare_suite_frame(
     } else {
         (reference_width, reference_height)
     };
-    let mut canvas = vec![
-        0_u8;
-        usize::try_from(width)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(usize::try_from(height).unwrap_or(usize::MAX))
-            .saturating_mul(4)
-    ];
+    let mut canvas = if matches!(sample.placement, FramePlacement::FullFrame) {
+        Vec::new()
+    } else {
+        vec![
+            0_u8;
+            usize::try_from(width)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(usize::try_from(height).unwrap_or(usize::MAX))
+                .saturating_mul(4)
+        ]
+    };
     match &sample.placement {
         FramePlacement::FullFrame => {
             if !spatial_full_frame && (image.width != width || image.height != height) {
@@ -3223,6 +3457,15 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
     ));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(internal_error)?;
+    let header = reader.info();
+    if header.width == 0
+        || header.height == 0
+        || header.width > 4_096
+        || header.height > 4_096
+        || header.bit_depth == png::BitDepth::Sixteen
+    {
+        return Err(RpcError::new(error_code::INVALID_PARAMS, "unsupported PNG"));
+    }
     let mut output = vec![
         0;
         reader.output_buffer_size().ok_or_else(|| {
@@ -3238,9 +3481,10 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
     {
         return Err(RpcError::new(error_code::INVALID_PARAMS, "unsupported PNG"));
     }
-    let data = &output[..info.buffer_size()];
+    output.truncate(info.buffer_size());
+    let data = &output;
     let pixels = match info.color_type {
-        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgba => output,
         png::ColorType::Rgb => data
             .chunks_exact(3)
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
@@ -3275,12 +3519,616 @@ fn analyze_image(state: &State, params: &AnalyzeImageParams) -> Result<Value, Rp
             "timeout_ms must be within 100..=120000",
         ));
     }
+    match (params.profile_id, params.bundle.as_deref()) {
+        (Some(profile_id), None) => {
+            let profile = state.profiles.load(profile_id).map_err(store_error)?;
+            let directory = state.profiles.profile_directory(profile.id);
+            analyze_image_with_profile(
+                &profile,
+                &directory,
+                &params.path,
+                params.timeout_ms,
+                params.context.as_ref(),
+            )
+        }
+        (None, Some(bundle_path)) => analyze_image_with_bundle(
+            state,
+            bundle_path,
+            &params.path,
+            params.timeout_ms,
+            params.context.as_ref(),
+        ),
+        (None, None) => Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "one of profile_id or bundle is required",
+        )),
+        (Some(_), Some(_)) => Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "profile_id and bundle are mutually exclusive",
+        )),
+    }
+}
+
+fn analyze_image_with_bundle(
+    state: &State,
+    bundle_path: &Path,
+    image_path: &Path,
+    timeout_ms: u64,
+    context: Option<&AnalysisContext>,
+) -> Result<Value, RpcError> {
+    let started = Instant::now();
+    let bundle = load_profile_bundle(bundle_path).map_err(|error| profile_bundle_error(&error))?;
+    let router = state
+        .profiles
+        .load(bundle.router_profile_id)
+        .map_err(|error| RpcError {
+            code: error_code::INVALID_PARAMS,
+            message: "profile bundle router profile is unavailable".into(),
+            data: Some(json!({
+                "reason": "router_profile_invalid",
+                "profile_id": bundle.router_profile_id,
+                "detail": error.to_string(),
+            })),
+        })?;
+    validate_bundle_router(&bundle, &router)?;
+    let router_directory = state.profiles.profile_directory(router.id);
+    let router_timeout = remaining_analysis_timeout(started, timeout_ms)?;
+    let router_result = analyze_image_with_profile(
+        &router,
+        &router_directory,
+        image_path,
+        router_timeout,
+        context,
+    )?;
+    let bundle_context = bundle_analysis_context(&router_result);
+    let selection = select_profile_bundle_member(&bundle, &bundle_context);
+    let Some((route_index, fallback)) = selection else {
+        return with_bundle_selection(
+            router_result,
+            bundle_selection_value(&bundle, &router, &bundle_context, None, false),
+        );
+    };
+    let member = &bundle.members[route_index];
+    let selected_profile = if member.profile_id == router.id {
+        if member.profile_revision != router.revision {
+            return Err(bundle_profile_reference_error(
+                route_index,
+                member,
+                &format!(
+                    "revision mismatch: manifest pins {}, store has {}",
+                    member.profile_revision, router.revision
+                ),
+            ));
+        }
+        router.clone()
+    } else {
+        load_bundle_member_profile(state, &bundle, &router, route_index)?
+    };
+    let router_context_report = router_result.get("analysis_context").cloned();
+    let mut result =
+        if selected_profile.id == router.id && selected_profile.revision == router.revision {
+            router_result
+        } else {
+            let remaining = remaining_analysis_timeout(started, timeout_ms)?;
+            let directory = state.profiles.profile_directory(selected_profile.id);
+            analyze_image_with_profile(&selected_profile, &directory, image_path, remaining, None)?
+        };
+    if let Some(report) = router_context_report {
+        result
+            .as_object_mut()
+            .ok_or_else(|| internal_error("analysis result is not a JSON object"))?
+            .insert("analysis_context".into(), report);
+    }
+    with_bundle_selection(
+        result,
+        bundle_selection_value(
+            &bundle,
+            &router,
+            &bundle_context,
+            Some((route_index, selected_profile.id)),
+            fallback,
+        ),
+    )
+}
+
+fn load_bundle_member_profile(
+    state: &State,
+    bundle: &ProfileBundle,
+    router: &Profile,
+    index: usize,
+) -> Result<Profile, RpcError> {
+    let member = &bundle.members[index];
     let profile = state
         .profiles
-        .load(params.profile_id)
-        .map_err(store_error)?;
-    let directory = state.profiles.profile_directory(profile.id);
-    analyze_image_with_profile(&profile, &directory, &params.path, params.timeout_ms)
+        .load(member.profile_id)
+        .map_err(|error| bundle_profile_reference_error(index, member, &error.to_string()))?;
+    if profile.revision != member.profile_revision {
+        return Err(bundle_profile_reference_error(
+            index,
+            member,
+            &format!(
+                "revision mismatch: manifest pins {}, store has {}",
+                member.profile_revision, profile.revision
+            ),
+        ));
+    }
+    if profile.game != bundle.game {
+        return Err(bundle_profile_reference_error(
+            index,
+            member,
+            &format!(
+                "game mismatch: manifest pins {}, profile has {}",
+                bundle.game, profile.game
+            ),
+        ));
+    }
+    if profile.layout.reference_width != router.layout.reference_width
+        || profile.layout.reference_height != router.layout.reference_height
+    {
+        return Err(bundle_profile_reference_error(
+            index,
+            member,
+            "reference layout dimensions differ from the router",
+        ));
+    }
+    Ok(profile)
+}
+
+fn validate_bundle_router(bundle: &ProfileBundle, router: &Profile) -> Result<(), RpcError> {
+    if router.revision != bundle.router_profile_revision {
+        return Err(RpcError {
+            code: error_code::INVALID_PARAMS,
+            message: "profile bundle router revision mismatch".into(),
+            data: Some(json!({
+                "reason": "router_revision_mismatch",
+                "expected": bundle.router_profile_revision,
+                "current": router.revision,
+                "profile_id": router.id,
+            })),
+        });
+    }
+    if router.game != bundle.game {
+        return Err(RpcError {
+            code: error_code::INVALID_PARAMS,
+            message: "profile bundle game mismatch".into(),
+            data: Some(json!({
+                "reason": "game_mismatch",
+                "expected": bundle.game,
+                "current": router.game,
+                "profile_id": router.id,
+            })),
+        });
+    }
+    let scene_ids = router
+        .scenes
+        .iter()
+        .map(|scene| scene.id)
+        .collect::<HashSet<_>>();
+    let overlay_ids = router
+        .overlays
+        .iter()
+        .map(|overlay| overlay.id)
+        .collect::<HashSet<_>>();
+    for (index, member) in bundle.members.iter().enumerate() {
+        if let Some(id) = member.scene_ids.iter().find(|id| !scene_ids.contains(id)) {
+            return Err(RpcError {
+                code: error_code::INVALID_PARAMS,
+                message: "profile bundle references an unknown router scene".into(),
+                data: Some(json!({
+                    "reason": "unknown_router_scene",
+                    "member_index": index,
+                    "scene_id": id,
+                })),
+            });
+        }
+        if let Some(id) = member
+            .overlay_ids
+            .iter()
+            .find(|id| !overlay_ids.contains(id))
+        {
+            return Err(RpcError {
+                code: error_code::INVALID_PARAMS,
+                message: "profile bundle references an unknown router overlay".into(),
+                data: Some(json!({
+                    "reason": "unknown_router_overlay",
+                    "member_index": index,
+                    "overlay_id": id,
+                })),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn profile_bundle_error(error: &yash_app_events_profile::ProfileBundleError) -> RpcError {
+    RpcError {
+        code: error_code::INVALID_PARAMS,
+        message: "invalid profile bundle".into(),
+        data: Some(json!({"reason": "invalid_bundle", "detail": error.to_string()})),
+    }
+}
+
+fn bundle_profile_reference_error(
+    index: usize,
+    member: &ProfileBundleMember,
+    detail: &str,
+) -> RpcError {
+    RpcError {
+        code: error_code::INVALID_PARAMS,
+        message: "profile bundle references an unavailable profile".into(),
+        data: Some(json!({
+            "reason": "profile_reference_invalid",
+            "member_index": index,
+            "profile_id": member.profile_id,
+            "detail": detail,
+        })),
+    }
+}
+
+fn remaining_analysis_timeout(started: Instant, timeout_ms: u64) -> Result<u64, RpcError> {
+    let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    timeout_ms
+        .checked_sub(elapsed)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            RpcError::new(
+                error_code::INTERNAL_ERROR,
+                "image analysis timed out before the selected profile could run",
+            )
+        })
+}
+
+#[derive(Debug)]
+struct BundleAnalysisContext {
+    scene_id: Option<SceneId>,
+    scene_status: String,
+    overlay_ids: Vec<OverlayId>,
+}
+
+fn bundle_analysis_context(result: &Value) -> BundleAnalysisContext {
+    let scene = result.get("scene").unwrap_or(&Value::Null);
+    let scene_status = scene
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let scene_id = (scene_status == "recognized")
+        .then(|| scene.get("id"))
+        .flatten()
+        .and_then(|value| serde_json::from_value::<SceneId>(value.clone()).ok());
+    let overlay_ids = result
+        .get("overlays")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|overlay| overlay.get("id"))
+        .filter_map(|id| serde_json::from_value::<OverlayId>(id.clone()).ok())
+        .collect();
+    BundleAnalysisContext {
+        scene_id,
+        scene_status,
+        overlay_ids,
+    }
+}
+
+fn bundle_member_matches(member: &ProfileBundleMember, context: &BundleAnalysisContext) -> bool {
+    let scene_matches = member.scene_ids.is_empty()
+        || context
+            .scene_id
+            .is_some_and(|scene_id| member.scene_ids.contains(&scene_id));
+    let overlay_matches = member.overlay_ids.is_empty()
+        || member
+            .overlay_ids
+            .iter()
+            .any(|overlay_id| context.overlay_ids.contains(overlay_id));
+    scene_matches && overlay_matches
+}
+
+fn bundle_member_specificity(member: &ProfileBundleMember) -> usize {
+    usize::from(!member.scene_ids.is_empty()) + usize::from(!member.overlay_ids.is_empty())
+}
+
+fn select_profile_bundle_member(
+    bundle: &ProfileBundle,
+    context: &BundleAnalysisContext,
+) -> Option<(usize, bool)> {
+    let mut best: Option<(usize, bool)> = None;
+    for (index, member) in bundle.members.iter().enumerate() {
+        if member.fallback || !bundle_member_matches(member, context) {
+            continue;
+        }
+        let replace = best.is_none_or(|(best_index, _)| {
+            let best_member = &bundle.members[best_index];
+            member.priority > best_member.priority
+                || (member.priority == best_member.priority
+                    && (bundle_member_specificity(member) > bundle_member_specificity(best_member)
+                        || (bundle_member_specificity(member)
+                            == bundle_member_specificity(best_member)
+                            && index < best_index)))
+        });
+        if replace {
+            best = Some((index, false));
+        }
+    }
+    best.or_else(|| {
+        bundle
+            .members
+            .iter()
+            .position(|member| member.fallback)
+            .map(|index| (index, true))
+    })
+}
+
+fn bundle_selection_value(
+    bundle: &ProfileBundle,
+    router: &Profile,
+    context: &BundleAnalysisContext,
+    selected: Option<(usize, ProfileId)>,
+    fallback: bool,
+) -> Value {
+    let status = selected.map_or_else(
+        || {
+            if context.scene_id.is_some() {
+                "no_match"
+            } else {
+                "unresolved"
+            }
+        },
+        |(_, _)| if fallback { "fallback" } else { "selected" },
+    );
+    json!({
+        "mode": "profile_bundle",
+        "bundle_name": bundle.name,
+        "status": status,
+        "router_profile_id": router.id,
+        "router_profile_revision": router.revision,
+        "route_index": selected.map(|(index, _)| index),
+        "selected_profile_id": selected.map(|(_, profile_id)| profile_id),
+        "router_scene_status": context.scene_status,
+        "matched_scene_id": context.scene_id,
+        "matched_overlay_ids": context.overlay_ids,
+    })
+}
+
+fn with_bundle_selection(mut result: Value, selection: Value) -> Result<Value, RpcError> {
+    result
+        .as_object_mut()
+        .ok_or_else(|| internal_error("analysis result is not a JSON object"))?
+        .insert("profile_selection".into(), selection);
+    Ok(result)
+}
+
+struct AnalysisContextResolution {
+    hints: SceneResolutionHints,
+    report: Value,
+}
+
+#[allow(clippy::too_many_lines)]
+fn analysis_context_for_profile(
+    profile: &Profile,
+    context: Option<&AnalysisContext>,
+) -> AnalysisContextResolution {
+    let Some(context) = context else {
+        return AnalysisContextResolution {
+            hints: SceneResolutionHints::default(),
+            report: json!({
+                "strategy": "soft_prior",
+                "status": "none",
+                "candidate_scope": "full_profile",
+                "fallback": "full_profile",
+                "preferred_scene_ids": [],
+                "preferred_overlay_ids": [],
+                "preferred_scene_names": [],
+                "preferred_overlay_names": [],
+                "ignored_reasons": [],
+            }),
+        };
+    };
+
+    let mut preferred_scene_ids = Vec::new();
+    let mut preferred_overlay_ids = Vec::new();
+    let mut preferred_scene_names = Vec::new();
+    let mut preferred_overlay_names = Vec::new();
+    let mut ignored_reasons = Vec::new();
+    let expected_scene_ids = if context.expected_scene_ids.len() <= MAX_ANALYSIS_CONTEXT_IDS {
+        context.expected_scene_ids.as_slice()
+    } else {
+        ignored_reasons.push("too_many_expected_scene_ids");
+        &[]
+    };
+    let expected_overlay_ids = if context.expected_overlay_ids.len() <= MAX_ANALYSIS_CONTEXT_IDS {
+        context.expected_overlay_ids.as_slice()
+    } else {
+        ignored_reasons.push("too_many_expected_overlay_ids");
+        &[]
+    };
+    let expected_scene_names = if context.expected_scene_names.len() <= MAX_ANALYSIS_CONTEXT_IDS {
+        context.expected_scene_names.as_slice()
+    } else {
+        ignored_reasons.push("too_many_expected_scene_names");
+        &[]
+    };
+    let expected_overlay_names = if context.expected_overlay_names.len() <= MAX_ANALYSIS_CONTEXT_IDS
+    {
+        context.expected_overlay_names.as_slice()
+    } else {
+        ignored_reasons.push("too_many_expected_overlay_names");
+        &[]
+    };
+
+    for scene_id in expected_scene_ids {
+        if profile
+            .scenes
+            .iter()
+            .any(|scene| scene.enabled && scene.id == *scene_id)
+        {
+            push_unique(&mut preferred_scene_ids, *scene_id);
+        } else {
+            ignored_reasons.push("expected_scene_not_in_profile");
+        }
+    }
+    for scene_name in expected_scene_names {
+        if let Some(scene) = profile
+            .scenes
+            .iter()
+            .find(|scene| scene.enabled && scene.name == scene_name.as_str())
+        {
+            push_unique(&mut preferred_scene_ids, scene.id);
+            push_unique(&mut preferred_scene_names, scene.name.clone());
+        } else {
+            ignored_reasons.push("expected_scene_name_not_in_profile");
+        }
+    }
+    for overlay_id in expected_overlay_ids {
+        if profile
+            .overlays
+            .iter()
+            .any(|overlay| overlay.enabled && overlay.id == *overlay_id)
+        {
+            push_unique(&mut preferred_overlay_ids, *overlay_id);
+        } else {
+            ignored_reasons.push("expected_overlay_not_in_profile");
+        }
+    }
+    for overlay_name in expected_overlay_names {
+        if let Some(overlay) = profile
+            .overlays
+            .iter()
+            .find(|overlay| overlay.enabled && overlay.name == overlay_name.as_str())
+        {
+            push_unique(&mut preferred_overlay_ids, overlay.id);
+            push_unique(&mut preferred_overlay_names, overlay.name.clone());
+        } else {
+            ignored_reasons.push("expected_overlay_name_not_in_profile");
+        }
+    }
+
+    let previous_is_usable = context.previous.as_ref().is_some_and(|previous| {
+        let mut usable = true;
+        if previous
+            .profile_id
+            .is_some_and(|profile_id| profile_id != profile.id)
+        {
+            ignored_reasons.push("previous_profile_mismatch");
+            usable = false;
+        }
+        if previous
+            .profile_revision
+            .is_some_and(|revision| revision != profile.revision)
+        {
+            ignored_reasons.push("previous_profile_revision_mismatch");
+            usable = false;
+        }
+        if previous
+            .age_ms
+            .is_some_and(|age_ms| age_ms > MAX_ANALYSIS_CONTEXT_AGE_MS)
+        {
+            ignored_reasons.push("previous_context_stale");
+            usable = false;
+        }
+        if previous
+            .frame_sha256
+            .as_deref()
+            .is_some_and(|hash| !is_sha256(hash))
+        {
+            ignored_reasons.push("previous_frame_hash_invalid");
+            usable = false;
+        }
+        usable
+    });
+
+    if previous_is_usable {
+        if let Some(previous) = context.previous.as_ref() {
+            if let Some(scene_id) = previous.scene_id {
+                if let Some(scene) = profile
+                    .scenes
+                    .iter()
+                    .find(|scene| scene.enabled && scene.id == scene_id)
+                {
+                    // Keep the previous screen first for an unchanged frame,
+                    // then prefer the profile-declared outgoing transitions.
+                    push_unique(&mut preferred_scene_ids, scene.id);
+                    push_unique(&mut preferred_scene_names, scene.name.clone());
+                    for transition_id in &scene.transition_hints {
+                        if profile
+                            .scenes
+                            .iter()
+                            .any(|candidate| candidate.enabled && candidate.id == *transition_id)
+                        {
+                            push_unique(&mut preferred_scene_ids, *transition_id);
+                            if let Some(transition) = profile.scenes.iter().find(|candidate| {
+                                candidate.enabled && candidate.id == *transition_id
+                            }) {
+                                push_unique(&mut preferred_scene_names, transition.name.clone());
+                            }
+                        }
+                    }
+                } else {
+                    ignored_reasons.push("previous_scene_not_in_profile");
+                }
+            }
+            if previous.overlay_ids.len() <= MAX_ANALYSIS_CONTEXT_IDS {
+                for overlay_id in &previous.overlay_ids {
+                    if profile
+                        .overlays
+                        .iter()
+                        .any(|overlay| overlay.enabled && overlay.id == *overlay_id)
+                    {
+                        push_unique(&mut preferred_overlay_ids, *overlay_id);
+                        if let Some(overlay) = profile
+                            .overlays
+                            .iter()
+                            .find(|candidate| candidate.enabled && candidate.id == *overlay_id)
+                        {
+                            push_unique(&mut preferred_overlay_names, overlay.name.clone());
+                        }
+                    } else {
+                        ignored_reasons.push("previous_overlay_not_in_profile");
+                    }
+                }
+            } else {
+                ignored_reasons.push("too_many_previous_overlay_ids");
+            }
+        }
+    }
+
+    let status = if preferred_scene_ids.is_empty() && preferred_overlay_ids.is_empty() {
+        "ignored"
+    } else {
+        "applied"
+    };
+    let previous_frame_sha256 = context
+        .previous
+        .as_ref()
+        .and_then(|previous| previous.frame_sha256.as_deref());
+    AnalysisContextResolution {
+        hints: SceneResolutionHints {
+            preferred_scene_ids: preferred_scene_ids.clone(),
+            preferred_overlay_ids: preferred_overlay_ids.clone(),
+        },
+        report: json!({
+            "strategy": "soft_prior",
+            "status": status,
+            "candidate_scope": "full_profile",
+            "fallback": "full_profile",
+            "preferred_scene_ids": preferred_scene_ids,
+            "preferred_overlay_ids": preferred_overlay_ids,
+            "preferred_scene_names": preferred_scene_names,
+            "preferred_overlay_names": preferred_overlay_names,
+            "previous_frame_sha256": previous_frame_sha256,
+            "ignored_reasons": ignored_reasons,
+        }),
+    }
+}
+
+fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3289,6 +4137,7 @@ fn analyze_image_with_profile(
     directory: &Path,
     path: &Path,
     timeout_ms: u64,
+    context: Option<&AnalysisContext>,
 ) -> Result<Value, RpcError> {
     let started = Instant::now();
     let image = decode_suite_png(path)?;
@@ -3308,22 +4157,20 @@ fn analyze_image_with_profile(
     )
     .map_err(internal_error)?;
     let mut pipeline = build_profile_pipeline(profile.clone(), directory, 10)?;
-    let mut processed = Vec::new();
+    let mut processed = if pipeline.scene_model_enabled {
+        pipeline.process_anchor_detectors(&frame)?.0
+    } else {
+        pipeline.process_all_detectors(&frame)?
+    };
     let mut observations = HashMap::new();
-    for (element_id, processor) in pipeline.processor_ids.iter().zip(&mut pipeline.processors) {
-        if pipeline.scene_model_enabled && !pipeline.anchor_ids.contains(element_id) {
-            continue;
-        }
-        if started.elapsed() > Duration::from_millis(timeout_ms) {
-            return Err(RpcError::new(
-                error_code::INTERNAL_ERROR,
-                "image analysis timed out",
-            ));
-        }
-        if let Some(item) = processor.process(&frame) {
-            observations.insert(item.observation.element_id, item.observation.clone());
-            processed.push(item);
-        }
+    for item in &processed {
+        observations.insert(item.observation.element_id, item.observation.clone());
+    }
+    if started.elapsed() > Duration::from_millis(timeout_ms) {
+        return Err(RpcError::new(
+            error_code::INTERNAL_ERROR,
+            "image analysis timed out",
+        ));
     }
     let samples = profile
         .scenes
@@ -3337,6 +4184,7 @@ fn analyze_image_with_profile(
         )
         .max()
         .unwrap_or(1);
+    let context_resolution = analysis_context_for_profile(profile, context);
     let mut resolver = SceneResolver::new(profile.scenes.clone(), profile.overlays.clone());
     let mut resolution = SceneResolution {
         scene: None,
@@ -3346,26 +4194,22 @@ fn analyze_image_with_profile(
         overlay_candidates: Vec::new(),
     };
     for _ in 0..samples {
-        resolution = resolver.resolve(&observations);
+        resolution = resolver.resolve_with_hints(&observations, Some(&context_resolution.hints));
     }
     let active_element_ids = active_element_ids(profile, &resolution);
     if pipeline.scene_model_enabled {
-        for (element_id, processor) in pipeline.processor_ids.iter().zip(&mut pipeline.processors) {
-            if pipeline.anchor_ids.contains(element_id) || !active_element_ids.contains(element_id)
-            {
-                continue;
-            }
-            if started.elapsed() > Duration::from_millis(timeout_ms) {
-                return Err(RpcError::new(
-                    error_code::INTERNAL_ERROR,
-                    "image analysis timed out",
-                ));
-            }
-            if let Some(item) = processor.process(&frame) {
-                observations.insert(item.observation.element_id, item.observation.clone());
-                processed.push(item);
-            }
+        pipeline.release_inactive_contextual(&active_element_ids);
+        let contextual = pipeline.process_context_detectors(&frame, &active_element_ids)?;
+        for item in contextual {
+            observations.insert(item.observation.element_id, item.observation.clone());
+            processed.push(item);
         }
+    }
+    if started.elapsed() > Duration::from_millis(timeout_ms) {
+        return Err(RpcError::new(
+            error_code::INTERNAL_ERROR,
+            "image analysis timed out",
+        ));
     }
     let mut serialized_observations = observations
         .iter()
@@ -3478,7 +4322,11 @@ fn analyze_image_with_profile(
                 .visibility
                 .as_ref()
                 .map(|expression| recognition_confidence(expression, &observations));
-            if visibility_confidence == Some(Some(0.0)) {
+            let visibility_matches = target
+                .visibility
+                .as_ref()
+                .map(|expression| recognition_matches(expression, &observations));
+            if visibility_matches == Some(Some(false)) {
                 return None;
             }
             let scene_id = resolution.scene.as_ref().and_then(|active| {
@@ -3507,7 +4355,7 @@ fn analyze_image_with_profile(
                     })
                     .map(|overlay| overlay.id)
             });
-            if visibility_confidence == Some(None) {
+            if visibility_matches == Some(None) {
                 if target.required_for_json {
                     missing_required_elements.push(target.name.clone());
                     suggested_crops.push(json!({
@@ -3645,6 +4493,7 @@ fn analyze_image_with_profile(
         "scene_ambiguous": resolution.ambiguous,
         "elements": elements,
         "derived_observations": derived_observations,
+        "analysis_context": context_resolution.report,
         "interaction_targets": interaction_targets,
         "analysis": {
             "evaluated_detectors":processed.len(),
@@ -3770,8 +4619,15 @@ fn active_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSe
     for expression in profile
         .scenes
         .iter()
+        .filter(|scene| scene.enabled)
         .map(|scene| &scene.recognition)
-        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+        .chain(
+            profile
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.enabled)
+                .map(|overlay| &overlay.recognition),
+        )
     {
         let conditions = match expression {
             yash_app_events_profile::RecognitionExpression::All { conditions }
@@ -3782,6 +4638,7 @@ fn active_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSe
     if let Some(active) = &resolution.scene {
         if let Some(scene) = profile.scenes.iter().find(|scene| scene.id == active.id) {
             ids.extend(scene.element_ids.iter().copied());
+            ids.extend(scene.required_element_ids.iter().copied());
         }
     }
     for active in &resolution.overlays {
@@ -3791,18 +4648,37 @@ fn active_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSe
             .find(|overlay| overlay.id == active.id)
         {
             ids.extend(overlay.element_ids.iter().copied());
+            ids.extend(overlay.required_element_ids.iter().copied());
         }
     }
     for target in active_interaction_targets(profile, resolution) {
         if let Some(visibility) = &target.visibility {
-            let conditions = match visibility {
-                yash_app_events_profile::RecognitionExpression::All { conditions }
-                | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
-            };
-            ids.extend(conditions.iter().map(|condition| condition.element_id));
+            ids.extend(recognition_element_ids(visibility));
         }
     }
     ids
+}
+
+fn recognition_element_ids(
+    expression: &yash_app_events_profile::RecognitionExpression,
+) -> impl Iterator<Item = ElementId> + '_ {
+    match expression {
+        yash_app_events_profile::RecognitionExpression::All { conditions }
+        | yash_app_events_profile::RecognitionExpression::Any { conditions } => {
+            conditions.iter().map(|condition| condition.element_id)
+        }
+    }
+}
+
+fn extend_target_visibility_dependencies(
+    ids: &mut HashSet<ElementId>,
+    targets: &[yash_app_events_profile::InteractionTarget],
+) {
+    for target in targets {
+        if let Some(visibility) = &target.visibility {
+            ids.extend(recognition_element_ids(visibility));
+        }
+    }
 }
 
 fn required_element_ids(profile: &Profile, resolution: &SceneResolution) -> HashSet<ElementId> {
@@ -3858,8 +4734,15 @@ fn anchor_crops(profile: &Profile, width: u32, height: u32) -> Result<Vec<Value>
     let anchor_ids = profile
         .scenes
         .iter()
+        .filter(|scene| scene.enabled)
         .map(|scene| &scene.recognition)
-        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
+        .chain(
+            profile
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.enabled)
+                .map(|overlay| &overlay.recognition),
+        )
         .flat_map(|expression| match expression {
             yash_app_events_profile::RecognitionExpression::All { conditions }
             | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
@@ -3937,100 +4820,53 @@ fn blit_scaled(
     Ok(())
 }
 
-fn replay_png_frames(directory: &Path, paths: &[PathBuf]) -> Result<Vec<Arc<Frame>>, RpcError> {
-    paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| {
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
-            {
-                return Err(RpcError::new(
-                    error_code::INVALID_PARAMS,
-                    "replay image path must be profile-relative without parent traversal",
-                ));
-            }
-            let path = directory.join(path);
-            let metadata = fs::metadata(&path).map_err(internal_error)?;
-            if metadata.len() > 16 * 1024 * 1024 {
-                return Err(RpcError::new(
-                    error_code::INVALID_PARAMS,
-                    "replay PNG exceeds 16 MiB",
-                ));
-            }
-            let decoder = png::Decoder::new(std::io::BufReader::new(
-                fs::File::open(path).map_err(internal_error)?,
+/// Decodes only the frame being consumed, without retaining the image sequence.
+fn replay_png_frames<'a>(
+    directory: &'a Path,
+    paths: &'a [PathBuf],
+) -> impl Iterator<Item = Result<Arc<Frame>, RpcError>> + 'a {
+    paths.iter().enumerate().map(move |(index, path)| {
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "replay image path must be profile-relative without parent traversal",
             ));
-            let mut reader = decoder.read_info().map_err(internal_error)?;
-            let mut output = vec![
-                0;
-                reader.output_buffer_size().ok_or_else(|| RpcError::new(
-                    error_code::INVALID_PARAMS,
-                    "replay PNG exceeds decoder limits",
-                ))?
-            ];
-            let info = reader.next_frame(&mut output).map_err(internal_error)?;
-            if info.width == 0
-                || info.height == 0
-                || info.width > 4_096
-                || info.height > 4_096
-                || info.bit_depth != png::BitDepth::Eight
-            {
-                return Err(RpcError::new(
-                    error_code::INVALID_PARAMS,
-                    "replay PNG must be 8-bit and no larger than 4096x4096",
-                ));
-            }
-            let data = &output[..info.buffer_size()];
-            let (format, pixels): (PixelFormat, Vec<u8>) = match info.color_type {
-                png::ColorType::Rgb => (PixelFormat::Rgb8, data.to_vec()),
-                png::ColorType::Rgba => (PixelFormat::Rgba8, data.to_vec()),
-                png::ColorType::Grayscale => (
-                    PixelFormat::Rgb8,
-                    data.iter()
-                        .flat_map(|value| [*value, *value, *value])
-                        .collect(),
-                ),
-                _ => {
-                    return Err(RpcError::new(
-                        error_code::INVALID_PARAMS,
-                        "replay PNG must use grayscale, RGB, or RGBA pixels",
-                    ))
-                }
-            };
-            let sequence = u64::try_from(index).unwrap_or(u64::MAX);
-            Frame::new(
-                sequence,
-                Duration::from_millis(sequence.saturating_mul(100)),
-                FrameLayout {
-                    width: info.width,
-                    height: info.height,
-                    row_stride: usize::try_from(info.width)
-                        .unwrap_or(usize::MAX)
-                        .saturating_mul(format.bytes_per_pixel()),
-                    format,
-                },
-                Some("image-replay".into()),
-                Arc::from(pixels),
-            )
-            .map(Arc::new)
-            .map_err(internal_error)
-        })
-        .collect()
+        }
+        let image = decode_suite_png(&directory.join(path))?;
+        let sequence = u64::try_from(index).unwrap_or(u64::MAX);
+        Frame::new(
+            sequence,
+            Duration::from_millis(sequence.saturating_mul(100)),
+            FrameLayout {
+                width: image.width,
+                height: image.height,
+                row_stride: usize::try_from(image.width)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(4),
+                format: PixelFormat::Rgba8,
+            },
+            Some("image-replay".into()),
+            Arc::from(image.pixels),
+        )
+        .map(Arc::new)
+        .map_err(internal_error)
+    })
 }
 
-fn replay_fixture_frames(
-    detector: &ProfileDetector,
-    directory: &Path,
-    values: &[u8],
-) -> Result<Vec<Arc<Frame>>, RpcError> {
+fn replay_fixture_frames<'a>(
+    detector: &'a ProfileDetector,
+    directory: &'a Path,
+    values: &'a [u8],
+) -> impl Iterator<Item = Result<Arc<Frame>, RpcError>> + 'a {
     values
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, value)| {
+        .map(move |(index, value)| {
             let sequence = u64::try_from(index).unwrap_or(u64::MAX);
             match detector {
                 ProfileDetector::ColorBar {
@@ -4075,7 +4911,6 @@ fn replay_fixture_frames(
                 )),
             }
         })
-        .collect()
 }
 
 const fn full_frame_region() -> NormalizedRegion {
@@ -4547,9 +5382,17 @@ async fn select_capture(
             .ok()
             .and_then(|settings| settings.active_profile)
     });
-    let live_pipeline = profile_id
-        .map(|profile_id| build_live_pipeline(state, profile_id))
-        .transpose()?;
+    let live_pipeline = if let Some(profile_id) = profile_id {
+        let worker_state = Arc::clone(state);
+        Some(
+            run_image_work(state, move || {
+                build_live_pipeline(&worker_state, profile_id)
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
     let restore_token = profile_id
         .map(|profile_id| state.local_config.capture_binding(profile_id))
         .transpose()
@@ -4969,8 +5812,10 @@ fn process_running(needle: &str) -> bool {
 
 #[derive(Debug)]
 struct LivePipeline {
-    processors: Vec<FrameProcessor<ConfiguredDetector, NoopRule>>,
+    processors: Vec<LazyProcessor>,
     processor_ids: Vec<ElementId>,
+    directory: PathBuf,
+    analysis_fps: u8,
     anchor_ids: HashSet<ElementId>,
     scene_elements: HashMap<SceneId, HashSet<ElementId>>,
     overlay_elements: HashMap<OverlayId, HashSet<ElementId>>,
@@ -4996,32 +5841,16 @@ struct LivePipeline {
 }
 
 impl LivePipeline {
-    fn process_scene_aware(&mut self, frame: &Frame) -> Vec<ProcessedFrame> {
+    fn process_scene_aware(&mut self, frame: &Frame) -> Result<Vec<ProcessedFrame>, RpcError> {
         if !self.scene_model_enabled {
-            let processed = self
-                .processors
-                .iter_mut()
-                .filter_map(|processor| processor.process(frame))
-                .collect::<Vec<_>>();
+            let processed = self.process_all_detectors(frame)?;
             self.last_evaluated_detectors = processed.len();
             self.last_gated_detectors = 0;
             self.last_throttled_detectors = self.processors.len().saturating_sub(processed.len());
-            return processed;
+            return Ok(processed);
         }
 
-        let mut processed = Vec::new();
-        let mut anchors_updated = false;
-        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
-            if !self.anchor_ids.contains(element_id) {
-                continue;
-            }
-            if let Some(item) = processor.process(frame) {
-                self.latest_anchors
-                    .insert(item.observation.element_id, item.observation.clone());
-                processed.push(item);
-                anchors_updated = true;
-            }
-        }
+        let (mut processed, anchors_updated) = self.process_anchor_detectors(frame)?;
         if anchors_updated || !self.scene_resolution_initialized {
             self.scene_resolution = self.scene_resolver.resolve(&self.latest_anchors);
             self.scene_resolution_initialized = true;
@@ -5038,14 +5867,8 @@ impl LivePipeline {
                 active.extend(elements);
             }
         }
-        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
-            if self.anchor_ids.contains(element_id) || !active.contains(element_id) {
-                continue;
-            }
-            if let Some(item) = processor.process(frame) {
-                processed.push(item);
-            }
-        }
+        self.release_inactive_contextual(&active);
+        processed.extend(self.process_context_detectors(frame, &active)?);
         let eligible_detectors = self
             .processor_ids
             .iter()
@@ -5054,7 +5877,62 @@ impl LivePipeline {
         self.last_evaluated_detectors = processed.len();
         self.last_gated_detectors = self.processors.len().saturating_sub(eligible_detectors);
         self.last_throttled_detectors = eligible_detectors.saturating_sub(processed.len());
-        processed
+        Ok(processed)
+    }
+
+    fn process_all_detectors(&mut self, frame: &Frame) -> Result<Vec<ProcessedFrame>, RpcError> {
+        let mut processed = Vec::new();
+        for processor in &mut self.processors {
+            if let Some(item) = processor.process(frame, &self.directory, self.analysis_fps)? {
+                processed.push(item);
+            }
+        }
+        Ok(processed)
+    }
+
+    fn process_anchor_detectors(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<(Vec<ProcessedFrame>, bool), RpcError> {
+        let mut processed = Vec::new();
+        let mut anchors_updated = false;
+        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
+            if !self.anchor_ids.contains(element_id) {
+                continue;
+            }
+            if let Some(item) = processor.process(frame, &self.directory, self.analysis_fps)? {
+                self.latest_anchors
+                    .insert(item.observation.element_id, item.observation.clone());
+                processed.push(item);
+                anchors_updated = true;
+            }
+        }
+        Ok((processed, anchors_updated))
+    }
+
+    fn release_inactive_contextual(&mut self, active: &HashSet<ElementId>) {
+        for processor in &mut self.processors {
+            if !self.anchor_ids.contains(&processor.id) && !active.contains(&processor.id) {
+                processor.release();
+            }
+        }
+    }
+
+    fn process_context_detectors(
+        &mut self,
+        frame: &Frame,
+        active: &HashSet<ElementId>,
+    ) -> Result<Vec<ProcessedFrame>, RpcError> {
+        let mut processed = Vec::new();
+        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
+            if self.anchor_ids.contains(element_id) || !active.contains(element_id) {
+                continue;
+            }
+            if let Some(item) = processor.process(frame, &self.directory, self.analysis_fps)? {
+                processed.push(item);
+            }
+        }
+        Ok(processed)
     }
 }
 
@@ -5177,17 +6055,8 @@ fn build_profile_pipeline(
         .elements
         .iter()
         .filter(|element| element.enabled)
-        .map(|element| {
-            Ok(FrameProcessor::new(
-                AnalysisScheduler::new(analysis_fps).map_err(internal_error)?,
-                configured_detector(&element.detector, directory)?,
-                element.region,
-                detector_id(&element.detector),
-                element.id,
-                NoopRule,
-            ))
-        })
-        .collect::<Result<Vec<_>, RpcError>>()?;
+        .map(LazyProcessor::new)
+        .collect::<Vec<_>>();
     if processors.is_empty() {
         return Err(RpcError::new(
             error_code::INVALID_PARAMS,
@@ -5197,13 +6066,16 @@ fn build_profile_pipeline(
     let recognition_ids = profile
         .scenes
         .iter()
+        .filter(|scene| scene.enabled)
         .map(|scene| &scene.recognition)
-        .chain(profile.overlays.iter().map(|overlay| &overlay.recognition))
-        .flat_map(|expression| match expression {
-            yash_app_events_profile::RecognitionExpression::All { conditions }
-            | yash_app_events_profile::RecognitionExpression::Any { conditions } => conditions,
-        })
-        .map(|condition| condition.element_id);
+        .chain(
+            profile
+                .overlays
+                .iter()
+                .filter(|overlay| overlay.enabled)
+                .map(|overlay| &overlay.recognition),
+        )
+        .flat_map(recognition_element_ids);
     let anchor_ids = profile
         .global_elements
         .iter()
@@ -5213,14 +6085,31 @@ fn build_profile_pipeline(
     let scene_elements = profile
         .scenes
         .iter()
-        .map(|scene| (scene.id, scene.element_ids.iter().copied().collect()))
+        .map(|scene| {
+            let mut ids = scene.element_ids.iter().copied().collect::<HashSet<_>>();
+            ids.extend(scene.required_element_ids.iter().copied());
+            extend_target_visibility_dependencies(&mut ids, &scene.interaction_targets);
+            (scene.id, ids)
+        })
         .collect();
     let overlay_elements = profile
         .overlays
         .iter()
-        .map(|overlay| (overlay.id, overlay.element_ids.iter().copied().collect()))
+        .map(|overlay| {
+            let mut ids = overlay.element_ids.iter().copied().collect::<HashSet<_>>();
+            ids.extend(overlay.required_element_ids.iter().copied());
+            extend_target_visibility_dependencies(&mut ids, &overlay.interaction_targets);
+            (overlay.id, ids)
+        })
         .collect();
     let scene_model_enabled = !profile.scenes.is_empty() || !profile.overlays.is_empty();
+    let eager_all = !scene_model_enabled;
+    let mut processors = processors;
+    for processor in &mut processors {
+        if eager_all || anchor_ids.contains(&processor.id) {
+            processor.prewarm(directory, analysis_fps)?;
+        }
+    }
     let scene_resolver = SceneResolver::new(profile.scenes.clone(), profile.overlays.clone());
     let scene_resolution = SceneResolution {
         scene: None,
@@ -5237,6 +6126,8 @@ fn build_profile_pipeline(
     Ok(LivePipeline {
         processors,
         processor_ids,
+        directory: directory.to_path_buf(),
+        analysis_fps,
         anchor_ids,
         scene_elements,
         overlay_elements,
@@ -5409,81 +6300,21 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
                     let Some(frame) = task_state.latest_frame.latest() else { continue; };
                     if last_sequence == Some(frame.sequence) { continue; }
                     last_sequence = Some(frame.sequence);
-                    let started = Instant::now();
-                    let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
-                    let mut collection_observations = BTreeMap::new();
-                    let mut collection_transitions = Vec::new();
-                    let processed_frames = pipeline.process_scene_aware(&frame);
-                    publication.context = json!({
-                        "scene": pipeline.scene_resolution.scene,
-                        "overlays": pipeline.scene_resolution.overlays,
-                        "ambiguous": pipeline.scene_resolution.ambiguous,
-                        "candidates": pipeline.scene_resolution.candidates,
-                        "overlay_candidates": pipeline.scene_resolution.overlay_candidates,
-                        "detectors": {
-                            "evaluated":pipeline.last_evaluated_detectors,
-                            "gated":pipeline.last_gated_detectors,
-                            "throttled":pipeline.last_throttled_detectors,
-                        },
-                    });
-                    let current_scene = pipeline.scene_resolution.scene.as_ref().map(|scene| scene.id);
-                    let current_overlays = pipeline.scene_resolution.overlays.iter().map(|overlay| overlay.id).collect::<HashSet<_>>();
-                    if current_scene != pipeline.published_scene || current_overlays != pipeline.published_overlays {
-                        if let Err(error) = publish_context_transition(
-                            &task_state,
-                            &pipeline.profile_id,
-                            &pipeline.game,
-                            pipeline.published_scene,
-                            &pipeline.published_overlays,
-                            &pipeline.scene_resolution,
-                            Utc::now(),
-                        ) {
-                            set_output_error(&task_state, &format!("{}: {}", error.code, error.message));
+                    let worker_state = Arc::clone(&task_state);
+                    let result = tokio::task::spawn_blocking(move || {
+                        process_live_frame(&worker_state, &mut pipeline, &mut publication, &frame);
+                        (pipeline, publication)
+                    }).await;
+                    match result {
+                        Ok((next_pipeline, next_publication)) => {
+                            pipeline = next_pipeline;
+                            publication = next_publication;
                         }
-                        pipeline.published_scene = current_scene;
-                        pipeline.published_overlays = current_overlays;
-                    }
-                    for processed in processed_frames {
-                        if let Some(alias) = pipeline.collection_aliases.get(&processed.observation.element_id) {
-                            collection_observations.insert(alias.clone(), processed.observation.clone());
-                        }
-                        let observation_timestamp_ms = processed.observation.timestamp_ms;
-                        update_analysis_metrics(&task_state.analysis_metrics, started.elapsed(), processed.observation.status == yash_app_events_engine::ObservationStatus::Error);
-                        let transitions: Vec<_> = pipeline.rules.iter_mut().filter_map(|rule| rule.observe(&processed.observation)).collect();
-                        collection_transitions.extend(transitions.iter().cloned());
-                        if transitions.is_empty() {
-                            if let Err(error) = publish_processed(&task_state,processed,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
-                        } else {
-                            for transition in transitions {
-                                let publication_item = ProcessedFrame { observation: processed.observation.clone(), transition: Some(transition) };
-                                if let Err(error) = publish_processed(&task_state,publication_item,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
-                            }
-                        }
-                        for derived in &pipeline.derived {
-                            let Some(observation) = compose_observation(derived, &publication.observations, observation_timestamp_ms) else { continue; };
-                            if let Some(alias) = pipeline.collection_aliases.get(&observation.element_id) {
-                                collection_observations.insert(alias.clone(), observation.clone());
-                            }
-                            let transitions: Vec<_> = pipeline.rules.iter_mut().filter_map(|rule| rule.observe(&observation)).collect();
-                            collection_transitions.extend(transitions.iter().cloned());
-                            if transitions.is_empty() {
-                                let item = ProcessedFrame { observation, transition: None };
-                                if let Err(error) = publish_processed(&task_state,item,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
-                            } else {
-                                for transition in transitions {
-                                    let item = ProcessedFrame { observation: observation.clone(), transition: Some(transition) };
-                                    if let Err(error) = publish_processed(&task_state,item,&pipeline.profile_id,&pipeline.game,Utc::now(),capture.clone(),&mut publication) { set_output_error(&task_state,&format!("{}: {}",error.code,error.message)); }
-                                }
-                            }
+                        Err(error) => {
+                            set_output_error(&task_state, &error.to_string());
+                            break;
                         }
                     }
-                    schedule_collection(
-                        &task_state,
-                        &pipeline,
-                        Arc::clone(&frame),
-                        collection_observations,
-                        collection_transitions,
-                    );
                 }
             }
         }
@@ -5492,6 +6323,183 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
         .analysis
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LiveAnalysis { stop, task });
+}
+
+#[allow(clippy::too_many_lines)]
+fn process_live_frame(
+    state: &Arc<State>,
+    pipeline: &mut LivePipeline,
+    publication: &mut PublicationState,
+    frame: &Arc<Frame>,
+) {
+    let started = Instant::now();
+    let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
+    let mut collection_observations = BTreeMap::new();
+    let mut collection_transitions = Vec::new();
+    let processed_frames = match pipeline.process_scene_aware(frame) {
+        Ok(processed_frames) => processed_frames,
+        Err(error) => {
+            set_output_error(state, &format!("{}: {}", error.code, error.message));
+            return;
+        }
+    };
+    publication.context = json!({
+        "scene": pipeline.scene_resolution.scene,
+        "overlays": pipeline.scene_resolution.overlays,
+        "ambiguous": pipeline.scene_resolution.ambiguous,
+        "candidates": pipeline.scene_resolution.candidates,
+        "overlay_candidates": pipeline.scene_resolution.overlay_candidates,
+        "detectors": {
+            "evaluated":pipeline.last_evaluated_detectors,
+            "gated":pipeline.last_gated_detectors,
+            "throttled":pipeline.last_throttled_detectors,
+        },
+    });
+    let current_scene = pipeline
+        .scene_resolution
+        .scene
+        .as_ref()
+        .map(|scene| scene.id);
+    let current_overlays = pipeline
+        .scene_resolution
+        .overlays
+        .iter()
+        .map(|overlay| overlay.id)
+        .collect::<HashSet<_>>();
+    if current_scene != pipeline.published_scene || current_overlays != pipeline.published_overlays
+    {
+        if let Err(error) = publish_context_transition(
+            state,
+            &pipeline.profile_id,
+            &pipeline.game,
+            pipeline.published_scene,
+            &pipeline.published_overlays,
+            &pipeline.scene_resolution,
+            Utc::now(),
+        ) {
+            set_output_error(state, &format!("{}: {}", error.code, error.message));
+        }
+        pipeline.published_scene = current_scene;
+        pipeline.published_overlays = current_overlays;
+    }
+    for processed in processed_frames {
+        if let Some(alias) = pipeline
+            .collection_aliases
+            .get(&processed.observation.element_id)
+        {
+            collection_observations.insert(alias.clone(), processed.observation.clone());
+        }
+        let observation_timestamp_ms = processed.observation.timestamp_ms;
+        update_analysis_metrics(
+            &state.analysis_metrics,
+            started.elapsed(),
+            processed.observation.status == yash_app_events_engine::ObservationStatus::Error,
+        );
+        let transitions: Vec<_> = pipeline
+            .rules
+            .iter_mut()
+            .filter_map(|rule| rule.observe(&processed.observation))
+            .collect();
+        collection_transitions.extend(transitions.iter().cloned());
+        if transitions.is_empty() {
+            if let Err(error) = publish_processed(
+                state,
+                processed,
+                &pipeline.profile_id,
+                &pipeline.game,
+                Utc::now(),
+                capture.clone(),
+                publication,
+            ) {
+                set_output_error(state, &format!("{}: {}", error.code, error.message));
+            }
+        } else {
+            for transition in transitions {
+                let publication_item = ProcessedFrame {
+                    observation: processed.observation.clone(),
+                    transition: Some(transition),
+                };
+                if let Err(error) = publish_processed(
+                    state,
+                    publication_item,
+                    &pipeline.profile_id,
+                    &pipeline.game,
+                    Utc::now(),
+                    capture.clone(),
+                    publication,
+                ) {
+                    set_output_error(state, &format!("{}: {}", error.code, error.message));
+                }
+            }
+        }
+        for derived in &pipeline.derived {
+            let Some(observation) =
+                compose_observation(derived, &publication.observations, observation_timestamp_ms)
+            else {
+                continue;
+            };
+            if let Some(alias) = pipeline.collection_aliases.get(&observation.element_id) {
+                collection_observations.insert(alias.clone(), observation.clone());
+            }
+            let transitions: Vec<_> = pipeline
+                .rules
+                .iter_mut()
+                .filter_map(|rule| rule.observe(&observation))
+                .collect();
+            collection_transitions.extend(transitions.iter().cloned());
+            if transitions.is_empty() {
+                let item = ProcessedFrame {
+                    observation,
+                    transition: None,
+                };
+                if let Err(error) = publish_processed(
+                    state,
+                    item,
+                    &pipeline.profile_id,
+                    &pipeline.game,
+                    Utc::now(),
+                    capture.clone(),
+                    publication,
+                ) {
+                    set_output_error(state, &format!("{}: {}", error.code, error.message));
+                }
+            } else {
+                for transition in transitions {
+                    let item = ProcessedFrame {
+                        observation: observation.clone(),
+                        transition: Some(transition),
+                    };
+                    if let Err(error) = publish_processed(
+                        state,
+                        item,
+                        &pipeline.profile_id,
+                        &pipeline.game,
+                        Utc::now(),
+                        capture.clone(),
+                        publication,
+                    ) {
+                        set_output_error(state, &format!("{}: {}", error.code, error.message));
+                    }
+                }
+            }
+        }
+    }
+    if let Err(error) = publish_current_state(
+        state,
+        &pipeline.profile_id,
+        Utc::now(),
+        capture,
+        publication,
+    ) {
+        set_output_error(state, &format!("{}: {}", error.code, error.message));
+    }
+    schedule_collection(
+        state,
+        pipeline,
+        Arc::clone(frame),
+        collection_observations,
+        collection_transitions,
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6106,12 +7114,59 @@ struct SuiteOperationParams {
     result: bool,
 }
 
+const MAX_ANALYSIS_CONTEXT_IDS: usize = 16;
+const MAX_ANALYSIS_CONTEXT_AGE_MS: u64 = 60_000;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AnalysisContext {
+    /// The last analysis produced by the caller.  It is accepted only when its
+    /// profile identity is still current and its age is within the bounded
+    /// transition window.
+    #[serde(default)]
+    previous: Option<PreviousAnalysisContext>,
+    /// Optional stable scene IDs expected by the caller for this frame.
+    #[serde(default)]
+    expected_scene_ids: Vec<SceneId>,
+    /// Optional semantic scene names expected by the caller for this frame.
+    /// Names are resolved against the selected profile so callers do not need
+    /// to hard-code profile-specific UUIDs.
+    #[serde(default)]
+    expected_scene_names: Vec<String>,
+    /// Optional stable overlay IDs expected by the caller for this frame.
+    #[serde(default)]
+    expected_overlay_ids: Vec<OverlayId>,
+    /// Optional semantic overlay names expected by the caller for this frame.
+    #[serde(default)]
+    expected_overlay_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PreviousAnalysisContext {
+    #[serde(default)]
+    profile_id: Option<ProfileId>,
+    #[serde(default)]
+    profile_revision: Option<u64>,
+    #[serde(default)]
+    scene_id: Option<SceneId>,
+    #[serde(default)]
+    overlay_ids: Vec<OverlayId>,
+    #[serde(default)]
+    frame_sha256: Option<String>,
+    #[serde(default)]
+    age_ms: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AnalyzeImageParams {
-    profile_id: ProfileId,
+    #[serde(default)]
+    profile_id: Option<ProfileId>,
+    #[serde(default, alias = "profile_bundle")]
+    bundle: Option<PathBuf>,
     path: PathBuf,
     #[serde(default = "default_analysis_timeout_ms")]
     timeout_ms: u64,
+    #[serde(default)]
+    context: Option<AnalysisContext>,
 }
 
 const fn default_analysis_timeout_ms() -> u64 {
@@ -6327,9 +7382,7 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
 
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use yash_app_events_profile::Profile;
 
     use super::*;
@@ -6354,6 +7407,108 @@ mod tests {
             tokio::task::yield_now().await;
         }
         (socket, task)
+    }
+
+    #[test]
+    fn profile_aliases_include_legacy_element_names() {
+        let mut profile = Profile::new("Demo", "demo_game", 10, 2);
+        let element_id = ElementId::new();
+        profile.elements.push(yash_app_events_profile::Element {
+            id: element_id,
+            name: "canonical_signal".into(),
+            enabled: true,
+            color: "#ffffff".into(),
+            region: NormalizedRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            detector: ProfileDetector::RegionChange {
+                id: DetectorId::new(),
+                threshold: 0.1,
+                preprocessing: Vec::new(),
+            },
+        });
+        profile
+            .element_aliases
+            .insert("legacy_signal".into(), element_id);
+        profile.validate().unwrap();
+        let aliases = profile_aliases(&profile).unwrap();
+        assert_eq!(aliases.get("legacy_signal"), Some(&element_id));
+    }
+
+    #[test]
+    fn profile_bundle_selection_is_prioritized_specific_and_fail_closed() {
+        let scene_id = SceneId::new();
+        let overlay_id = OverlayId::new();
+        let generic = ProfileBundleMember {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            scene_ids: vec![scene_id],
+            overlay_ids: Vec::new(),
+            priority: 10,
+            fallback: false,
+        };
+        let specific = ProfileBundleMember {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            scene_ids: vec![scene_id],
+            overlay_ids: vec![overlay_id],
+            priority: 10,
+            fallback: false,
+        };
+        let fallback = ProfileBundleMember {
+            profile_id: ProfileId::new(),
+            profile_revision: 1,
+            scene_ids: Vec::new(),
+            overlay_ids: Vec::new(),
+            priority: 0,
+            fallback: true,
+        };
+        let bundle = ProfileBundle {
+            schema: yash_app_events_profile::PROFILE_BUNDLE_SCHEMA_VERSION,
+            name: "test".into(),
+            game: "game".into(),
+            router_profile_id: ProfileId::new(),
+            router_profile_revision: 1,
+            members: vec![generic, specific, fallback],
+        };
+        let context = BundleAnalysisContext {
+            scene_id: Some(scene_id),
+            scene_status: "recognized".into(),
+            overlay_ids: vec![overlay_id],
+        };
+        assert_eq!(
+            select_profile_bundle_member(&bundle, &context),
+            Some((1, false))
+        );
+
+        let unresolved = BundleAnalysisContext {
+            scene_id: None,
+            scene_status: "ambiguous".into(),
+            overlay_ids: Vec::new(),
+        };
+        assert_eq!(
+            select_profile_bundle_member(&bundle, &unresolved),
+            Some((2, true))
+        );
+
+        let no_fallback = ProfileBundle {
+            members: bundle.members[..2].to_vec(),
+            ..bundle
+        };
+        assert_eq!(
+            select_profile_bundle_member(&no_fallback, &unresolved),
+            None
+        );
+
+        let router = Profile::new("Router", "game", 1, 1);
+        let no_match = bundle_selection_value(&no_fallback, &router, &context, None, false);
+        assert_eq!(no_match["status"], "no_match");
+        let unresolved_value =
+            bundle_selection_value(&no_fallback, &router, &unresolved, None, false);
+        assert_eq!(unresolved_value["status"], "unresolved");
     }
 
     async fn call(
@@ -6545,6 +7700,64 @@ mod tests {
         .await;
         assert_eq!(old["result"]["revision"], 1);
         call(&mut client, 8, method::SHUTDOWN, Value::Null).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_import_rebases_revision_after_trash() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, task) = start(directory.path()).await;
+        let mut client = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        handshake(&mut client).await;
+
+        let profile = Profile::new("Demo", "demo_game", 1920, 1080);
+        let created = call(
+            &mut client,
+            2,
+            method::PROFILE_CREATE,
+            json!({"profile":profile}),
+        )
+        .await;
+        assert_eq!(created["result"]["created"], true);
+
+        let mut high_revision = profile.clone();
+        high_revision.name = "High revision".into();
+        let committed = call(
+            &mut client,
+            3,
+            method::PROFILE_COMMIT,
+            json!({"profile":high_revision,"expected_revision":0}),
+        )
+        .await;
+        assert_eq!(committed["result"]["revision"], 1);
+        let trashed = call(
+            &mut client,
+            4,
+            method::PROFILE_TRASH,
+            json!({"profile_id":profile.id}),
+        )
+        .await;
+        assert_eq!(trashed["result"]["trashed"], true);
+
+        let source = directory.path().join("portable");
+        fs::create_dir_all(&source).unwrap();
+        let mut imported_source = profile;
+        imported_source.name = "Imported replacement".into();
+        yash_app_events_profile::save_profile(&source.join("profile.json"), &imported_source)
+            .unwrap();
+        let archive = directory.path().join("replacement.hudprofile");
+        yash_app_events_profile::export_profile(&source, &archive).unwrap();
+
+        let imported = call(
+            &mut client,
+            5,
+            method::PROFILE_IMPORT,
+            json!({"path":archive}),
+        )
+        .await;
+        assert_eq!(imported["result"]["revision"], 2);
+        assert_eq!(imported["result"]["name"], "Imported replacement");
+        call(&mut client, 6, method::SHUTDOWN, Value::Null).await;
         task.await.unwrap().unwrap();
     }
 
@@ -7377,6 +8590,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn scene_pipeline_skips_detectors_outside_active_context() {
         let mut profile = Profile::new("Scene gating", "synthetic_game", 10, 2);
         let element = |name: &str| yash_app_events_profile::Element {
@@ -7393,10 +8607,18 @@ mod tests {
                 mask: None,
             },
         };
-        profile.elements = vec![element("anchor"), element("active"), element("skipped")];
+        profile.elements = vec![
+            element("anchor"),
+            element("active"),
+            element("skipped"),
+            element("required"),
+            element("visibility evidence"),
+        ];
         let anchor_id = profile.elements[0].id;
         let active_id = profile.elements[1].id;
         let skipped_id = profile.elements[2].id;
+        let required_id = profile.elements[3].id;
+        let visibility_id = profile.elements[4].id;
         profile.scenes.push(yash_app_events_profile::Scene {
             id: yash_app_events_profile::SceneId::new(),
             name: "gameplay".into(),
@@ -7416,36 +8638,157 @@ mod tests {
             ambiguity_margin: 0.1,
             required_samples: 2,
             sample_window: 3,
-            element_ids: vec![active_id],
-            required_element_ids: Vec::new(),
-            interaction_targets: Vec::new(),
+            element_ids: vec![active_id, required_id],
+            required_element_ids: vec![required_id],
+            interaction_targets: vec![yash_app_events_profile::InteractionTarget {
+                id: yash_app_events_profile::InteractionTargetId::new(),
+                name: "active_target".into(),
+                role: yash_app_events_profile::InteractionRole::Navigation,
+                region: full_frame_region(),
+                interaction_point: Some(yash_app_events_profile::InteractionPoint::Center),
+                visibility: Some(yash_app_events_profile::RecognitionExpression::All {
+                    conditions: vec![yash_app_events_profile::RecognitionCondition {
+                        element_id: visibility_id,
+                        predicate: yash_app_events_profile::AtomicRulePredicate::Boolean {
+                            expected: true,
+                        },
+                        weight: 1.0,
+                    }],
+                }),
+                required_for_json: true,
+                caution_class: None,
+                caution: None,
+            }],
             transition_hints: Vec::new(),
         });
+        let mut disabled_scene = profile.scenes[0].clone();
+        disabled_scene.id = yash_app_events_profile::SceneId::new();
+        disabled_scene.name = "disabled_scene".into();
+        disabled_scene.enabled = false;
+        disabled_scene.interaction_targets.clear();
+        disabled_scene.recognition = yash_app_events_profile::RecognitionExpression::All {
+            conditions: vec![yash_app_events_profile::RecognitionCondition {
+                element_id: skipped_id,
+                predicate: yash_app_events_profile::AtomicRulePredicate::Boolean { expected: true },
+                weight: 1.0,
+            }],
+        };
+        profile.overlays.push(yash_app_events_profile::Overlay {
+            id: yash_app_events_profile::OverlayId::new(),
+            name: "disabled_overlay".into(),
+            description: String::new(),
+            enabled: false,
+            priority: 0,
+            blocks_scene_targets: false,
+            recognition: disabled_scene.recognition.clone(),
+            minimum_confidence: 0.8,
+            required_samples: 1,
+            sample_window: 1,
+            element_ids: Vec::new(),
+            required_element_ids: Vec::new(),
+            interaction_targets: Vec::new(),
+        });
+        profile.scenes.push(disabled_scene);
         profile.validate().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let mut pipeline = build_profile_pipeline(profile, directory.path(), 10).unwrap();
+        let mut pipeline = build_profile_pipeline(profile.clone(), directory.path(), 10).unwrap();
+        assert_eq!(
+            active_element_ids(&profile, &pipeline.scene_resolution),
+            HashSet::from([anchor_id])
+        );
+        assert_eq!(anchor_crops(&profile, 10, 2).unwrap().len(), 1);
+        assert_eq!(
+            pipeline
+                .processors
+                .iter()
+                .filter(|processor| processor.is_constructed())
+                .count(),
+            1
+        );
         let frame =
             synthetic_color_bar_frame(0, 10, BarDirection::LeftToRight, [180, 0, 0], [255, 60, 60])
                 .unwrap();
-        let first = pipeline.process_scene_aware(&frame);
+        let first = pipeline.process_scene_aware(&frame).unwrap();
         assert_eq!(first.len(), 1);
-        assert_eq!(pipeline.last_gated_detectors, 2);
+        assert_eq!(pipeline.last_gated_detectors, 4);
         assert!(pipeline.scene_resolution.scene.is_none());
-        assert!(pipeline.process_scene_aware(&frame).is_empty());
+        assert_eq!(
+            pipeline
+                .processors
+                .iter()
+                .filter(|processor| processor.is_constructed())
+                .count(),
+            1
+        );
+        assert!(pipeline.process_scene_aware(&frame).unwrap().is_empty());
         assert!(pipeline.scene_resolution.scene.is_none());
         let next_frame =
             synthetic_color_bar_frame(1, 10, BarDirection::LeftToRight, [180, 0, 0], [255, 60, 60])
                 .unwrap();
-        let processed = pipeline.process_scene_aware(&next_frame);
+        let processed = pipeline.process_scene_aware(&next_frame).unwrap();
         let ids = processed
             .iter()
             .map(|item| item.observation.element_id)
             .collect::<HashSet<_>>();
-        assert_eq!(ids, HashSet::from([anchor_id, active_id]));
+        assert_eq!(
+            ids,
+            HashSet::from([anchor_id, active_id, required_id, visibility_id])
+        );
         assert!(!ids.contains(&skipped_id));
-        assert_eq!(pipeline.last_evaluated_detectors, 2);
+        assert_eq!(pipeline.last_evaluated_detectors, 4);
         assert_eq!(pipeline.last_gated_detectors, 1);
         assert_eq!(pipeline.last_throttled_detectors, 0);
+        assert_eq!(
+            pipeline
+                .processors
+                .iter()
+                .filter(|processor| processor.is_constructed())
+                .count(),
+            4
+        );
+        assert!(!pipeline
+            .processors
+            .iter()
+            .find(|processor| processor.id == skipped_id)
+            .unwrap()
+            .is_constructed());
+        pipeline.release_inactive_contextual(&HashSet::from([anchor_id]));
+        assert!(!pipeline
+            .processors
+            .iter()
+            .find(|processor| processor.id == active_id)
+            .unwrap()
+            .is_constructed());
+    }
+
+    #[test]
+    fn lazy_detector_reports_a_cached_initialization_error_once() {
+        let element = yash_app_events_profile::Element {
+            id: ElementId::new(),
+            name: "missing template".into(),
+            enabled: true,
+            color: "#fff".into(),
+            region: full_frame_region(),
+            detector: ProfileDetector::Template {
+                id: DetectorId::new(),
+                templates: vec!["missing-template.png".into()],
+                masks: Vec::new(),
+                threshold: 0.9,
+                preprocessing: Vec::new(),
+            },
+        };
+        let mut processor = LazyProcessor::new(&element);
+        let directory = tempfile::tempdir().unwrap();
+        let frame =
+            synthetic_color_bar_frame(0, 10, BarDirection::LeftToRight, [180, 0, 0], [255, 60, 60])
+                .unwrap();
+
+        assert!(processor.process(&frame, directory.path(), 10).is_err());
+        assert!(processor
+            .process(&frame, directory.path(), 10)
+            .unwrap()
+            .is_none());
+        assert!(!processor.is_constructed());
     }
 
     #[test]
@@ -7479,6 +8822,7 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            image_work: Arc::new(Semaphore::new(1)),
             suite_operations: Mutex::new(HashMap::new()),
             suite_inventory_cache: Mutex::new(HashMap::new()),
         };
@@ -7586,9 +8930,11 @@ mod tests {
         let analyzed = analyze_image(
             &state,
             &AnalyzeImageParams {
-                profile_id: profile.id,
+                profile_id: Some(profile.id),
+                bundle: None,
                 path: profile_directory.join("victory.png"),
                 timeout_ms: 5_000,
+                context: None,
             },
         )
         .unwrap();
@@ -7606,6 +8952,167 @@ mod tests {
         assert_eq!(analyzed["ai_handoff"]["image_bytes_included"], false);
         assert_eq!(analyzed["analysis"]["evaluated_detectors"], 1);
         assert_eq!(analyzed["analysis"]["gated_detectors"], 1);
+
+        let contextual = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: Some(profile.id),
+                bundle: None,
+                path: profile_directory.join("victory.png"),
+                timeout_ms: 5_000,
+                context: Some(AnalysisContext {
+                    previous: Some(PreviousAnalysisContext {
+                        profile_id: Some(profile.id),
+                        profile_revision: Some(profile.revision),
+                        scene_id: Some(profile.scenes[0].id),
+                        overlay_ids: Vec::new(),
+                        frame_sha256: Some("0".repeat(64)),
+                        age_ms: Some(10),
+                    }),
+                    expected_scene_ids: Vec::new(),
+                    expected_scene_names: vec!["result".into()],
+                    expected_overlay_ids: Vec::new(),
+                    expected_overlay_names: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(contextual["scene"]["status"], "recognized");
+        assert_eq!(contextual["analysis_context"]["status"], "applied");
+        assert_eq!(
+            contextual["analysis_context"]["candidate_scope"],
+            "full_profile"
+        );
+        assert_eq!(contextual["analysis_context"]["fallback"], "full_profile");
+        assert_eq!(
+            contextual["analysis_context"]["preferred_scene_ids"][0],
+            json!(profile.scenes[0].id)
+        );
+        assert_eq!(
+            contextual["analysis_context"]["preferred_scene_names"][0],
+            json!("result")
+        );
+
+        let stale_context = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: Some(profile.id),
+                bundle: None,
+                path: profile_directory.join("victory.png"),
+                timeout_ms: 5_000,
+                context: Some(AnalysisContext {
+                    previous: Some(PreviousAnalysisContext {
+                        profile_id: Some(ProfileId::new()),
+                        profile_revision: Some(profile.revision),
+                        scene_id: Some(profile.scenes[0].id),
+                        overlay_ids: Vec::new(),
+                        frame_sha256: Some("not-a-hash".into()),
+                        age_ms: Some(MAX_ANALYSIS_CONTEXT_AGE_MS + 1),
+                    }),
+                    expected_scene_ids: vec![SceneId::new()],
+                    expected_scene_names: vec!["missing-scene".into()],
+                    expected_overlay_ids: Vec::new(),
+                    expected_overlay_names: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(stale_context["scene"]["status"], "recognized");
+        assert_eq!(stale_context["analysis_context"]["status"], "ignored");
+        assert_eq!(
+            stale_context["analysis_context"]["fallback"],
+            "full_profile"
+        );
+        assert!(stale_context["analysis_context"]["ignored_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "previous_profile_mismatch"));
+        assert!(stale_context["analysis_context"]["ignored_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "previous_context_stale"));
+        assert!(stale_context["analysis_context"]["ignored_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "previous_frame_hash_invalid"));
+        assert!(stale_context["analysis_context"]["ignored_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "expected_scene_not_in_profile"));
+        assert!(stale_context["analysis_context"]["ignored_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "expected_scene_name_not_in_profile"));
+
+        let mut member_profile = profile.clone();
+        member_profile.id = ProfileId::new();
+        member_profile.revision = 0;
+        member_profile.name = "OCR specialized".into();
+        state.profiles.create(&member_profile).unwrap();
+        let bundle_path = directory.path().join("synthetic.profile-bundle.json");
+        let bundle = ProfileBundle {
+            schema: yash_app_events_profile::PROFILE_BUNDLE_SCHEMA_VERSION,
+            name: "Synthetic control".into(),
+            game: profile.game.clone(),
+            router_profile_id: profile.id,
+            router_profile_revision: profile.revision,
+            members: vec![
+                ProfileBundleMember {
+                    profile_id: member_profile.id,
+                    profile_revision: member_profile.revision,
+                    scene_ids: vec![profile.scenes[0].id],
+                    overlay_ids: Vec::new(),
+                    priority: 0,
+                    fallback: false,
+                },
+                ProfileBundleMember {
+                    profile_id: profile.id,
+                    profile_revision: profile.revision,
+                    scene_ids: Vec::new(),
+                    overlay_ids: Vec::new(),
+                    priority: -1,
+                    fallback: true,
+                },
+            ],
+        };
+        fs::write(&bundle_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        let bundled = analyze_image(
+            &state,
+            &AnalyzeImageParams {
+                profile_id: None,
+                bundle: Some(bundle_path),
+                path: profile_directory.join("victory.png"),
+                timeout_ms: 5_000,
+                context: Some(AnalysisContext {
+                    previous: None,
+                    expected_scene_ids: vec![profile.scenes[0].id],
+                    expected_scene_names: vec![profile.scenes[0].name.clone()],
+                    expected_overlay_ids: Vec::new(),
+                    expected_overlay_names: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(bundled["profile_id"], member_profile.id.to_string());
+        assert_eq!(bundled["profile_selection"]["status"], "selected");
+        assert_eq!(
+            bundled["profile_selection"]["selected_profile_id"],
+            member_profile.id.to_string()
+        );
+        assert_eq!(bundled["analysis_context"]["status"], "applied");
+        assert_eq!(
+            bundled["analysis_context"]["preferred_scene_ids"][0],
+            json!(profile.scenes[0].id)
+        );
+        assert_eq!(
+            bundled["analysis_context"]["preferred_scene_names"][0],
+            json!("result")
+        );
         assert_eq!(*state.latest_snapshot.lock().unwrap(), json!({}));
         assert_eq!(state.sequence.load(Ordering::Relaxed), 0);
         let scene_resolution = SceneResolution {
@@ -7653,9 +9160,11 @@ mod tests {
         let unresolved = analyze_image(
             &state,
             &AnalyzeImageParams {
-                profile_id: profile.id,
+                profile_id: Some(profile.id),
+                bundle: None,
                 path: profile_directory.join("blank.png"),
                 timeout_ms: 5_000,
+                context: None,
             },
         )
         .unwrap();
@@ -7676,9 +9185,11 @@ mod tests {
         let incompatible = analyze_image(
             &state,
             &AnalyzeImageParams {
-                profile_id: profile.id,
+                profile_id: Some(profile.id),
+                bundle: None,
                 path: profile_directory.join("victory.png"),
                 timeout_ms: 5_000,
+                context: None,
             },
         )
         .unwrap();
@@ -7691,6 +9202,7 @@ mod tests {
         );
         let diagnostic_frame =
             replay_png_frames(&profile_directory, &[PathBuf::from("localized.png")])
+                .collect::<Result<Vec<_>, _>>()
                 .unwrap()
                 .remove(0);
         let diagnostic = build_diagnostic_bundle(
@@ -7761,6 +9273,7 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            image_work: Arc::new(Semaphore::new(1)),
             suite_operations: Mutex::new(HashMap::new()),
             suite_inventory_cache: Mutex::new(HashMap::new()),
         };
@@ -7841,25 +9354,22 @@ mod tests {
         assert_eq!(result["observations"][1]["value"]["value"], "cross");
     }
 
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn live_latest_frame_worker_throttles_sixty_fps_and_publishes_transition() {
-        let directory = tempfile::tempdir().unwrap();
+    fn test_state(root: &Path) -> Arc<State> {
         let (notifications, _) = broadcast::channel(64);
-        let local_config = LocalConfig::new(directory.path().join("config"));
+        let local_config = LocalConfig::new(root.join("config"));
         let output_routes = routes::Router::spawn(local_config.clone(), notifications.clone());
-        let state = Arc::new(State {
+        Arc::new(State {
             instance: Uuid::new_v4(),
-            profiles: ProfileStore::new(directory.path().join("data"), 20),
+            profiles: ProfileStore::new(root.join("data"), 20),
             local_config,
-            catalog: CatalogService::new(directory.path().join("cache")).unwrap(),
+            catalog: CatalogService::new(root.join("cache")).unwrap(),
             connected: AtomicUsize::new(0),
             maximum_connections: 8,
             shutdown: Notify::new(),
             notifications,
             sequence: AtomicU64::new(0),
             output: Mutex::new(OutputWriter::new(
-                directory.path().join("state"),
+                root.join("state"),
                 OutputConfig::default(),
             )),
             latest_snapshot: Mutex::new(json!({})),
@@ -7872,9 +9382,17 @@ mod tests {
             diagnostic_logs: Mutex::new(VecDeque::new()),
             collector: Mutex::new(collection::Runtime::default()),
             output_routes,
+            image_work: Arc::new(Semaphore::new(1)),
             suite_operations: Mutex::new(HashMap::new()),
             suite_inventory_cache: Mutex::new(HashMap::new()),
-        });
+        })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_latest_frame_worker_throttles_sixty_fps_and_publishes_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
         state
             .local_config
             .save_settings(&yash_app_events_profile::Settings::default())
@@ -8076,6 +9594,224 @@ mod tests {
             .join("templates/health_crop.json");
         let image: GrayImage = serde_json::from_slice(&fs::read(asset).unwrap()).unwrap();
         assert_eq!((image.width, image.height), (10, 2));
+    }
+
+    #[tokio::test]
+    async fn image_work_keeps_control_responsive_and_admission_survives_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let worker_state = Arc::clone(&state);
+        let (started, ready) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first = tokio::spawn(async move {
+            run_image_work(&worker_state, move || {
+                let _ = started.send(());
+                released.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch(
+                Request {
+                    jsonrpc: "2.0".into(),
+                    id: RequestId::Number(1),
+                    method: method::STATUS.into(),
+                    params: Value::Null,
+                },
+                &state,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(response.result.is_some());
+        first.abort();
+        let _ = first.await;
+        assert_eq!(
+            state.image_work.available_permits(),
+            0,
+            "cancelling a caller released admission while its native work was still running"
+        );
+        let worker_state = Arc::clone(&state);
+        let second = tokio::spawn(async move { run_image_work(&worker_state, || Ok(42)).await });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        assert_eq!(state.image_work.available_permits(), 1);
+    }
+
+    #[test]
+    fn observations_publish_one_complete_state_per_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let profile_id = ProfileId::new().to_string();
+        let mut publication = PublicationState::default();
+        let timestamp = Utc::now();
+        for index in 0..128 {
+            let observation = Observation {
+                detector_id: DetectorId::new(),
+                element_id: ElementId::new(),
+                timestamp_ms: 0,
+                value: ObservationValue::Number(f64::from(index)),
+                confidence: Some(1.0),
+                status: yash_app_events_engine::ObservationStatus::Valid,
+                diagnostic: String::new(),
+            };
+            publish_processed(
+                &state,
+                ProcessedFrame {
+                    observation,
+                    transition: None,
+                },
+                &profile_id,
+                "synthetic_game",
+                timestamp,
+                Value::Null,
+                &mut publication,
+            )
+            .unwrap();
+        }
+        let path = directory.path().join("state/state.json");
+        assert!(!path.exists(), "partial detector state reached disk");
+        assert_eq!(*state.latest_snapshot.lock().unwrap(), json!({}));
+        assert!(publish_current_state(
+            &state,
+            &profile_id,
+            timestamp,
+            Value::Null,
+            &mut publication
+        )
+        .unwrap());
+        let snapshot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot["observations"].as_object().unwrap().len(), 128);
+        assert_eq!(snapshot, *state.latest_snapshot.lock().unwrap());
+        assert!(!publish_current_state(
+            &state,
+            &profile_id,
+            timestamp,
+            Value::Null,
+            &mut publication
+        )
+        .unwrap());
+    }
+
+    #[test]
+    #[ignore = "release-mode performance measurement"]
+    fn replay_publication_benchmark() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(directory.path());
+        let mut profile = Profile::new("Publication benchmark", "synthetic_game", 10, 2);
+        for index in 0..128 {
+            profile.elements.push(yash_app_events_profile::Element {
+                id: ElementId::new(),
+                name: format!("Bar {index}"),
+                enabled: true,
+                color: "#f00".into(),
+                region: full_frame_region(),
+                detector: ProfileDetector::ColorBar {
+                    id: DetectorId::new(),
+                    direction: BarDirection::LeftToRight,
+                    minimum_rgb: [180, 0, 0],
+                    maximum_rgb: [255, 60, 60],
+                    mask: None,
+                },
+            });
+        }
+        state.profiles.create(&profile).unwrap();
+        let started = Instant::now();
+        let result = evaluate_profile_replay(
+            &state,
+            &ReplayManifest {
+                schema: 1,
+                profile_id: profile.id,
+                element_id: profile.elements[0].id,
+                values: vec![8; 20],
+                image_frames: Vec::new(),
+                expected_events: Vec::new(),
+                regression: ReplayRegression::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["observations"].as_array().unwrap().len(), 128 * 20);
+        eprintln!(
+            "128 detectors x 20 replay frames: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    fn replay_decodes_one_frame_at_a_time_and_releases_consumed_pixels() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = vec![PathBuf::from("first.png"), PathBuf::from("second.png")];
+        fs::write(
+            directory.path().join(&paths[0]),
+            encode_frame_png(&synthetic_health_frame(0, 8).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut frames = replay_png_frames(directory.path(), &paths);
+        let first = frames.next().unwrap().unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.timestamp, Duration::ZERO);
+        let pixels = Arc::downgrade(&first.data);
+        drop(first);
+        assert!(
+            pixels.upgrade().is_none(),
+            "iterator retained a consumed image"
+        );
+        // The second file need not exist until the consumer reaches it.
+        fs::write(
+            directory.path().join(&paths[1]),
+            encode_frame_png(&synthetic_health_frame(1, 1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let second = frames.next().unwrap().unwrap();
+        assert_eq!(second.sequence, 1);
+        assert_eq!(second.timestamp, Duration::from_millis(100));
+        assert!(frames.next().is_none());
+        for path in [
+            PathBuf::from("../escape.png"),
+            directory.path().join("first.png"),
+        ] {
+            assert_eq!(
+                replay_png_frames(directory.path(), &[path])
+                    .next()
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                error_code::INVALID_PARAMS,
+            );
+        }
+    }
+
+    #[test]
+    fn png_dimensions_are_rejected_before_pixel_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.png");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 4_097, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&vec![0; 4_097 * 4]).unwrap();
+        }
+        // Retain the header and IDAT header, but omit the compressed pixels.
+        bytes.truncate(41);
+        fs::write(&path, bytes).unwrap();
+        let error = decode_suite_png(&path).unwrap_err();
+        assert_eq!(error.code, error_code::INVALID_PARAMS);
+        assert_eq!(error.message, "unsupported PNG");
     }
 
     #[test]
