@@ -12,7 +12,7 @@ Implemented controls include:
   visibility;
 - portal source selection, stop, metrics, opt-in preview, and freeze;
 - aspect-preserving preview, zoom, pan, draw/select/move/resize/duplicate regions,
-  enable state, labels, normalized coordinates, and reference-pixel sizes.
+  enable state, labels, normalized coordinates, and reference-pixel sizes;
 - schema-2 scene and overlay creation, duplication, ordering, anchor expressions,
   confidence/N-of-M policy, contextual and required detector scopes;
 - an explicit canvas preview scope for all layers, global/recognition anchors, or one
@@ -22,17 +22,17 @@ Implemented controls include:
   geometry, optional explicit/center safe points, and cyan preview overlays;
 - numeric, boolean, text, stable-duration, composed, initial, and updated event rules;
 - deterministic color/template/change/seven-segment, OCR, and portable ONNX classifier configuration and diagnostics;
-- diagnostic bundle entry/size/privacy review and confirmed export.
+- diagnostic bundle entry/size/privacy review and confirmed export;
 - passive evidence policy/status, an inspectable image/observation batch, editable typed
   expectations, accept/correct/reject/promote actions, and conservative automatic
-  review through the shared collection JSON-RPC methods.
+  review through the shared collection JSON-RPC methods;
 - machine-local output route listing, enable/disable controls, trigger/sink inspection,
-  and explicit sample delivery through the shared output JSON-RPC methods.
+  and explicit sample delivery through the shared output JSON-RPC methods;
 - packaged inert output-recipe browsing with provenance/hash disclosure, editable
   trigger/payload JSON, side-effect-free preview, explicit local sink selection, and
-  disabled installation before the existing test/enable controls.
+  disabled installation before the existing test/enable controls;
 - collapsed public Profile Catalog browsing with cached/offline status, compatibility,
-  media/provenance/license/verification disclosure, explicit review, and inactive install.
+  media/provenance/license/verification disclosure, explicit review, and inactive install;
 - shared 80/90/100% profile-capacity warnings for elements, scenes, overlays, targets,
   largest layers, and recognition expressions, plus unreachable-element and read-only
   consolidation guidance matching `profile analyze-capacity`.
@@ -41,8 +41,9 @@ The live evidence panel shows ranked scene/overlay context and evaluated, gated,
 throttled detector counts. Interaction targets are descriptive only: the GUI and daemon
 never click or generate input.
 
-Preview is a per-connection lease. The daemon downsamples to at most 320×180 and
-returns a compressed PNG from a clone of the latest frame; detector input is unchanged.
+Preview is a per-connection lease. The GUI requests at most 1600×900 and the daemon
+downsamples to the requested bound before returning a compressed PNG from a clone of
+the latest frame; detector input is unchanged.
 Disconnecting the GUI drops the lease automatically, and preview never writes a file.
 
 Automated evidence includes normalized and scope-filtered interaction tests, preview

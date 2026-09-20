@@ -347,8 +347,11 @@ only after exporting anything you need.
 ## Development
 
 The Rust workspace and crate boundaries are initialized. Implementation order and
-acceptance gates are in `PLAN.md`; dependency direction is documented in
-`docs/architecture.md`.
+acceptance gates are in `PLAN.md`. Maintained technical documentation lives in
+[`docs/`](docs/), including the [architecture](docs/architecture.md),
+[protocol](docs/protocol-v1.md), [replay](docs/replay.md),
+[security review](docs/security-review.md), and dated performance and acceptance
+evidence. Repository contributors must update affected documents with the same change.
 
 The canonical baseline checks are:
 
@@ -373,7 +376,7 @@ audit, workload limits, and reproducible publication, capture, and detector benc
 Interactive Wayland capture is verified on the documented Hyprland environment. The
 daemon owns capture; `yash-eventsctl capture select` opens the picker, `capture status`
 reports metrics, `capture snapshot <path>` explicitly saves one PNG, and `capture
-stop` releases the session. See `docs/capture-smoke.md` for the acceptance procedure
+stop` releases the session. See the [capture smoke test](docs/capture-smoke.md) for the acceptance procedure
 and the current GNOME/KDE compatibility boundary.
 
 ## Project principles

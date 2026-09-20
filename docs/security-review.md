@@ -1,6 +1,6 @@
-# First-release security and privacy review
+# Security and privacy review
 
-Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output schema 1.
+Reviewed 2026-09-20 against protocol 1, profile schema 2, and capture/output schema 1.
 
 - Control is local-only: the daemon binds no TCP listener, creates its runtime
   directory as `0700`, its Unix socket as `0600`, rejects unsafe stale paths, limits
@@ -27,6 +27,9 @@ Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output sch
 - Frame queues are bounded to the latest frame. Preview images are opt-in, bounded,
   compressed, per-connection leased, and discarded on disconnect. Detector diagnostic
   previews are bounded and returned in memory only.
+- CPU-heavy analysis, replay, preview encoding, detector setup, and suite evaluation
+  run on blocking workers behind one shared foreground image-work permit. Cancellation
+  does not release that permit while native work is still running.
 - Image persistence requires the explicit snapshot or template-capture action. Paths
   are written atomically. The GUI labels these actions and the capture state/source is
   visible through GUI, CLI, status RPC, and state output.
@@ -34,7 +37,8 @@ Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output sch
   tokens. `RUST_LOG` controls verbosity.
 - Image replay accepts only profile-relative, non-traversing PNG paths, caps files at
   16 MiB, dimensions at 4096×4096, sample count at 10,000, and supported pixels to
-  8-bit grayscale/RGB/RGBA.
+  8-bit grayscale/RGB/RGBA. It validates dimensions before pixel allocation and consumes
+  frames lazily instead of retaining the suite's decoded images.
 - One-shot analysis accepts only an explicit current-user path, reuses the same 16 MiB
   and 4096×4096 PNG decoder limits, bounds profiles/scenes/targets and timeout, mutates
   no daemon state/output, and returns no image bytes. Spatial JSON carries the exact
@@ -44,6 +48,9 @@ Reviewed 2026-08-02 against protocol 1, profile schema 2, and capture/output sch
   pinned revision/game/layout and router references, evaluates at most one member, and never
   executes a bundle path or activates a selected profile. Invalid, stale, unresolved, and
   unmatched routes fail closed.
+- Profile listing accepts only canonical UUID-named directories and rejects a profile
+  document whose stable ID differs from its directory. External backups may inform
+  revision rebasing without entering the active profile list.
 - Schema-2 interaction targets are inert rectangles and optional safe points. Neither
   the daemon, CLI, GUI, nor Wayland adapter converts them into input automatically.
 - Diagnostic bundles require plan/review/export. The plan discloses every redacted

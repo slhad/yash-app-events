@@ -59,8 +59,10 @@ and refresh interval.
 
 ## Known limitations and next evidence
 
-- Tesseract and Leptonica development libraries are currently source-build
-  dependencies; packaging metadata still needs updating.
+- Tesseract and Leptonica development libraries remain host build dependencies. The
+  Debian/Ubuntu package names are documented in the README and installed by CI and the
+  release workflow; native distribution packages still need equivalent dependency
+  metadata before they are published.
 - The English language pack removes accents from the French localization fixture;
   profiles needing accent fidelity must select an installed matching language pack.
 - Additional language packs require installation through the host distribution.

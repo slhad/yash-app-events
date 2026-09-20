@@ -6,11 +6,13 @@ Dependencies flow inward from binaries to narrow libraries:
 
 ```text
 daemon -> capture-pw -> capture
-daemon -> catalog -> profile
+daemon -> catalog -> profile, output
 daemon -> engine -> capture, profile, vision
 daemon -> output -> protocol
 daemon -> profile, protocol, vision
-cli/gui -> profile, protocol
+profile -> output -> protocol
+cli -> engine, profile, protocol
+gui -> profile, protocol
 ```
 
 `protocol`, `profile`, `catalog`, and `capture` do not depend on application binaries. The

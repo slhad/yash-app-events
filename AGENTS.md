@@ -40,8 +40,25 @@ For each implementation task:
 5. Update the status and evidence in `SPECS.md`.
 6. Update `PLAN.md` if sequencing or scope changed.
 7. Update `README.md` only for user-visible behavior that now works.
+8. Review `docs/` for affected reference material, decisions, procedures, benchmarks,
+   and acceptance reports. Update current documentation in the same change. Preserve
+   dated evidence as historical evidence and label it clearly rather than rewriting it
+   to match a newer run.
 
 Do not mark a requirement complete based only on code presence. Completion requires the verification evidence stated in `SPECS.md`.
+
+## Documentation maintenance
+
+The `docs/` directory is maintained project documentation. Keep current guides and
+reference material aligned with the implementation, including command syntax, limits,
+dependency direction, security controls, and supported behavior. Benchmark and
+acceptance reports may describe older measurements or environments when their date and
+scope are explicit. When a document no longer provides current guidance or useful
+historical evidence, remove it and remove or replace every reference to it.
+
+Before finishing a documentation-affecting change, check relative links, validate JSON
+artifacts, and run `bash scripts/check-readme-claims.sh` when user-visible claims may
+have changed.
 
 ## Intended workspace shape
 
