@@ -88,6 +88,8 @@ pub struct ColorBarConfig {
 #[derive(Clone, Debug)]
 pub struct ColorBarDetector {
     config: ColorBarConfig,
+    line_scores: Vec<f32>,
+    matching_lines: Vec<bool>,
 }
 
 impl ColorBarDetector {
@@ -115,7 +117,11 @@ impl ColorBarDetector {
         {
             return Err("maximum gap fraction must be within [0,0.25]");
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            line_scores: Vec::new(),
+            matching_lines: Vec::new(),
+        })
     }
 }
 
@@ -123,7 +129,8 @@ impl Detector for ColorBarDetector {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
     )]
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let Some(crop) = Crop::new(frame, region) else {
@@ -142,8 +149,12 @@ impl Detector for ColorBarDetector {
             BarDirection::LeftToRight | BarDirection::RightToLeft
         );
         let lines = if horizontal { crop.width } else { crop.height };
-        let mut matching_lines = Vec::with_capacity(lines);
-        let mut line_scores = Vec::with_capacity(lines);
+        self.line_scores.clear();
+        self.matching_lines.clear();
+        self.line_scores
+            .reserve(lines.saturating_sub(self.line_scores.capacity()));
+        self.matching_lines
+            .reserve(lines.saturating_sub(self.matching_lines.capacity()));
         for line in 0..lines {
             let samples = if horizontal { crop.height } else { crop.width };
             let mut matched = 0_usize;
@@ -172,8 +183,9 @@ impl Detector for ColorBarDetector {
             } else {
                 matched as f32 / included as f32
             };
-            line_scores.push(score);
-            matching_lines.push(score >= self.config.line_match_fraction);
+            self.line_scores.push(score);
+            self.matching_lines
+                .push(score >= self.config.line_match_fraction);
         }
         let reverse = matches!(
             self.config.direction,
@@ -181,31 +193,40 @@ impl Detector for ColorBarDetector {
         );
         let maximum_gap =
             ((lines as f32 * self.config.maximum_gap_fraction).ceil() as usize).max(1);
-        let ordered: Box<dyn Iterator<Item = bool>> = if reverse {
-            Box::new(matching_lines.iter().rev().copied())
-        } else {
-            Box::new(matching_lines.iter().copied())
-        };
         let mut contiguous = 0;
         let mut last_match = 0;
         let mut gap = 0;
-        for (index, matched) in ordered.enumerate() {
+        let mut consume = |index: usize, matched: bool| {
             if matched {
                 last_match = index + 1;
                 gap = 0;
             } else {
                 gap += 1;
                 if gap > maximum_gap {
-                    break;
+                    return false;
                 }
             }
             contiguous = last_match;
+            true
+        };
+        if reverse {
+            for (index, matched) in self.matching_lines.iter().rev().copied().enumerate() {
+                if !consume(index, matched) {
+                    break;
+                }
+            }
+        } else {
+            for (index, matched) in self.matching_lines.iter().copied().enumerate() {
+                if !consume(index, matched) {
+                    break;
+                }
+            }
         }
         let fill = contiguous as f64 / lines as f64;
         let confidence = if lines == 0 {
             0.0
         } else {
-            line_scores
+            self.line_scores
                 .iter()
                 .map(|score| (score - 0.5).abs() * 2.0)
                 .sum::<f32>()

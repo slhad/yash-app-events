@@ -41,15 +41,17 @@ impl Detector for RegionChangeDetector {
     #[allow(clippy::cast_precision_loss)]
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let current = match grayscale_crop(frame, region)
-            .and_then(|image| self.config.preprocessing.apply(&image))
+            .and_then(|image| self.config.preprocessing.apply_owned(image))
         {
             Ok(image) => image,
             Err(error) => return Detection::error(error),
         };
-        let Some(previous) = self.previous.replace(current.clone()) else {
+        let Some(previous) = self.previous.take() else {
+            self.previous = Some(current);
             return Detection::unknown("baseline frame established");
         };
         if previous.width != current.width || previous.height != current.height {
+            self.previous = Some(current);
             return Detection::unknown("baseline reset after crop dimensions changed");
         }
         let difference = previous
@@ -60,7 +62,7 @@ impl Detector for RegionChangeDetector {
             .sum::<u64>() as f64
             / current.pixels.len() as f64
             / 255.0;
-        Detection {
+        let detection = Detection {
             value: Some(DetectionValue::Number(difference)),
             confidence: Some(1.0),
             status: DetectionStatus::Valid,
@@ -68,7 +70,9 @@ impl Detector for RegionChangeDetector {
                 "change {difference:.4}; stable={}",
                 difference < f64::from(self.config.change_threshold)
             ),
-        }
+        };
+        self.previous = Some(current);
+        detection
     }
 }
 

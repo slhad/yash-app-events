@@ -17,9 +17,9 @@ pub use diagnostic::{
     DiagnosticError, DiagnosticLimits, DiagnosticPlan,
 };
 pub use routing::{
-    execute_route, render_payload, FileMode, OutputFormat, OutputRecipe, OutputRecipeSink,
-    OutputRecipeSource, OutputRoute, OutputRouteError, OutputSink, OutputTrigger, RouteContext,
-    RouteReceipt,
+    execute_rendered_route, execute_rendered_route_validated, execute_route, render_payload,
+    FileMode, OutputFormat, OutputRecipe, OutputRecipeSink, OutputRecipeSource, OutputRoute,
+    OutputRouteError, OutputSink, OutputTrigger, RouteContext, RouteReceipt,
 };
 
 /// Current event and state output schema version.
@@ -131,14 +131,23 @@ impl OutputWriter {
         Ok(())
     }
 
-    /// Atomically publishes current state using same-directory flush, sync, and rename.
+    /// Atomically publishes current state using same-directory flush and rename.
+    ///
+    /// `state.json` is a latest-value snapshot. It intentionally avoids a filesystem
+    /// sync barrier for every analyzed frame; the event log and atomic replace routes
+    /// remain the durable recovery paths.
     ///
     /// # Errors
     ///
     /// Returns serialization or I/O failures while retaining the previous complete snapshot.
     pub fn write_state(&self, state: &StateSnapshot) -> Result<(), OutputError> {
         let bytes = serde_json::to_vec_pretty(state)?;
-        atomic_write_before_rename(&self.root.join("state.json"), &bytes, || Ok(()))?;
+        atomic_write_before_rename(
+            &self.root.join("state.json"),
+            &bytes,
+            AtomicWriteDurability::Flush,
+            || Ok(()),
+        )?;
         Ok(())
     }
 
@@ -168,6 +177,7 @@ impl OutputWriter {
 fn atomic_write_before_rename(
     path: &Path,
     bytes: &[u8],
+    durability: AtomicWriteDurability,
     before_rename: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
@@ -183,15 +193,39 @@ fn atomic_write_before_rename(
         let mut writer = BufWriter::new(file);
         writer.write_all(bytes)?;
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        if durability.sync_file() {
+            writer.get_ref().sync_all()?;
+        }
         before_rename()?;
         fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()
+        if durability.sync_directory() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicWriteDurability {
+    /// Flush userspace buffers, then atomically rename without a disk barrier.
+    Flush,
+    /// Flush and sync both the temporary file and containing directory.
+    #[allow(dead_code)]
+    Sync,
+}
+
+impl AtomicWriteDurability {
+    const fn sync_file(self) -> bool {
+        matches!(self, Self::Sync)
+    }
+
+    const fn sync_directory(self) -> bool {
+        matches!(self, Self::Sync)
+    }
 }
 
 /// Durable output failure deliberately returned to orchestration rather than panicking.
@@ -256,10 +290,12 @@ mod tests {
     fn interrupted_state_write_retains_previous_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");
-        atomic_write_before_rename(&path, b"old", || Ok(())).unwrap();
+        atomic_write_before_rename(&path, b"old", AtomicWriteDurability::Sync, || Ok(())).unwrap();
         assert!(
-            atomic_write_before_rename(&path, b"new", || Err(io::Error::other("injected")))
-                .is_err()
+            atomic_write_before_rename(&path, b"new", AtomicWriteDurability::Sync, || Err(
+                io::Error::other("injected")
+            ),)
+            .is_err()
         );
         assert_eq!(fs::read(path).unwrap(), b"old");
     }

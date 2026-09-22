@@ -75,7 +75,7 @@ impl TemplateDetector {
 impl Detector for TemplateDetector {
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let crop = match grayscale_crop(frame, region)
-            .and_then(|image| self.config.preprocessing.apply(&image))
+            .and_then(|image| self.config.preprocessing.apply_owned(image))
         {
             Ok(crop) => crop,
             Err(error) => return Detection::error(error),

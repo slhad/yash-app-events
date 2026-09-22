@@ -23,9 +23,20 @@ The 2026-09-20 application audit fixed the largest measured performance problems
 - disabled layers do not keep recognition anchors active;
 - profile listing and revision checks avoid redundant or unsafe work.
 
-The canonical evidence is in `SPECS.md` and `docs/performance.md`. The audit passed 197
-workspace tests and the available 33-case, 126-assertion game suite. A fresh interactive
-portal and GUI capture run was not part of that audit.
+A 2026-09-21 follow-up pass also rate-gates live work before worker submission, admits
+collection evidence before frame-wide copies, indexes rule dispatch, keeps typed derived
+observations and detector scratch storage in memory, shares spatial-suite frame pixels,
+and caches output routes. The canonical evidence is recorded in the dated follow-up
+section of `docs/performance.md`.
+
+The final 2026-09-21 hot-path audit also removed duplicate one-shot PNG reads and temporal
+sample replay, indexed scene-aware processor scheduling, moved the status `/proc` cache
+check before filesystem reads, avoided duplicate route validation and per-delivery sync
+barriers, reused canonical suite roots, and cached the GUI observation profile index.
+The canonical evidence is in `SPECS.md` and `docs/performance.md`. The current tree passes
+200 workspace tests and strict workspace Clippy. The available 33-case, 126-assertion game
+suite and interactive portal/GUI runs remain dated evidence; no fresh interactive run was
+part of this audit.
 
 ## Active work
 

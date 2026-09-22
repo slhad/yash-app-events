@@ -101,7 +101,7 @@ impl OnnxClassifierDetector {
 impl Detector for OnnxClassifierDetector {
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let image = match grayscale_crop(frame, region)
-            .and_then(|image| self.config.preprocessing.apply(&image))
+            .and_then(|image| self.config.preprocessing.apply_owned(image))
         {
             Ok(image) => image,
             Err(error) => {
@@ -121,9 +121,9 @@ impl Detector for OnnxClassifierDetector {
         let refresh_due = self.last_run_ms.is_none_or(|last| {
             timestamp_ms.saturating_sub(last) >= self.config.maximum_interval_ms
         });
-        self.previous = Some(image.clone());
         if !changed && !refresh_due {
             if let Some(mut cached) = self.last_detection.clone() {
+                self.previous = Some(image);
                 cached
                     .diagnostic
                     .push_str("; cached because crop is unchanged");
@@ -135,6 +135,7 @@ impl Detector for OnnxClassifierDetector {
             .iter()
             .map(|pixel| f32::from(*pixel) / 255.0)
             .collect();
+        self.previous = Some(image);
         let tensor = match Tensor::from_array((
             [1, 1, self.config.input_height, self.config.input_width],
             input.into_boxed_slice(),

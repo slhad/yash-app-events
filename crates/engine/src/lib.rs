@@ -211,6 +211,8 @@ pub struct OverlayCandidate {
 pub struct SceneResolver {
     scenes: Vec<Scene>,
     overlays: Vec<Overlay>,
+    scene_index: HashMap<SceneId, usize>,
+    overlay_index: HashMap<OverlayId, usize>,
     scene_evidence: HashMap<SceneId, VecDeque<bool>>,
     overlay_evidence: HashMap<OverlayId, VecDeque<bool>>,
     active_scene: Option<SceneId>,
@@ -219,9 +221,21 @@ pub struct SceneResolver {
 impl SceneResolver {
     #[must_use]
     pub fn new(scenes: Vec<Scene>, overlays: Vec<Overlay>) -> Self {
+        let scene_index = scenes
+            .iter()
+            .enumerate()
+            .map(|(index, scene)| (scene.id, index))
+            .collect();
+        let overlay_index = overlays
+            .iter()
+            .enumerate()
+            .map(|(index, overlay)| (overlay.id, index))
+            .collect();
         Self {
             scenes,
             overlays,
+            scene_index,
+            overlay_index,
             scene_evidence: HashMap::new(),
             overlay_evidence: HashMap::new(),
             active_scene: None,
@@ -251,10 +265,25 @@ impl SceneResolver {
             hints.map_or(&[], |value| value.preferred_scene_ids.as_slice());
         let preferred_overlay_ids: &[OverlayId] =
             hints.map_or(&[], |value| value.preferred_overlay_ids.as_slice());
+        let preferred_scene_ranks = (!preferred_scene_ids.is_empty()).then(|| {
+            preferred_scene_ids
+                .iter()
+                .enumerate()
+                .map(|(rank, id)| (*id, rank))
+                .collect::<HashMap<_, _>>()
+        });
+        let preferred_overlay_ranks = (!preferred_overlay_ids.is_empty()).then(|| {
+            preferred_overlay_ids
+                .iter()
+                .enumerate()
+                .map(|(rank, id)| (*id, rank))
+                .collect::<HashMap<_, _>>()
+        });
         let hinted = self
             .active_scene
-            .and_then(|active| self.scenes.iter().find(|scene| scene.id == active))
-            .map_or_else(Vec::new, |scene| scene.transition_hints.clone());
+            .and_then(|active| self.scene_index.get(&active))
+            .and_then(|index| self.scenes.get(*index))
+            .map_or(&[][..], |scene| scene.transition_hints.as_slice());
         let mut candidates = self
             .scenes
             .iter()
@@ -278,49 +307,50 @@ impl SceneResolver {
                 .confidence
                 .total_cmp(&left.confidence)
                 .then_with(|| {
-                    let left_rank = preferred_scene_ids
-                        .iter()
-                        .position(|id| *id == left.id)
+                    let left_rank = preferred_scene_ranks
+                        .as_ref()
+                        .and_then(|ranks| ranks.get(&left.id))
+                        .copied()
                         .unwrap_or(usize::MAX);
-                    let right_rank = preferred_scene_ids
-                        .iter()
-                        .position(|id| *id == right.id)
+                    let right_rank = preferred_scene_ranks
+                        .as_ref()
+                        .and_then(|ranks| ranks.get(&right.id))
+                        .copied()
                         .unwrap_or(usize::MAX);
                     left_rank.cmp(&right_rank)
                 })
                 .then_with(|| hinted.contains(&right.id).cmp(&hinted.contains(&left.id)))
                 .then_with(|| {
                     let left_priority = self
-                        .scenes
-                        .iter()
-                        .find(|scene| scene.id == left.id)
+                        .scene_index
+                        .get(&left.id)
+                        .and_then(|index| self.scenes.get(*index))
                         .map_or(0, |scene| scene.priority);
                     let right_priority = self
-                        .scenes
-                        .iter()
-                        .find(|scene| scene.id == right.id)
+                        .scene_index
+                        .get(&right.id)
+                        .and_then(|index| self.scenes.get(*index))
                         .map_or(0, |scene| scene.priority);
                     right_priority.cmp(&left_priority)
                 })
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        let eligible = candidates
-            .iter()
-            .filter(|candidate| candidate.eligible)
-            .collect::<Vec<_>>();
-        let ambiguous = eligible.first().is_some_and(|best| {
-            eligible.get(1).is_some_and(|runner_up| {
+        let mut eligible = candidates.iter().filter(|candidate| candidate.eligible);
+        let best = eligible.next();
+        let runner_up = eligible.next();
+        let ambiguous = best.is_some_and(|best| {
+            runner_up.is_some_and(|runner_up| {
                 let margin = self
-                    .scenes
-                    .iter()
-                    .find(|scene| scene.id == best.id)
+                    .scene_index
+                    .get(&best.id)
+                    .and_then(|index| self.scenes.get(*index))
                     .map_or(0.0, |scene| scene.ambiguity_margin);
                 best.confidence - runner_up.confidence < margin
             })
         });
         if !ambiguous {
-            self.active_scene = eligible.first().map(|candidate| candidate.id);
+            self.active_scene = best.map(|candidate| candidate.id);
         }
         let scene = self.active_scene.and_then(|id| {
             candidates
@@ -355,18 +385,38 @@ impl SceneResolver {
             })
             .collect::<Vec<_>>();
         overlay_candidates.sort_by(|left, right| {
-            let left_rank = preferred_overlay_ids
-                .iter()
-                .position(|id| *id == left.id)
+            let left_rank = preferred_overlay_ranks
+                .as_ref()
+                .and_then(|ranks| ranks.get(&left.id))
+                .copied()
                 .unwrap_or(usize::MAX);
-            let right_rank = preferred_overlay_ids
-                .iter()
-                .position(|id| *id == right.id)
+            let right_rank = preferred_overlay_ranks
+                .as_ref()
+                .and_then(|ranks| ranks.get(&right.id))
+                .copied()
                 .unwrap_or(usize::MAX);
             left_rank
                 .cmp(&right_rank)
                 .then_with(|| left.name.cmp(&right.name))
         });
+        let mut highest_priority_by_target: HashMap<&str, i16> = HashMap::new();
+        for candidate in overlay_candidates
+            .iter()
+            .filter(|candidate| candidate.eligible)
+        {
+            let Some(index) = self.overlay_index.get(&candidate.id) else {
+                continue;
+            };
+            let Some(overlay) = self.overlays.get(*index) else {
+                continue;
+            };
+            for target in &overlay.interaction_targets {
+                highest_priority_by_target
+                    .entry(target.name.as_str())
+                    .and_modify(|priority| *priority = (*priority).max(overlay.priority))
+                    .or_insert(overlay.priority);
+            }
+        }
         let overlays = overlay_candidates
             .iter()
             .filter(|candidate| candidate.eligible)
@@ -376,25 +426,16 @@ impl SceneResolver {
             // one click target (for example a generic reward popup beside a
             // route-specific reward result).
             .filter(|candidate| {
-                let Some(current) = self
-                    .overlays
-                    .iter()
-                    .find(|overlay| overlay.id == candidate.id)
-                else {
+                let Some(index) = self.overlay_index.get(&candidate.id) else {
                     return false;
                 };
-                !self.overlays.iter().any(|other| {
-                    other.enabled
-                        && other.priority > current.priority
-                        && overlay_candidates.iter().any(|other_candidate| {
-                            other_candidate.id == other.id && other_candidate.eligible
-                        })
-                        && current.interaction_targets.iter().any(|target| {
-                            other
-                                .interaction_targets
-                                .iter()
-                                .any(|other_target| other_target.name == target.name)
-                        })
+                let Some(current) = self.overlays.get(*index) else {
+                    return false;
+                };
+                !current.interaction_targets.iter().any(|target| {
+                    highest_priority_by_target
+                        .get(target.name.as_str())
+                        .is_some_and(|priority| *priority > current.priority)
                 })
             })
             .map(|candidate| ResolvedOverlay {
@@ -434,30 +475,18 @@ pub fn recognition_confidence<S: std::hash::BuildHasher>(
     if conditions.is_empty() {
         return require_all.then_some(1.0);
     }
-    let evaluations = conditions
-        .iter()
-        .map(|condition| condition_confidence(condition, observations))
-        .collect::<Vec<_>>();
-    if require_all && evaluations.iter().any(Option::is_none) {
-        return None;
+    let mut total_weight = 0.0_f32;
+    let mut matched_weight = 0.0_f32;
+    for condition in conditions {
+        total_weight += condition.weight;
+        if let Some((matched, confidence, weight)) = condition_confidence(condition, observations) {
+            if matched {
+                matched_weight += confidence * weight;
+            }
+        } else if require_all {
+            return None;
+        }
     }
-    let total_weight = conditions
-        .iter()
-        .map(|condition| condition.weight)
-        .sum::<f32>();
-    let matched_weight = evaluations
-        .iter()
-        .flatten()
-        .map(
-            |(matched, confidence, weight)| {
-                if *matched {
-                    confidence * weight
-                } else {
-                    0.0
-                }
-            },
-        )
-        .sum::<f32>();
     if !require_all && matched_weight == 0.0 {
         return Some(0.0);
     }
@@ -484,24 +513,19 @@ pub fn recognition_matches<S: std::hash::BuildHasher>(
         return Some(require_all);
     }
 
-    let evaluations = conditions
-        .iter()
-        .map(|condition| condition_confidence(condition, observations).map(|result| result.0))
-        .collect::<Vec<_>>();
-    if require_all {
-        if evaluations.iter().any(|value| *value == Some(false)) {
-            Some(false)
-        } else if evaluations.iter().any(Option::is_none) {
-            None
-        } else {
-            Some(true)
+    let mut unknown = false;
+    for condition in conditions {
+        match condition_confidence(condition, observations).map(|result| result.0) {
+            Some(true) if !require_all => return Some(true),
+            Some(false) if require_all => return Some(false),
+            Some(_) => {}
+            None => unknown = true,
         }
-    } else if evaluations.iter().any(|value| *value == Some(true)) {
-        Some(true)
-    } else if evaluations.iter().any(Option::is_none) {
+    }
+    if unknown {
         None
     } else {
-        Some(false)
+        Some(require_all)
     }
 }
 
@@ -647,35 +671,20 @@ impl CompositeRule {
         }
         self.latest
             .insert(observation.element_id, observation.clone());
-        let evaluations = self
-            .conditions
-            .iter()
-            .map(|condition| {
-                let observation = self.latest.get(&condition.element_id)?;
-                atomic_matches(&condition.predicate, &observation.value)
-                    .map(|matched| (matched, observation.confidence.unwrap_or(1.0)))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let matched = if self.require_all {
-            evaluations.iter().all(|(matched, _)| *matched)
-        } else {
-            evaluations.iter().any(|(matched, _)| *matched)
-        };
-        let confidence = evaluations
-            .iter()
-            .map(|(_, confidence)| *confidence)
-            .reduce(f32::min)
-            .unwrap_or(1.0);
-        let synthetic = Observation {
-            detector_id: observation.detector_id,
-            element_id: observation.element_id,
-            timestamp_ms: observation.timestamp_ms,
-            value: ObservationValue::Boolean(matched),
-            confidence: Some(confidence),
-            status: ObservationStatus::Valid,
-            diagnostic: "composed observation evidence".into(),
-        };
-        self.temporal.observe(&synthetic)
+        let mut matched = self.require_all;
+        let mut confidence = 1.0_f32;
+        for condition in &self.conditions {
+            let observation = self.latest.get(&condition.element_id)?;
+            let condition_matched = atomic_matches(&condition.predicate, &observation.value)?;
+            if self.require_all {
+                matched &= condition_matched;
+            } else {
+                matched |= condition_matched;
+            }
+            confidence = confidence.min(observation.confidence.unwrap_or(1.0));
+        }
+        self.temporal
+            .observe_boolean(observation, confidence, matched)
     }
 
     #[must_use]
@@ -766,6 +775,42 @@ impl TemporalRule {
             }
             _ => return None,
         };
+        self.observe_match(
+            observation.timestamp_ms,
+            observation.monotonic_timestamp(),
+            numeric_transition_value(&observation.value),
+            confidence,
+            matched,
+        )
+    }
+
+    /// Evaluates a pre-computed boolean without constructing a synthetic observation.
+    fn observe_boolean(
+        &mut self,
+        observation: &Observation,
+        confidence: f32,
+        matched: bool,
+    ) -> Option<Transition> {
+        if confidence < self.config.minimum_confidence {
+            return None;
+        }
+        self.observe_match(
+            observation.timestamp_ms,
+            observation.monotonic_timestamp(),
+            f64::from(u8::from(matched)),
+            confidence,
+            matched,
+        )
+    }
+
+    fn observe_match(
+        &mut self,
+        timestamp_ms: u64,
+        now: Duration,
+        value: f64,
+        confidence: f32,
+        matched: bool,
+    ) -> Option<Transition> {
         self.evidence.push_back(matched);
         while self.evidence.len() > self.config.sample_window {
             self.evidence.pop_front();
@@ -781,7 +826,6 @@ impl TemporalRule {
         } else {
             self.state
         };
-        let now = observation.monotonic_timestamp();
         if desired != self.state {
             let desired = desired?;
             let since = match self.candidate {
@@ -809,7 +853,7 @@ impl TemporalRule {
                 return None;
             }
             self.last_transition = Some(now);
-            return Some(self.transition(observation, confidence, desired));
+            return Some(self.transition(timestamp_ms, value, confidence, desired));
         }
         self.candidate = None;
         if self.state == Some(true)
@@ -820,7 +864,8 @@ impl TemporalRule {
         {
             self.last_update = Some(now);
             return Some(self.transition_with_state(
-                observation,
+                timestamp_ms,
+                value,
                 confidence,
                 TransitionState::Updated,
             ));
@@ -828,27 +873,34 @@ impl TemporalRule {
         None
     }
 
-    fn transition(&self, observation: &Observation, confidence: f32, active: bool) -> Transition {
+    fn transition(
+        &self,
+        timestamp_ms: u64,
+        value: f64,
+        confidence: f32,
+        active: bool,
+    ) -> Transition {
         let state = if active {
             TransitionState::Entered
         } else {
             TransitionState::Left
         };
-        self.transition_with_state(observation, confidence, state)
+        self.transition_with_state(timestamp_ms, value, confidence, state)
     }
 
     fn transition_with_state(
         &self,
-        observation: &Observation,
+        timestamp_ms: u64,
+        value: f64,
         confidence: f32,
         state: TransitionState,
     ) -> Transition {
         Transition {
             rule_id: self.config.id,
             event: self.config.event.clone(),
-            timestamp_ms: observation.timestamp_ms,
+            timestamp_ms,
             state,
-            value: numeric_transition_value(&observation.value),
+            value,
             confidence,
         }
     }

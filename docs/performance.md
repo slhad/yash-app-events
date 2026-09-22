@@ -71,9 +71,10 @@ leave an empty `all` expression, making a scene or interaction target match with
 evidence. Removal now disables affected scenes/overlays and hides affected targets until
 their draft configuration is repaired. Profile and engine tests verify the behavior.
 
-Final automated validation: formatting, strict workspace Clippy, all 197 workspace
-tests, README claim checks, and documentation generation pass. The two ignored benchmarks
-were run explicitly. An isolated release daemon passed the available BlazBlue suite's
+The 2026-09-20 audit's final automated validation was: formatting, strict workspace
+Clippy, all 197 workspace tests, README claim checks, and documentation generation pass.
+The two ignored benchmarks were run explicitly. An isolated release daemon passed the
+available BlazBlue suite's
 33 cases, 50 frames, and 126 assertions in 12.476 seconds, with a cold inventory cache.
 During that run, 61 CLI status requests took 4.245 ms median and 5.730 ms maximum;
 sampled daemon RSS peaked at 308.57 MiB. These measurements cover this workload only.
@@ -86,6 +87,100 @@ Reproduce the publication and capture benchmarks with:
 cargo test --release -p yash-app-eventsd replay_publication_benchmark -- --ignored --nocapture
 cargo test --release -p yash-app-events-capture-pw packed_capture_copy_benchmark -- --ignored --nocapture
 ```
+
+## Follow-up hot-path audit, 2026-09-21
+
+The follow-up pass re-audited the live frame loop, rule dispatch, detector ownership,
+suite image flow, and output-route worker. Fixes were applied from highest to lowest
+observed cost or frequency:
+
+1. Live analysis now rejects frames above the configured 1–10 FPS rate before submitting
+   a blocking worker job. The latest-frame poll runs at half the configured analysis
+   interval and skips missed timer ticks, so the worker does not wake at 200 Hz for a
+   10 FPS pipeline.
+2. Collection admission is checked before building observation evidence or cloning
+   collection observations. Disabled, throttled, and already-writing collectors now
+   avoid all full-frame thumbnail work and per-observation evidence copies.
+3. Rule dispatch is indexed by affected element IDs. Composite rule evaluation folds
+   its bounded conditions without a temporary vector or synthetic observation allocation.
+   Scene overlay duplicate suppression uses a highest-priority target index, and the
+   live active-element set is retained between frames.
+4. Derived observations consume the typed latest-observation map directly instead of
+   serializing to JSON and deserializing back through the composition path. Spatial suite
+   cases decode each PNG once and share its pixel storage with the analysis frame.
+5. Detector crops now use ownership-taking preprocessing and move stateful image buffers
+   into detector state without an unconditional clone. Color-bar scratch vectors and
+   live overlay IDs are reused between evaluations.
+6. The output-route worker caches validated per-profile route vectors and refreshes them
+   on route list/set/enable/remove/install operations, removing repeated route-config
+   file reads and JSON parsing from state publication.
+
+Targeted daemon, engine, and vision tests passed after each relevant change. The final
+workspace run passed 198 tests with 2 ignored, and strict workspace Clippy passed. A fresh
+release detector sample on this host measured color bar 5.441 µs, template 47.371 µs, and
+region change 5.215 µs per evaluation; these are workload samples, not supported-system
+targets. No new interactive portal or native GUI capture run was performed.
+
+## Additional hot-path audit fixes, 2026-09-21
+
+The audit continued through the remaining high-frequency publication, route, resolver,
+and GUI paths:
+
+1. Latest daemon state is retained as one immutable typed `Arc<StateSnapshot>`. Each
+   analyzed frame no longer converts that snapshot into a second full JSON value just
+   for `state.get` and the route queue; readers clone the `Arc` and serialize only at
+   the RPC boundary. The route worker shares the same snapshot instead of receiving a
+   deep copy.
+2. `state.json` still uses same-directory atomic replacement, but its per-frame write
+   now flushes userspace buffers without forcing a filesystem sync barrier. Event-log
+   flush/rotation and atomic-replace output routes retain their existing durability
+   policies.
+3. Full output routes no longer serialize an unused `{kind,event,state}` context before
+   serializing the selected event or state. State routes render once for deduplication
+   and reuse that rendered payload for delivery.
+4. Scene and overlay resolution builds stable profile indexes once and precomputes
+   caller-hint ranks, removing repeated linear profile scans from sort and target
+   suppression paths.
+5. The GUI caches pretty-printed scene context and event state until the next state
+   response, indexes profile identities for the live observation panel, avoids per-frame
+   route/recipe/collection vector clones, and uses a slower repaint interval while idle.
+6. The route cache mutex is no longer held during sink execution. Cached profiles with
+   no enabled route matching the job type skip queue submission, and rendered state
+   payloads for removed routes are pruned from the worker's deduplication cache.
+
+Targeted output, daemon, engine, and GUI tests passed after these changes; strict
+workspace Clippy also passes. These fixes were verified functionally and are not
+represented as new benchmark targets without a representative interactive workload.
+
+## Final hot-path audit, 2026-09-21
+
+A further audit included the uncommitted application changes and checked the remaining
+suite, live, status, output, resolver, and GUI repaint paths:
+
+1. One-shot and spatial-suite PNG analysis now hashes the bytes already read for decoding
+   instead of opening the fixture a second time. One-shot scene resolution evaluates one
+   frame once, so an N-of-M requirement cannot be fabricated by replaying the same image;
+   suite pipeline construction also borrows the loaded profile rather than cloning the
+   complete document for each case. Canonical suite roots are reused while per-image
+   canonicalization and traversal checks remain in place.
+2. Scene-aware live detector scheduling precomputes enabled-processor and anchor indexes,
+   processes only active contextual indexes, and releases only previously active contextual
+   processors. Detector order and lazy construction behavior remain unchanged.
+3. Status process accounting checks its 500 ms cache before reading `/proc`, and parses
+   CPU ticks without allocating a temporary field vector. A parser regression test covers
+   command names containing `)` and malformed input.
+4. The output worker now validates a route once before rendering/delivery, while public
+   untrusted helpers retain their validation guarantees. Atomic replace routes still use
+   same-directory temporary-file replacement, but flush userspace buffers without forcing
+   a file and directory sync barrier on every delivery.
+5. The GUI caches profile-derived observation names, detector labels, regions, and derived
+   inputs. The live observation panel still sorts current observations and reads current
+   values each repaint, but no longer rebuilds profile indexes on every egui frame.
+
+The final verification for this pass is formatting, strict workspace Clippy, all-feature
+workspace tests, README claim checks, and workspace documentation generation. No fresh
+portal or native GUI capture run was performed, and no GPU/shared-memory or concurrent
+suite change was made without a representative workload.
 
 ## Deterministic detector microbenchmark
 

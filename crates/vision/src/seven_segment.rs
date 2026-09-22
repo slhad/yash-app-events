@@ -40,7 +40,7 @@ impl Detector for SevenSegmentDetector {
     #[allow(clippy::cast_precision_loss)]
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let image = match grayscale_crop(frame, region)
-            .and_then(|image| self.config.preprocessing.apply(&image))
+            .and_then(|image| self.config.preprocessing.apply_owned(image))
         {
             Ok(image) => image,
             Err(error) => {

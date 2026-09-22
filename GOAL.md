@@ -9,7 +9,8 @@ CLI, and local JSON-RPC protocol.
 
 That release goal is complete. Later work added OCR, image classification, output routing,
 the public profile catalog, scene-aware analysis, profile bundles, transition context,
-capacity diagnostics, and the 2026-09-20 performance audit.
+capacity diagnostics, and the 2026-09-20/21 performance audits, including the final
+one-shot, live-scheduling, output, and GUI repaint follow-up.
 
 Current authority is deliberately small:
 

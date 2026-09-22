@@ -106,7 +106,7 @@ impl OcrDetector {
 impl Detector for OcrDetector {
     fn detect(&mut self, frame: &Frame, region: NormalizedRegion) -> Detection {
         let image = match grayscale_crop(frame, region)
-            .and_then(|image| self.config.preprocessing.apply(&image))
+            .and_then(|image| self.config.preprocessing.apply_owned(image))
         {
             Ok(image) => image,
             Err(error) => return Detection::error(format!("OCR preprocessing failed: {error}")),
@@ -118,9 +118,9 @@ impl Detector for OcrDetector {
         let refresh_due = self.last_run_ms.is_none_or(|last| {
             timestamp_ms.saturating_sub(last) >= self.config.maximum_interval_ms
         });
-        self.previous = Some(image.clone());
         if !changed && !refresh_due {
             if let Some(mut cached) = self.last_detection.clone() {
+                self.previous = Some(image);
                 cached
                     .diagnostic
                     .push_str("; cached because crop is unchanged");
@@ -129,15 +129,20 @@ impl Detector for OcrDetector {
         }
         let encoded = match encode_grayscale_png(&image) {
             Ok(encoded) => encoded,
-            Err(error) => return Detection::error(error),
+            Err(error) => {
+                self.previous = Some(image);
+                return Detection::error(error);
+            }
         };
         if let Err(error) = self.engine.set_image_from_mem(&encoded) {
+            self.previous = Some(image);
             return Detection::error(format!("Tesseract rejected the OCR crop: {error}"));
         }
         let mut text = match self.engine.get_utf8_text() {
             Ok(text) => text.trim().to_owned(),
             Err(error) => {
-                return Detection::error(format!("Tesseract recognition failed: {error}"))
+                self.previous = Some(image);
+                return Detection::error(format!("Tesseract recognition failed: {error}"));
             }
         };
         let mut binary_fallback = false;
@@ -148,6 +153,7 @@ impl Detector for OcrDetector {
             }
         }
         if text.is_empty() {
+            self.previous = Some(image);
             self.last_run_ms = Some(timestamp_ms);
             if let Some(value) = &self.config.empty_value {
                 let detection = Detection {
@@ -190,6 +196,7 @@ impl Detector for OcrDetector {
                 }
             ),
         };
+        self.previous = Some(image);
         self.last_run_ms = Some(timestamp_ms);
         self.last_detection = Some(detection.clone());
         detection

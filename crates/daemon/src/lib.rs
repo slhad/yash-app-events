@@ -5,7 +5,7 @@ mod routes;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::{self, Cursor, Read as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -43,10 +43,10 @@ use yash_app_events_engine::{
     TemporalRule, TemporalRuleConfig, Transition, TransitionState, ValuePredicate,
 };
 use yash_app_events_output::{
-    execute_route, export_diagnostic_bundle, plan_diagnostic_bundle, render_payload,
-    DiagnosticBundle, DiagnosticCrop, DiagnosticLimits, EventRecord, EventState, OutputConfig,
-    OutputFormat, OutputRecipeSource, OutputRoute, OutputSink, OutputTrigger, OutputWriter,
-    RouteContext, StateSnapshot,
+    execute_rendered_route_validated, export_diagnostic_bundle, plan_diagnostic_bundle,
+    render_payload, DiagnosticBundle, DiagnosticCrop, DiagnosticLimits, EventRecord, EventState,
+    OutputConfig, OutputFormat, OutputRecipeSource, OutputRoute, OutputSink, OutputTrigger,
+    OutputWriter, RouteContext, StateSnapshot,
 };
 #[cfg(test)]
 use yash_app_events_output::{FileMode, OutputRecipe, OutputRecipeSink};
@@ -94,7 +94,7 @@ struct State {
     notifications: broadcast::Sender<Value>,
     sequence: AtomicU64,
     output: Mutex<OutputWriter>,
-    latest_snapshot: Mutex<Value>,
+    latest_snapshot: Mutex<Arc<StateSnapshot>>,
     output_error: Mutex<Option<String>>,
     latest_frame: LatestFrameSlot,
     capture: Mutex<Option<PortalCapture>>,
@@ -219,7 +219,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let listener = bind_socket(&config.socket_path).await?;
     let (notifications, _) = broadcast::channel(SUBSCRIPTION_CAPACITY);
     let instance = Uuid::new_v4();
-    let initial_state = serde_json::to_value(StateSnapshot {
+    let initial_state = Arc::new(StateSnapshot {
         schema: 1,
         daemon_instance: instance,
         sequence: 0,
@@ -229,7 +229,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         observations: json!({}),
         events: json!({}),
         context: Value::Null,
-    })?;
+    });
     let output_routes = routes::Router::spawn(
         LocalConfig::new(config.config_root.clone()),
         notifications.clone(),
@@ -563,35 +563,55 @@ async fn dispatch(
             .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
         method::OUTPUT_LIST => parse::<ProfileIdParam>(request.params)
             .and_then(|params| {
+                let profile_id = params.profile_id;
                 state
                     .local_config
-                    .output_routes(params.profile_id)
+                    .output_routes(profile_id)
+                    .inspect(|routes| {
+                        state
+                            .output_routes
+                            .replace_routes(profile_id, routes.clone());
+                    })
                     .map_err(internal_error)
             })
             .and_then(|routes| serde_json::to_value(routes).map_err(internal_error)),
         method::OUTPUT_SET => parse::<OutputSetParams>(request.params)
             .and_then(|mut params| {
                 params.route.source_recipe = None;
+                let profile_id = params.profile_id;
                 state
                     .local_config
-                    .set_output_route(params.profile_id, params.route)
+                    .set_output_route(profile_id, params.route)
+                    .inspect(|routes| {
+                        state
+                            .output_routes
+                            .replace_routes(profile_id, routes.clone());
+                    })
                     .map_err(internal_error)
             })
             .and_then(|routes| serde_json::to_value(routes).map_err(internal_error)),
         method::OUTPUT_ENABLE => parse::<OutputEnableParams>(request.params)
             .and_then(|params| {
+                let profile_id = params.profile_id;
                 state
                     .local_config
-                    .set_output_enabled(params.profile_id, params.route_id, params.enabled)
+                    .set_output_enabled(profile_id, params.route_id, params.enabled)
+                    .inspect(|routes| {
+                        state
+                            .output_routes
+                            .replace_routes(profile_id, routes.clone());
+                    })
                     .map_err(internal_error)
             })
             .and_then(|routes| serde_json::to_value(routes).map_err(internal_error)),
         method::OUTPUT_REMOVE => parse::<OutputRouteParams>(request.params).and_then(|params| {
-            state
+            let profile_id = params.profile_id;
+            let removed = state
                 .local_config
-                .remove_output_route(params.profile_id, params.route_id)
-                .map(|removed| json!({"removed":removed}))
-                .map_err(internal_error)
+                .remove_output_route(profile_id, params.route_id)
+                .map_err(internal_error)?;
+            state.output_routes.invalidate_routes(profile_id);
+            Ok(json!({"removed":removed}))
         }),
         method::OUTPUT_TEST => match parse::<OutputRouteParams>(request.params) {
             Ok(params) => test_output_route(state, params).await,
@@ -687,11 +707,15 @@ async fn dispatch(
             Ok(params) => install_catalog_profile(state, params).await,
             Err(error) => Err(error),
         },
-        method::STATE_GET => Ok(state
-            .latest_snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()),
+        method::STATE_GET => {
+            let snapshot = Arc::clone(
+                &*state
+                    .latest_snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            serde_json::to_value(snapshot.as_ref()).map_err(internal_error)
+        }
         method::ANALYZE_IMAGE
         | method::REPLAY_SYNTHETIC_HEALTH
         | method::DETECTOR_TEST
@@ -1066,6 +1090,7 @@ fn publish_replay<D: VisionDetector>(
     let mut publication = PublicationState::default();
     let mut emitted = Vec::new();
     let mut processed_count = 0_usize;
+    let capture = json!({"active":false,"source":"replay"});
     for frame in frames {
         let frame = frame?;
         let Some(processed) = processor.process(&frame) else {
@@ -1082,18 +1107,12 @@ fn publish_replay<D: VisionDetector>(
             profile_id,
             game,
             timestamp,
-            json!({"active":false,"source":"replay"}),
+            &capture,
             &mut publication,
         )? {
             emitted.push(record);
         }
-        publish_current_state(
-            state,
-            profile_id,
-            timestamp,
-            json!({"active":false,"source":"replay"}),
-            &mut publication,
-        )?;
+        publish_current_state(state, profile_id, timestamp, &capture, &mut publication);
     }
     Ok(json!({"frames": processed_count, "events": emitted}))
 }
@@ -1101,6 +1120,7 @@ fn publish_replay<D: VisionDetector>(
 #[derive(Debug, Default)]
 struct PublicationState {
     observations: serde_json::Map<String, Value>,
+    latest_observations: HashMap<ElementId, Observation>,
     event_states: serde_json::Map<String, Value>,
     context: Value,
     dirty: bool,
@@ -1166,17 +1186,25 @@ fn publish_processed(
     profile_id: &str,
     game: &str,
     timestamp: DateTime<Utc>,
-    capture: Value,
+    capture: &Value,
     publication: &mut PublicationState,
 ) -> Result<Option<Value>, RpcError> {
+    let ProcessedFrame {
+        observation,
+        transition,
+    } = processed;
+    let element_id = observation.element_id;
     publication.observations.insert(
-        processed.observation.element_id.to_string(),
-        serde_json::to_value(&processed.observation).map_err(internal_error)?,
+        element_id.to_string(),
+        serde_json::to_value(&observation).map_err(internal_error)?,
     );
+    publication
+        .latest_observations
+        .insert(element_id, observation);
     publication.dirty = true;
     let mut emitted = None;
     let mut event_record = None;
-    if let Some(transition) = processed.transition {
+    if let Some(transition) = transition {
         let sequence = state
             .sequence
             .fetch_add(1, Ordering::Relaxed)
@@ -1219,7 +1247,13 @@ fn publish_processed(
     }
     if let Some(record) = event_record {
         if let Ok(route_profile_id) = serde_json::from_value::<ProfileId>(json!(profile_id)) {
-            let snapshot = publication_snapshot(state, profile_id, timestamp, capture, publication);
+            let snapshot = Arc::new(publication_snapshot(
+                state,
+                profile_id,
+                timestamp,
+                capture,
+                publication,
+            ));
             if let Err(error) =
                 state
                     .output_routes
@@ -1236,7 +1270,7 @@ fn publication_snapshot(
     state: &State,
     profile_id: &str,
     timestamp: DateTime<Utc>,
-    capture: Value,
+    capture: &Value,
     publication: &PublicationState,
 ) -> StateSnapshot {
     StateSnapshot {
@@ -1244,7 +1278,7 @@ fn publication_snapshot(
         daemon_instance: state.instance,
         sequence: state.sequence.load(Ordering::Relaxed),
         updated_at: EventRecord::timestamp_rfc3339(timestamp),
-        capture,
+        capture: capture.clone(),
         active_profile: Some(profile_id.to_owned()),
         observations: Value::Object(publication.observations.clone()),
         events: Value::Object(publication.event_states.clone()),
@@ -1257,26 +1291,32 @@ fn publish_current_state(
     state: &State,
     profile_id: &str,
     timestamp: DateTime<Utc>,
-    capture: Value,
+    capture: &Value,
     publication: &mut PublicationState,
-) -> Result<bool, RpcError> {
+) -> bool {
     if !publication.dirty {
-        return Ok(false);
+        return false;
     }
-    let snapshot = publication_snapshot(state, profile_id, timestamp, capture, publication);
-    let snapshot_value = serde_json::to_value(&snapshot).map_err(internal_error)?;
+    let snapshot = Arc::new(publication_snapshot(
+        state,
+        profile_id,
+        timestamp,
+        capture,
+        publication,
+    ));
     if let Err(error) = state
         .output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .write_state(&snapshot)
+        .write_state(snapshot.as_ref())
     {
         set_output_error(state, &error.to_string());
     }
     if let Ok(route_profile_id) = serde_json::from_value::<ProfileId>(json!(profile_id)) {
-        if let Err(error) = state
-            .output_routes
-            .publish(route_profile_id, None, snapshot)
+        if let Err(error) =
+            state
+                .output_routes
+                .publish(route_profile_id, None, Arc::clone(&snapshot))
         {
             set_output_error(state, error);
         }
@@ -1284,9 +1324,9 @@ fn publish_current_state(
     *state
         .latest_snapshot
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot_value;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
     publication.dirty = false;
-    Ok(true)
+    true
 }
 
 fn synthetic_health_frame(
@@ -1417,14 +1457,12 @@ fn preview_output_recipe(
             sha256: entry.sha256,
         }),
     };
-    let snapshot = serde_json::from_value::<StateSnapshot>(
-        state
+    let snapshot = Arc::clone(
+        &*state
             .latest_snapshot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone(),
-    )
-    .map_err(internal_error)?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     let profile = state
         .profiles
         .load(params.profile_id)
@@ -1439,7 +1477,7 @@ fn preview_output_recipe(
                 "state_change"
             },
             event: event.as_ref(),
-            state: &snapshot,
+            state: snapshot.as_ref(),
         },
     )
     .map_err(internal_error)?;
@@ -1474,6 +1512,9 @@ fn install_output_recipe(
         .local_config
         .set_output_route(params.draft.profile_id, route.clone())
         .map_err(internal_error)?;
+    state
+        .output_routes
+        .replace_routes(params.draft.profile_id, routes.clone());
     Ok(json!({"installed":route,"routes":routes}))
 }
 
@@ -1511,14 +1552,12 @@ async fn test_output_route(state: &State, params: OutputRouteParams) -> Result<V
         .into_iter()
         .find(|route| route.id == params.route_id)
         .ok_or_else(|| RpcError::new(error_code::INVALID_PARAMS, "output route was not found"))?;
-    let snapshot = serde_json::from_value::<StateSnapshot>(
-        state
+    let snapshot = Arc::clone(
+        &*state
             .latest_snapshot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone(),
-    )
-    .map_err(internal_error)?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     let profile = state
         .profiles
         .load(params.profile_id)
@@ -1532,10 +1571,10 @@ async fn test_output_route(state: &State, params: OutputRouteParams) -> Result<V
                 "state_change"
             },
             event: event.as_ref(),
-            state: &snapshot,
+            state: snapshot.as_ref(),
         };
         let payload = render_payload(&route, &context)?;
-        let receipt = execute_route(&route, &context)?;
+        let receipt = execute_rendered_route_validated(&route, &payload)?;
         Ok::<Value, yash_app_events_output::OutputRouteError>(
             json!({"delivered":true,"payload":payload,"receipt":receipt}),
         )
@@ -1994,50 +2033,50 @@ fn evaluate_profile_replay(state: &State, manifest: &ReplayManifest) -> Result<V
             pipeline.published_overlays = current_overlays;
         }
         for processed in processed_frames {
-            let observation_timestamp_ms = processed.observation.timestamp_ms;
             let timestamp = start
                 + TimeDelta::milliseconds(
-                    i64::try_from(observation_timestamp_ms).unwrap_or(i64::MAX),
+                    i64::try_from(processed.observation.timestamp_ms).unwrap_or(i64::MAX),
                 );
             transitions.extend(publish_replay_observation(
                 state,
                 &mut pipeline.rules,
+                &pipeline.rule_indices,
                 &replay_context,
                 &processed.observation,
                 timestamp,
                 &mut publication,
             )?);
             observations.push(processed.observation);
-            for derived in &pipeline.derived {
-                let Some(observation) = compose_observation(
-                    derived,
-                    &publication.observations,
-                    observation_timestamp_ms,
-                ) else {
-                    continue;
-                };
-                transitions.extend(publish_replay_observation(
-                    state,
-                    &mut pipeline.rules,
-                    &replay_context,
-                    &observation,
-                    timestamp,
-                    &mut publication,
-                )?);
-                observations.push(observation);
-            }
         }
-        let timestamp = start
-            + TimeDelta::milliseconds(
-                i64::try_from(frame.timestamp.as_millis()).unwrap_or(i64::MAX),
-            );
+        let frame_timestamp_ms = u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX);
+        let timestamp =
+            start + TimeDelta::milliseconds(i64::try_from(frame_timestamp_ms).unwrap_or(i64::MAX));
+        for derived in &pipeline.derived {
+            let Some(observation) = compose_observation(
+                derived,
+                &publication.latest_observations,
+                frame_timestamp_ms,
+            ) else {
+                continue;
+            };
+            transitions.extend(publish_replay_observation(
+                state,
+                &mut pipeline.rules,
+                &pipeline.rule_indices,
+                &replay_context,
+                &observation,
+                timestamp,
+                &mut publication,
+            )?);
+            observations.push(observation);
+        }
         publish_current_state(
             state,
             &pipeline.profile_id,
             timestamp,
-            capture.clone(),
+            &capture,
             &mut publication,
-        )?;
+        );
     }
     let metrics = evaluate_replay(
         &manifest.expected_events,
@@ -2056,15 +2095,13 @@ struct ReplayPublicationContext<'a> {
 fn publish_replay_observation(
     state: &State,
     rules: &mut [CoordinatedRule],
+    rule_indices: &HashMap<ElementId, Vec<usize>>,
     context: &ReplayPublicationContext<'_>,
     observation: &Observation,
     timestamp: DateTime<Utc>,
     publication: &mut PublicationState,
 ) -> Result<Vec<Transition>, RpcError> {
-    let transitions: Vec<_> = rules
-        .iter_mut()
-        .filter_map(|rule| rule.observe(observation))
-        .collect();
+    let transitions = observe_indexed_rules(rules, rule_indices, observation);
     if transitions.is_empty() {
         publish_processed(
             state,
@@ -2075,7 +2112,7 @@ fn publish_replay_observation(
             context.profile_id,
             context.game,
             timestamp,
-            context.capture.clone(),
+            context.capture,
             publication,
         )?;
     } else {
@@ -2089,7 +2126,7 @@ fn publish_replay_observation(
                 context.profile_id,
                 context.game,
                 timestamp,
-                context.capture.clone(),
+                context.capture,
                 publication,
             )?;
         }
@@ -2358,7 +2395,7 @@ fn evaluate_regression_suite(
     let profile_load_started = Instant::now();
     update_suite_progress(operation, "profile_load", 0, 1, None)?;
     require_in_inventory(&inventory, &suite.profile)?;
-    let profile_path = safe_suite_path(&root, &suite.profile)?;
+    let profile_path = safe_suite_path_from_canonical_root(&root, &suite.profile)?;
     let profile = load_profile(&profile_path).map_err(internal_error)?;
     profile.validate().map_err(internal_error)?;
     if profile.game != suite.game {
@@ -2383,7 +2420,8 @@ fn evaluate_regression_suite(
     for (case_index, case_path) in suite.cases.iter().enumerate() {
         let evaluation_started = Instant::now();
         require_in_inventory(&inventory, case_path)?;
-        let case: RegressionCase = read_suite_document(&safe_suite_path(&root, case_path)?)?;
+        let case: RegressionCase =
+            read_suite_document(&safe_suite_path_from_canonical_root(&root, case_path)?)?;
         let Some(selection_reasons) = suite_case_selection(options, &case) else {
             continue;
         };
@@ -2694,7 +2732,7 @@ fn verify_suite_inventory(
                 "duplicate suite file",
             ));
         }
-        let path = safe_suite_path(root, &entry.path)?;
+        let path = safe_suite_path_from_canonical_root(root, &entry.path)?;
         let actual = hash_suite_file(&path)?;
         if actual != entry.sha256.to_ascii_lowercase() {
             return Err(RpcError::new(
@@ -2733,7 +2771,7 @@ fn suite_inventory_metadata(
         .files
         .iter()
         .map(|entry| {
-            let path = safe_suite_path(root, &entry.path)?;
+            let path = safe_suite_path_from_canonical_root(root, &entry.path)?;
             let metadata = fs::metadata(path).map_err(internal_error)?;
             Ok(SuiteFileMetadata {
                 path: entry.path.clone(),
@@ -2776,7 +2814,13 @@ fn require_in_inventory(inventory: &HashSet<PathBuf>, path: &Path) -> Result<(),
     }
 }
 
+#[cfg(test)]
 fn safe_suite_path(root: &Path, relative: &Path) -> Result<PathBuf, RpcError> {
+    let root = fs::canonicalize(root).map_err(internal_error)?;
+    safe_suite_path_from_canonical_root(&root, relative)
+}
+
+fn safe_suite_path_from_canonical_root(root: &Path, relative: &Path) -> Result<PathBuf, RpcError> {
     if relative.is_absolute()
         || relative
             .components()
@@ -2787,9 +2831,8 @@ fn safe_suite_path(root: &Path, relative: &Path) -> Result<PathBuf, RpcError> {
             "suite paths must be package-relative without parent traversal",
         ));
     }
-    let root = fs::canonicalize(root).map_err(internal_error)?;
     let path = fs::canonicalize(root.join(relative)).map_err(internal_error)?;
-    if !path.starts_with(&root) || !path.is_file() {
+    if !path.starts_with(root) || !path.is_file() {
         return Err(RpcError::new(
             error_code::INVALID_PARAMS,
             "suite path escapes the package or is not a regular file",
@@ -2875,7 +2918,7 @@ fn evaluate_suite_case(
         .load_settings()
         .map_err(internal_error)?
         .analysis_fps;
-    let mut pipeline = build_profile_pipeline(profile.clone(), profile_directory, analysis_fps)?;
+    let mut pipeline = build_profile_pipeline(profile, profile_directory, analysis_fps)?;
     let mut latest: HashMap<ElementId, Observation> = HashMap::new();
     let mut transitions = Vec::new();
     let mut assertion_results = Vec::new();
@@ -2895,22 +2938,43 @@ fn evaluate_suite_case(
         .map(|element| (element.id, &element.detector))
         .collect::<HashMap<_, _>>();
     for (sequence, sample) in case.frames.iter().enumerate() {
-        let spatial_analysis = if sample.has_spatial_assertions() {
-            let image_path = safe_suite_path(root, &sample.image)?;
-            Some(analyze_image_with_profile(
+        let (spatial_analysis, frame) = if sample.has_spatial_assertions() {
+            let image_path = safe_suite_path_from_canonical_root(root, &sample.image)?;
+            let (image, frame_sha256) = decode_suite_png_with_hash(&image_path)?;
+            if sample.expected_frame.is_none()
+                && (image.width != profile.layout.reference_width
+                    || image.height != profile.layout.reference_height)
+            {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "full-frame fixture must match the profile reference resolution",
+                ));
+            }
+            let frame = suite_image_to_frame(
+                image,
+                u64::try_from(sequence).unwrap_or(u64::MAX),
+                Duration::from_millis(sample.timestamp_ms),
+                "external-suite",
+            )?;
+            let analysis_frame =
+                clone_frame_with_timestamp(&frame, 0, Duration::ZERO, "one-shot-png")?;
+            let analysis = analyze_frame_with_profile(
                 profile,
                 profile_directory,
-                &image_path,
+                &analysis_frame,
+                &frame_sha256,
                 120_000,
                 None,
-            )?)
+            )?;
+            (Some(analysis), frame)
         } else {
-            None
+            (
+                None,
+                prepare_suite_frame(root, profile, aliases, sample, sequence)?,
+            )
         };
-        let frame = prepare_suite_frame(root, profile, aliases, sample, sequence)?;
         decoded_image_bytes = decoded_image_bytes.saturating_add(frame.data.len());
         if spatial_analysis.is_some() {
-            decoded_image_bytes = decoded_image_bytes.saturating_add(frame.data.len());
             spatial_detector_evaluations = spatial_detector_evaluations.saturating_add(
                 spatial_analysis
                     .as_ref()
@@ -2931,34 +2995,25 @@ fn evaluate_suite_case(
                 }
                 _ => {}
             }
-            transitions.extend(
-                pipeline
-                    .rules
-                    .iter_mut()
-                    .filter_map(|rule| rule.observe(&processed.observation)),
-            );
+            transitions.extend(observe_indexed_rules(
+                &mut pipeline.rules,
+                &pipeline.rule_indices,
+                &processed.observation,
+            ));
             latest.insert(processed.observation.element_id, processed.observation);
         }
-        let serialized: serde_json::Map<String, Value> = latest
-            .iter()
-            .map(|(id, observation)| {
-                (
-                    id.to_string(),
-                    serde_json::to_value(observation).unwrap_or(Value::Null),
-                )
-            })
-            .collect();
-        for derived in &pipeline.derived {
-            if let Some(observation) =
-                compose_observation(derived, &serialized, sample.timestamp_ms)
-            {
-                transitions.extend(
-                    pipeline
-                        .rules
-                        .iter_mut()
-                        .filter_map(|rule| rule.observe(&observation)),
-                );
-                latest.insert(observation.element_id, observation);
+        if !pipeline.derived.is_empty() {
+            for derived in &pipeline.derived {
+                if let Some(observation) =
+                    compose_observation(derived, &latest, sample.timestamp_ms)
+                {
+                    transitions.extend(observe_indexed_rules(
+                        &mut pipeline.rules,
+                        &pipeline.rule_indices,
+                        &observation,
+                    ));
+                    latest.insert(observation.element_id, observation);
+                }
             }
         }
         for (target, expected) in &sample.expected_observations {
@@ -3350,7 +3405,7 @@ fn prepare_suite_frame(
     sample: &SuiteFrame,
     sequence: usize,
 ) -> Result<Arc<Frame>, RpcError> {
-    let image = decode_suite_png(&safe_suite_path(root, &sample.image)?)?;
+    let image = decode_suite_png(&safe_suite_path_from_canonical_root(root, &sample.image)?)?;
     let reference_width = profile.layout.reference_width;
     let reference_height = profile.layout.reference_height;
     let spatial_full_frame =
@@ -3445,6 +3500,52 @@ struct SuiteImage {
     pixels: Vec<u8>,
 }
 
+fn suite_image_to_frame(
+    image: SuiteImage,
+    sequence: u64,
+    timestamp: Duration,
+    source: &str,
+) -> Result<Arc<Frame>, RpcError> {
+    Frame::new(
+        sequence,
+        timestamp,
+        FrameLayout {
+            width: image.width,
+            height: image.height,
+            row_stride: usize::try_from(image.width)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4),
+            format: PixelFormat::Rgba8,
+        },
+        Some(source.to_owned()),
+        Arc::from(image.pixels),
+    )
+    .map(Arc::new)
+    .map_err(internal_error)
+}
+
+fn clone_frame_with_timestamp(
+    frame: &Frame,
+    sequence: u64,
+    timestamp: Duration,
+    source: &str,
+) -> Result<Arc<Frame>, RpcError> {
+    Frame::new(
+        sequence,
+        timestamp,
+        FrameLayout {
+            width: frame.width,
+            height: frame.height,
+            row_stride: frame.row_stride,
+            format: frame.format,
+        },
+        Some(source.to_owned()),
+        Arc::clone(&frame.data),
+    )
+    .map(Arc::new)
+    .map_err(internal_error)
+}
+
 fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
     if fs::metadata(path).map_err(internal_error)?.len() > 16 * 1024 * 1024 {
         return Err(RpcError::new(
@@ -3452,9 +3553,38 @@ fn decode_suite_png(path: &Path) -> Result<SuiteImage, RpcError> {
             "PNG exceeds 16 MiB",
         ));
     }
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(
+    decode_suite_png_reader(std::io::BufReader::new(
         fs::File::open(path).map_err(internal_error)?,
-    ));
+    ))
+}
+
+fn decode_suite_png_with_hash(path: &Path) -> Result<(SuiteImage, String), RpcError> {
+    let metadata_length = fs::metadata(path).map_err(internal_error)?.len();
+    if metadata_length > 16 * 1024 * 1024 {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "PNG exceeds 16 MiB",
+        ));
+    }
+    let file = fs::File::open(path).map_err(internal_error)?;
+    let capacity = usize::try_from(metadata_length).unwrap_or(16 * 1024 * 1024);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(internal_error)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(RpcError::new(
+            error_code::INVALID_PARAMS,
+            "PNG exceeds 16 MiB",
+        ));
+    }
+    let frame_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let image = decode_suite_png_reader(Cursor::new(bytes))?;
+    Ok((image, frame_sha256))
+}
+
+fn decode_suite_png_reader(reader: impl io::Read + io::Seek) -> Result<SuiteImage, RpcError> {
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(reader));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(internal_error)?;
     let header = reader.info();
@@ -4139,28 +4269,33 @@ fn analyze_image_with_profile(
     timeout_ms: u64,
     context: Option<&AnalysisContext>,
 ) -> Result<Value, RpcError> {
-    let started = Instant::now();
-    let image = decode_suite_png(path)?;
-    let frame = Frame::new(
-        0,
-        Duration::ZERO,
-        FrameLayout {
-            width: image.width,
-            height: image.height,
-            row_stride: usize::try_from(image.width)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(4),
-            format: PixelFormat::Rgba8,
-        },
-        Some("one-shot-png".into()),
-        Arc::from(image.pixels),
+    let (image, frame_sha256) = decode_suite_png_with_hash(path)?;
+    let frame = suite_image_to_frame(image, 0, Duration::ZERO, "one-shot-png")?;
+    analyze_frame_with_profile(
+        profile,
+        directory,
+        &frame,
+        &frame_sha256,
+        timeout_ms,
+        context,
     )
-    .map_err(internal_error)?;
-    let mut pipeline = build_profile_pipeline(profile.clone(), directory, 10)?;
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_frame_with_profile(
+    profile: &Profile,
+    directory: &Path,
+    frame: &Frame,
+    frame_sha256: &str,
+    timeout_ms: u64,
+    context: Option<&AnalysisContext>,
+) -> Result<Value, RpcError> {
+    let started = Instant::now();
+    let mut pipeline = build_profile_pipeline(profile, directory, 10)?;
     let mut processed = if pipeline.scene_model_enabled {
-        pipeline.process_anchor_detectors(&frame)?.0
+        pipeline.process_anchor_detectors(frame)?.0
     } else {
-        pipeline.process_all_detectors(&frame)?
+        pipeline.process_all_detectors(frame)?
     };
     let mut observations = HashMap::new();
     for item in &processed {
@@ -4172,34 +4307,13 @@ fn analyze_image_with_profile(
             "image analysis timed out",
         ));
     }
-    let samples = profile
-        .scenes
-        .iter()
-        .map(|scene| scene.required_samples)
-        .chain(
-            profile
-                .overlays
-                .iter()
-                .map(|overlay| overlay.required_samples),
-        )
-        .max()
-        .unwrap_or(1);
     let context_resolution = analysis_context_for_profile(profile, context);
     let mut resolver = SceneResolver::new(profile.scenes.clone(), profile.overlays.clone());
-    let mut resolution = SceneResolution {
-        scene: None,
-        overlays: Vec::new(),
-        ambiguous: false,
-        candidates: Vec::new(),
-        overlay_candidates: Vec::new(),
-    };
-    for _ in 0..samples {
-        resolution = resolver.resolve_with_hints(&observations, Some(&context_resolution.hints));
-    }
+    let resolution = resolver.resolve_with_hints(&observations, Some(&context_resolution.hints));
     let active_element_ids = active_element_ids(profile, &resolution);
     if pipeline.scene_model_enabled {
         pipeline.release_inactive_contextual(&active_element_ids);
-        let contextual = pipeline.process_context_detectors(&frame, &active_element_ids)?;
+        let contextual = pipeline.process_context_detectors(frame, &active_element_ids)?;
         for item in contextual {
             observations.insert(item.observation.element_id, item.observation.clone());
             processed.push(item);
@@ -4211,22 +4325,9 @@ fn analyze_image_with_profile(
             "image analysis timed out",
         ));
     }
-    let mut serialized_observations = observations
-        .iter()
-        .map(|(id, observation)| {
-            (
-                id.to_string(),
-                serde_json::to_value(observation).unwrap_or(Value::Null),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
     let mut derived_observations = Vec::new();
     for derived in &pipeline.derived {
-        if let Some(observation) = compose_observation(derived, &serialized_observations, 0) {
-            serialized_observations.insert(
-                observation.element_id.to_string(),
-                serde_json::to_value(&observation).map_err(internal_error)?,
-            );
+        if let Some(observation) = compose_observation(derived, &observations, 0) {
             observations.insert(observation.element_id, observation.clone());
             derived_observations.push(json!({
                 "id":derived.id,
@@ -4443,8 +4544,6 @@ fn analyze_image_with_profile(
     } else {
         valid_elements as f64 / elements.len() as f64
     };
-    let bytes = fs::read(path).map_err(internal_error)?;
-    let frame_sha256 = format!("{:x}", Sha256::digest(&bytes));
     let layout_compatible = layout_is_compatible(profile, frame.width, frame.height);
     if !layout_compatible {
         suggested_crops.clear();
@@ -5814,9 +5913,14 @@ fn process_running(needle: &str) -> bool {
 struct LivePipeline {
     processors: Vec<LazyProcessor>,
     processor_ids: Vec<ElementId>,
+    processor_indices: HashMap<ElementId, usize>,
+    anchor_indices: Vec<usize>,
+    active_contextual_indices: Vec<usize>,
     directory: PathBuf,
     analysis_fps: u8,
+    frame_scheduler: AnalysisScheduler,
     anchor_ids: HashSet<ElementId>,
+    active_elements: HashSet<ElementId>,
     scene_elements: HashMap<SceneId, HashSet<ElementId>>,
     overlay_elements: HashMap<OverlayId, HashSet<ElementId>>,
     scene_resolver: SceneResolver,
@@ -5830,6 +5934,7 @@ struct LivePipeline {
     last_gated_detectors: usize,
     last_throttled_detectors: usize,
     rules: Vec<CoordinatedRule>,
+    rule_indices: HashMap<ElementId, Vec<usize>>,
     derived: Vec<yash_app_events_profile::DerivedObservation>,
     initial_events: Vec<String>,
     profile_id: String,
@@ -5841,7 +5946,28 @@ struct LivePipeline {
 }
 
 impl LivePipeline {
+    fn should_analyze_frame(&mut self, timestamp: Duration) -> bool {
+        self.frame_scheduler.should_analyze(timestamp)
+    }
+
+    fn mark_frame_throttled(&mut self) {
+        self.last_evaluated_detectors = 0;
+        self.last_gated_detectors = 0;
+        self.last_throttled_detectors = self.processors.len();
+    }
+
     fn process_scene_aware(&mut self, frame: &Frame) -> Result<Vec<ProcessedFrame>, RpcError> {
+        if !self.should_analyze_frame(frame.timestamp) {
+            self.mark_frame_throttled();
+            return Ok(Vec::new());
+        }
+        self.process_scene_aware_scheduled(frame)
+    }
+
+    fn process_scene_aware_scheduled(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<Vec<ProcessedFrame>, RpcError> {
         if !self.scene_model_enabled {
             let processed = self.process_all_detectors(frame)?;
             self.last_evaluated_detectors = processed.len();
@@ -5856,7 +5982,9 @@ impl LivePipeline {
             self.scene_resolution_initialized = true;
         }
 
-        let mut active = self.anchor_ids.clone();
+        let mut active = std::mem::take(&mut self.active_elements);
+        active.clear();
+        active.extend(self.anchor_ids.iter().copied());
         if let Some(scene) = &self.scene_resolution.scene {
             if let Some(elements) = self.scene_elements.get(&scene.id) {
                 active.extend(elements);
@@ -5868,11 +5996,13 @@ impl LivePipeline {
             }
         }
         self.release_inactive_contextual(&active);
-        processed.extend(self.process_context_detectors(frame, &active)?);
+        let contextual = self.process_context_detectors(frame, &active);
+        self.active_elements = active;
+        processed.extend(contextual?);
         let eligible_detectors = self
-            .processor_ids
+            .active_elements
             .iter()
-            .filter(|element_id| active.contains(element_id))
+            .filter(|element_id| self.processor_indices.contains_key(element_id))
             .count();
         self.last_evaluated_detectors = processed.len();
         self.last_gated_detectors = self.processors.len().saturating_sub(eligible_detectors);
@@ -5896,11 +6026,10 @@ impl LivePipeline {
     ) -> Result<(Vec<ProcessedFrame>, bool), RpcError> {
         let mut processed = Vec::new();
         let mut anchors_updated = false;
-        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
-            if !self.anchor_ids.contains(element_id) {
-                continue;
-            }
-            if let Some(item) = processor.process(frame, &self.directory, self.analysis_fps)? {
+        for &index in &self.anchor_indices {
+            if let Some(item) =
+                self.processors[index].process(frame, &self.directory, self.analysis_fps)?
+            {
                 self.latest_anchors
                     .insert(item.observation.element_id, item.observation.clone());
                 processed.push(item);
@@ -5911,9 +6040,9 @@ impl LivePipeline {
     }
 
     fn release_inactive_contextual(&mut self, active: &HashSet<ElementId>) {
-        for processor in &mut self.processors {
-            if !self.anchor_ids.contains(&processor.id) && !active.contains(&processor.id) {
-                processor.release();
+        for &index in &self.active_contextual_indices {
+            if !active.contains(&self.processor_ids[index]) {
+                self.processors[index].release();
             }
         }
     }
@@ -5924,14 +6053,20 @@ impl LivePipeline {
         active: &HashSet<ElementId>,
     ) -> Result<Vec<ProcessedFrame>, RpcError> {
         let mut processed = Vec::new();
-        for (element_id, processor) in self.processor_ids.iter().zip(&mut self.processors) {
-            if self.anchor_ids.contains(element_id) || !active.contains(element_id) {
-                continue;
-            }
-            if let Some(item) = processor.process(frame, &self.directory, self.analysis_fps)? {
+        let mut active_contextual_indices = active
+            .iter()
+            .filter_map(|element_id| self.processor_indices.get(element_id).copied())
+            .filter(|index| !self.anchor_ids.contains(&self.processor_ids[*index]))
+            .collect::<Vec<_>>();
+        active_contextual_indices.sort_unstable();
+        for &index in &active_contextual_indices {
+            if let Some(item) =
+                self.processors[index].process(frame, &self.directory, self.analysis_fps)?
+            {
                 processed.push(item);
             }
         }
+        self.active_contextual_indices = active_contextual_indices;
         Ok(processed)
     }
 }
@@ -5939,6 +6074,7 @@ impl LivePipeline {
 #[derive(Debug)]
 struct CoordinatedRule {
     element_id: Option<ElementId>,
+    dependencies: Vec<ElementId>,
     runtime: Box<dyn ObservationRule + Send>,
 }
 
@@ -6018,7 +6154,7 @@ fn build_live_pipeline(state: &State, profile_id: ProfileId) -> Result<LivePipel
     let profile = state.profiles.load(profile_id).map_err(store_error)?;
     let settings = state.local_config.load_settings().map_err(internal_error)?;
     let directory = state.profiles.profile_directory(profile.id);
-    let mut pipeline = build_profile_pipeline(profile, &directory, settings.analysis_fps)?;
+    let mut pipeline = build_profile_pipeline(&profile, &directory, settings.analysis_fps)?;
     pipeline.collection_policy = state
         .local_config
         .collection_policy(profile_id)
@@ -6028,7 +6164,7 @@ fn build_live_pipeline(state: &State, profile_id: ProfileId) -> Result<LivePipel
 
 #[allow(clippy::too_many_lines)]
 fn build_profile_pipeline(
-    profile: Profile,
+    profile: &Profile,
     directory: &Path,
     analysis_fps: u8,
 ) -> Result<LivePipeline, RpcError> {
@@ -6082,6 +6218,16 @@ fn build_profile_pipeline(
         .copied()
         .chain(recognition_ids)
         .collect::<HashSet<_>>();
+    let processor_indices = processor_ids
+        .iter()
+        .enumerate()
+        .map(|(index, element_id)| (*element_id, index))
+        .collect::<HashMap<_, _>>();
+    let anchor_indices = processor_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element_id)| anchor_ids.contains(element_id).then_some(index))
+        .collect::<Vec<_>>();
     let scene_elements = profile
         .scenes
         .iter()
@@ -6123,12 +6269,18 @@ fn build_profile_pipeline(
         .iter()
         .map(build_coordinated_rule)
         .collect::<Result<Vec<_>, RpcError>>()?;
+    let rule_indices = build_rule_indices(&rules);
     Ok(LivePipeline {
         processors,
         processor_ids,
+        processor_indices,
+        anchor_indices,
+        active_contextual_indices: Vec::new(),
         directory: directory.to_path_buf(),
         analysis_fps,
+        frame_scheduler: AnalysisScheduler::new(analysis_fps).map_err(internal_error)?,
         anchor_ids,
+        active_elements: HashSet::new(),
         scene_elements,
         overlay_elements,
         scene_resolver,
@@ -6142,10 +6294,12 @@ fn build_profile_pipeline(
         last_gated_detectors: 0,
         last_throttled_detectors: 0,
         rules,
+        rule_indices,
         derived: profile
             .derived_observations
-            .into_iter()
+            .iter()
             .filter(|derived| derived.enabled)
+            .cloned()
             .collect(),
         initial_events: profile
             .rules
@@ -6153,7 +6307,7 @@ fn build_profile_pipeline(
             .map(|rule| rule.event.clone())
             .collect(),
         profile_id: profile.id.to_string(),
-        game: profile.game,
+        game: profile.game.clone(),
         profile_revision,
         profile_sha256,
         collection_aliases,
@@ -6165,6 +6319,14 @@ fn build_profile_pipeline(
 fn build_coordinated_rule(
     rule: &yash_app_events_profile::EventRule,
 ) -> Result<CoordinatedRule, RpcError> {
+    let mut dependencies = vec![rule.element_id];
+    if let RulePredicate::All { conditions } | RulePredicate::Any { conditions } = &rule.predicate {
+        for element_id in conditions.iter().map(|condition| condition.element_id) {
+            if !dependencies.contains(&element_id) {
+                dependencies.push(element_id);
+            }
+        }
+    }
     let common = || TemporalRuleConfig {
         id: rule.id,
         event: rule.event.clone(),
@@ -6264,13 +6426,47 @@ fn build_coordinated_rule(
     };
     Ok(CoordinatedRule {
         element_id,
+        dependencies,
         runtime,
     })
+}
+
+fn build_rule_indices(rules: &[CoordinatedRule]) -> HashMap<ElementId, Vec<usize>> {
+    let mut indices = HashMap::new();
+    for (index, rule) in rules.iter().enumerate() {
+        for element_id in &rule.dependencies {
+            indices
+                .entry(*element_id)
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
+    }
+    indices
+}
+
+fn observe_indexed_rules(
+    rules: &mut [CoordinatedRule],
+    rule_indices: &HashMap<ElementId, Vec<usize>>,
+    observation: &Observation,
+) -> Vec<Transition> {
+    let mut transitions = Vec::new();
+    let Some(indices) = rule_indices.get(&observation.element_id) else {
+        return transitions;
+    };
+    for index in indices {
+        if let Some(transition) = rules[*index].observe(observation) {
+            transitions.push(transition);
+        }
+    }
+    transitions
 }
 
 #[allow(clippy::too_many_lines)]
 fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
     let (stop, mut stopped) = oneshot::channel();
+    // The slot is latest-frame only, so polling faster than twice the configured
+    // analysis cadence cannot produce more useful work.
+    let poll_interval = Duration::from_millis(500 / u64::from(pipeline.analysis_fps));
     *state
         .analysis_metrics
         .lock()
@@ -6285,6 +6481,8 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
         );
     let task_state = Arc::clone(state);
     let task = tokio::spawn(async move {
+        let mut poll_timer = tokio::time::interval(poll_interval);
+        poll_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut publication = PublicationState::default();
         publication.event_states.extend(
             pipeline
@@ -6296,10 +6494,14 @@ fn start_live_analysis(state: &Arc<State>, mut pipeline: LivePipeline) {
         loop {
             tokio::select! {
                 _ = &mut stopped => break,
-                () = tokio::time::sleep(Duration::from_millis(5)) => {
+                _ = poll_timer.tick() => {
                     let Some(frame) = task_state.latest_frame.latest() else { continue; };
                     if last_sequence == Some(frame.sequence) { continue; }
                     last_sequence = Some(frame.sequence);
+                    if !pipeline.should_analyze_frame(frame.timestamp) {
+                        pipeline.mark_frame_throttled();
+                        continue;
+                    }
                     let worker_state = Arc::clone(&task_state);
                     let result = tokio::task::spawn_blocking(move || {
                         process_live_frame(&worker_state, &mut pipeline, &mut publication, &frame);
@@ -6333,16 +6535,32 @@ fn process_live_frame(
     frame: &Arc<Frame>,
 ) {
     let started = Instant::now();
+    let collect_evidence = state
+        .collector
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .due(Instant::now(), frame.sequence);
     let capture = json!({"active":true,"source":frame.source_id,"resolution":[frame.width,frame.height],"pixel_format":format!("{:?}",frame.format).to_ascii_lowercase()});
     let mut collection_observations = BTreeMap::new();
     let mut collection_transitions = Vec::new();
-    let processed_frames = match pipeline.process_scene_aware(frame) {
+    let processed_frames = match pipeline.process_scene_aware_scheduled(frame) {
         Ok(processed_frames) => processed_frames,
         Err(error) => {
             set_output_error(state, &format!("{}: {}", error.code, error.message));
             return;
         }
     };
+    let detector_errors = processed_frames
+        .iter()
+        .filter(|processed| {
+            processed.observation.status == yash_app_events_engine::ObservationStatus::Error
+        })
+        .count();
+    update_analysis_metrics(&state.analysis_metrics, started.elapsed(), detector_errors);
+    if processed_frames.is_empty() {
+        return;
+    }
+    let published_at = Utc::now();
     publication.context = json!({
         "scene": pipeline.scene_resolution.scene,
         "overlays": pipeline.scene_resolution.overlays,
@@ -6360,14 +6578,14 @@ fn process_live_frame(
         .scene
         .as_ref()
         .map(|scene| scene.id);
-    let current_overlays = pipeline
-        .scene_resolution
-        .overlays
-        .iter()
-        .map(|overlay| overlay.id)
-        .collect::<HashSet<_>>();
-    if current_scene != pipeline.published_scene || current_overlays != pipeline.published_overlays
-    {
+    let overlays_changed = pipeline.scene_resolution.overlays.len()
+        != pipeline.published_overlays.len()
+        || pipeline
+            .scene_resolution
+            .overlays
+            .iter()
+            .any(|overlay| !pipeline.published_overlays.contains(&overlay.id));
+    if current_scene != pipeline.published_scene || overlays_changed {
         if let Err(error) = publish_context_transition(
             state,
             &pipeline.profile_id,
@@ -6375,40 +6593,45 @@ fn process_live_frame(
             pipeline.published_scene,
             &pipeline.published_overlays,
             &pipeline.scene_resolution,
-            Utc::now(),
+            published_at,
         ) {
             set_output_error(state, &format!("{}: {}", error.code, error.message));
         }
         pipeline.published_scene = current_scene;
-        pipeline.published_overlays = current_overlays;
+        pipeline.published_overlays.clear();
+        pipeline.published_overlays.extend(
+            pipeline
+                .scene_resolution
+                .overlays
+                .iter()
+                .map(|overlay| overlay.id),
+        );
     }
     for processed in processed_frames {
-        if let Some(alias) = pipeline
-            .collection_aliases
-            .get(&processed.observation.element_id)
-        {
-            collection_observations.insert(alias.clone(), processed.observation.clone());
+        if collect_evidence {
+            if let Some(alias) = pipeline
+                .collection_aliases
+                .get(&processed.observation.element_id)
+            {
+                collection_observations.insert(alias.clone(), processed.observation.clone());
+            }
         }
-        let observation_timestamp_ms = processed.observation.timestamp_ms;
-        update_analysis_metrics(
-            &state.analysis_metrics,
-            started.elapsed(),
-            processed.observation.status == yash_app_events_engine::ObservationStatus::Error,
+        let transitions = observe_indexed_rules(
+            &mut pipeline.rules,
+            &pipeline.rule_indices,
+            &processed.observation,
         );
-        let transitions: Vec<_> = pipeline
-            .rules
-            .iter_mut()
-            .filter_map(|rule| rule.observe(&processed.observation))
-            .collect();
-        collection_transitions.extend(transitions.iter().cloned());
+        if collect_evidence {
+            collection_transitions.extend(transitions.iter().cloned());
+        }
         if transitions.is_empty() {
             if let Err(error) = publish_processed(
                 state,
                 processed,
                 &pipeline.profile_id,
                 &pipeline.game,
-                Utc::now(),
-                capture.clone(),
+                published_at,
+                &capture,
                 publication,
             ) {
                 set_output_error(state, &format!("{}: {}", error.code, error.message));
@@ -6424,82 +6647,86 @@ fn process_live_frame(
                     publication_item,
                     &pipeline.profile_id,
                     &pipeline.game,
-                    Utc::now(),
-                    capture.clone(),
+                    published_at,
+                    &capture,
                     publication,
                 ) {
                     set_output_error(state, &format!("{}: {}", error.code, error.message));
                 }
             }
         }
-        for derived in &pipeline.derived {
-            let Some(observation) =
-                compose_observation(derived, &publication.observations, observation_timestamp_ms)
-            else {
-                continue;
-            };
+    }
+    let derived_timestamp_ms = u64::try_from(frame.timestamp.as_millis()).unwrap_or(u64::MAX);
+    for derived in &pipeline.derived {
+        let Some(observation) = compose_observation(
+            derived,
+            &publication.latest_observations,
+            derived_timestamp_ms,
+        ) else {
+            continue;
+        };
+        if collect_evidence {
             if let Some(alias) = pipeline.collection_aliases.get(&observation.element_id) {
                 collection_observations.insert(alias.clone(), observation.clone());
             }
-            let transitions: Vec<_> = pipeline
-                .rules
-                .iter_mut()
-                .filter_map(|rule| rule.observe(&observation))
-                .collect();
+        }
+        let transitions =
+            observe_indexed_rules(&mut pipeline.rules, &pipeline.rule_indices, &observation);
+        if collect_evidence {
             collection_transitions.extend(transitions.iter().cloned());
-            if transitions.is_empty() {
+        }
+        if transitions.is_empty() {
+            let item = ProcessedFrame {
+                observation,
+                transition: None,
+            };
+            if let Err(error) = publish_processed(
+                state,
+                item,
+                &pipeline.profile_id,
+                &pipeline.game,
+                published_at,
+                &capture,
+                publication,
+            ) {
+                set_output_error(state, &format!("{}: {}", error.code, error.message));
+            }
+        } else {
+            for transition in transitions {
                 let item = ProcessedFrame {
-                    observation,
-                    transition: None,
+                    observation: observation.clone(),
+                    transition: Some(transition),
                 };
                 if let Err(error) = publish_processed(
                     state,
                     item,
                     &pipeline.profile_id,
                     &pipeline.game,
-                    Utc::now(),
-                    capture.clone(),
+                    published_at,
+                    &capture,
                     publication,
                 ) {
                     set_output_error(state, &format!("{}: {}", error.code, error.message));
                 }
-            } else {
-                for transition in transitions {
-                    let item = ProcessedFrame {
-                        observation: observation.clone(),
-                        transition: Some(transition),
-                    };
-                    if let Err(error) = publish_processed(
-                        state,
-                        item,
-                        &pipeline.profile_id,
-                        &pipeline.game,
-                        Utc::now(),
-                        capture.clone(),
-                        publication,
-                    ) {
-                        set_output_error(state, &format!("{}: {}", error.code, error.message));
-                    }
-                }
             }
         }
     }
-    if let Err(error) = publish_current_state(
+    publish_current_state(
         state,
         &pipeline.profile_id,
-        Utc::now(),
-        capture,
+        published_at,
+        &capture,
         publication,
-    ) {
-        set_output_error(state, &format!("{}: {}", error.code, error.message));
-    }
-    schedule_collection(
-        state,
-        pipeline,
-        Arc::clone(frame),
-        collection_observations,
-        collection_transitions,
     );
+    if collect_evidence {
+        schedule_collection(
+            state,
+            pipeline,
+            Arc::clone(frame),
+            collection_observations,
+            collection_transitions,
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6511,38 +6738,40 @@ fn schedule_collection(
     transitions: Vec<Transition>,
 ) {
     let now = Instant::now();
-    let thumbnail = collection::thumbnail(&frame);
-    let evidence =
-        collection::evidence_signature(&observations, &pipeline.collection_policy.novelty_targets);
-    let (policy, scene_difference, scene_novel, evidence_novel) = {
+    let (policy, previous_thumbnail, previous_evidence) = {
         let mut runtime = state
             .collector
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !runtime.due(now, frame.sequence) {
-            return;
-        }
-        runtime.last_attempt = Some(now);
-        let Some(policy) = runtime.policy.clone() else {
+        let Some(policy) = runtime.reserve_attempt(now, frame.sequence) else {
             return;
         };
-        let scene_difference = runtime
-            .last_thumbnail
-            .as_deref()
-            .and_then(|previous| collection::similarity(previous, &thumbnail));
-        let scene_novel =
-            scene_difference.is_none_or(|difference| difference > policy.similarity_threshold);
-        let evidence_novel = runtime
-            .last_evidence
-            .as_ref()
-            .is_none_or(|previous| previous != &evidence);
-        if !scene_novel && !evidence_novel && transitions.is_empty() {
-            runtime.duplicates = runtime.duplicates.saturating_add(1);
-            return;
-        }
-        runtime.write_in_progress = true;
-        (policy, scene_difference, scene_novel, evidence_novel)
+        (
+            policy,
+            runtime.last_thumbnail.clone(),
+            runtime.last_evidence.clone(),
+        )
     };
+    let thumbnail = collection::thumbnail(&frame);
+    let evidence =
+        collection::evidence_signature(&observations, &pipeline.collection_policy.novelty_targets);
+    let scene_difference = previous_thumbnail
+        .as_deref()
+        .and_then(|previous| collection::similarity(previous, &thumbnail));
+    let scene_novel =
+        scene_difference.is_none_or(|difference| difference > policy.similarity_threshold);
+    let evidence_novel = previous_evidence
+        .as_ref()
+        .is_none_or(|previous| previous != &evidence);
+    if !scene_novel && !evidence_novel && transitions.is_empty() {
+        let mut runtime = state
+            .collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.write_in_progress = false;
+        runtime.duplicates = runtime.duplicates.saturating_add(1);
+        return;
+    }
     let state = Arc::clone(state);
     let profile_id = pipeline.profile_id.clone();
     let profile_revision = pipeline.profile_revision;
@@ -6648,15 +6877,13 @@ fn schedule_collection(
 
 fn compose_observation(
     derived: &yash_app_events_profile::DerivedObservation,
-    observations: &serde_json::Map<String, Value>,
+    observations: &HashMap<ElementId, Observation>,
     timestamp_ms: u64,
 ) -> Option<Observation> {
     let mut text = derived.format.clone();
     let mut confidence = 1.0_f32;
     for input in &derived.inputs {
-        let observation: Observation =
-            serde_json::from_value(observations.get(&input.element_id.to_string())?.clone())
-                .ok()?;
+        let observation = observations.get(&input.element_id)?;
         if observation.status != yash_app_events_engine::ObservationStatus::Valid {
             return Some(Observation {
                 detector_id: derived.detector_id,
@@ -6668,8 +6895,8 @@ fn compose_observation(
                 diagnostic: format!("input {} is not valid", input.name),
             });
         }
-        let value = match observation.value {
-            yash_app_events_engine::ObservationValue::Text(value) => value,
+        let value = match &observation.value {
+            yash_app_events_engine::ObservationValue::Text(value) => value.clone(),
             yash_app_events_engine::ObservationValue::Number(value) => value.to_string(),
             yash_app_events_engine::ObservationValue::Boolean(value) => value.to_string(),
             yash_app_events_engine::ObservationValue::None => {
@@ -6698,7 +6925,7 @@ fn compose_observation(
     })
 }
 
-fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>, latency: Duration, errored: bool) {
+fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>, latency: Duration, errors: usize) {
     let now = Instant::now();
     let mut metrics = metrics
         .lock()
@@ -6707,7 +6934,9 @@ fn update_analysis_metrics(metrics: &Mutex<AnalysisMetrics>, latency: Duration, 
     metrics.last = Some(now);
     metrics.frames = metrics.frames.saturating_add(1);
     metrics.last_processing_latency = Some(latency);
-    metrics.detector_errors = metrics.detector_errors.saturating_add(u64::from(errored));
+    metrics.detector_errors = metrics
+        .detector_errors
+        .saturating_add(u64::try_from(errors).unwrap_or(u64::MAX));
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -6955,21 +7184,30 @@ struct ProcessSampler {
     last_usage: ProcessUsage,
 }
 
+fn process_cpu_time_ns(value: &str) -> Option<u64> {
+    let mut fields = value.rsplit_once(") ")?.1.split_whitespace();
+    let user = fields.nth(11)?.parse::<u64>().ok()?;
+    let system = fields.next()?.parse::<u64>().ok()?;
+    Some(user.saturating_add(system).saturating_mul(10_000_000))
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn process_usage() -> ProcessUsage {
     static SAMPLER: OnceLock<Mutex<ProcessSampler>> = OnceLock::new();
+    let now = Instant::now();
+    let mut sampler = SAMPLER
+        .get_or_init(|| Mutex::new(ProcessSampler::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if sampler
+        .previous_at
+        .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(500))
+    {
+        return sampler.last_usage;
+    }
     let cpu_ns = fs::read_to_string("/proc/self/stat")
         .ok()
-        .and_then(|value| {
-            let fields = value
-                .rsplit_once(") ")?
-                .1
-                .split_whitespace()
-                .collect::<Vec<_>>();
-            let user = fields.get(11)?.parse::<u64>().ok()?;
-            let system = fields.get(12)?.parse::<u64>().ok()?;
-            Some(user.saturating_add(system).saturating_mul(10_000_000))
-        });
+        .and_then(|value| process_cpu_time_ns(&value));
     let rss_bytes = fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|value| {
@@ -6983,17 +7221,6 @@ fn process_usage() -> ProcessUsage {
         })
         .unwrap_or(0)
         .saturating_mul(1024);
-    let now = Instant::now();
-    let mut sampler = SAMPLER
-        .get_or_init(|| Mutex::new(ProcessSampler::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if sampler
-        .previous_at
-        .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(500))
-    {
-        return sampler.last_usage;
-    }
     let cpu_percent = cpu_ns
         .zip(sampler.previous_cpu_ns)
         .zip(sampler.previous_at)
@@ -7386,6 +7613,29 @@ mod tests {
     use yash_app_events_profile::Profile;
 
     use super::*;
+
+    fn empty_snapshot() -> Arc<StateSnapshot> {
+        Arc::new(StateSnapshot {
+            schema: 1,
+            daemon_instance: Uuid::nil(),
+            sequence: 0,
+            updated_at: String::new(),
+            capture: Value::Null,
+            active_profile: None,
+            observations: Value::Null,
+            events: Value::Null,
+            context: Value::Null,
+        })
+    }
+
+    #[test]
+    fn process_cpu_time_parses_stat_fields_without_allocating_a_field_list() {
+        assert_eq!(
+            process_cpu_time_ns("42 (game ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13"),
+            Some(230_000_000)
+        );
+        assert_eq!(process_cpu_time_ns("malformed"), None);
+    }
 
     async fn start(
         directory: &Path,
@@ -8691,7 +8941,7 @@ mod tests {
         profile.scenes.push(disabled_scene);
         profile.validate().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let mut pipeline = build_profile_pipeline(profile.clone(), directory.path(), 10).unwrap();
+        let mut pipeline = build_profile_pipeline(&profile, directory.path(), 10).unwrap();
         assert_eq!(
             active_element_ids(&profile, &pipeline.scene_resolution),
             HashSet::from([anchor_id])
@@ -8812,7 +9062,7 @@ mod tests {
                 directory.path().join("state"),
                 OutputConfig::default(),
             )),
-            latest_snapshot: Mutex::new(json!({})),
+            latest_snapshot: Mutex::new(empty_snapshot()),
             output_error: Mutex::new(None),
             latest_frame: LatestFrameSlot::default(),
             capture: Mutex::new(None),
@@ -9113,7 +9363,7 @@ mod tests {
             bundled["analysis_context"]["preferred_scene_names"][0],
             json!("result")
         );
-        assert_eq!(*state.latest_snapshot.lock().unwrap(), json!({}));
+        assert_eq!(state.latest_snapshot.lock().unwrap().sequence, 0);
         assert_eq!(state.sequence.load(Ordering::Relaxed), 0);
         let scene_resolution = SceneResolution {
             scene: Some(yash_app_events_engine::ResolvedScene {
@@ -9263,7 +9513,7 @@ mod tests {
                 directory.path().join("state"),
                 OutputConfig::default(),
             )),
-            latest_snapshot: Mutex::new(json!({})),
+            latest_snapshot: Mutex::new(empty_snapshot()),
             output_error: Mutex::new(None),
             latest_frame: LatestFrameSlot::default(),
             capture: Mutex::new(None),
@@ -9372,7 +9622,7 @@ mod tests {
                 root.join("state"),
                 OutputConfig::default(),
             )),
-            latest_snapshot: Mutex::new(json!({})),
+            latest_snapshot: Mutex::new(empty_snapshot()),
             output_error: Mutex::new(None),
             latest_frame: LatestFrameSlot::default(),
             capture: Mutex::new(None),
@@ -9559,7 +9809,7 @@ mod tests {
                 .count(),
             4
         );
-        assert_eq!(state.latest_snapshot.lock().unwrap()["sequence"], 4);
+        assert_eq!(state.latest_snapshot.lock().unwrap().sequence, 4);
         {
             let mut lease = PreviewLease::new(Arc::clone(&state));
             lease.start();
@@ -9677,33 +9927,34 @@ mod tests {
                 &profile_id,
                 "synthetic_game",
                 timestamp,
-                Value::Null,
+                &Value::Null,
                 &mut publication,
             )
             .unwrap();
         }
         let path = directory.path().join("state/state.json");
         assert!(!path.exists(), "partial detector state reached disk");
-        assert_eq!(*state.latest_snapshot.lock().unwrap(), json!({}));
+        assert_eq!(state.latest_snapshot.lock().unwrap().sequence, 0);
         assert!(publish_current_state(
             &state,
             &profile_id,
             timestamp,
-            Value::Null,
+            &Value::Null,
             &mut publication
-        )
-        .unwrap());
+        ));
         let snapshot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(snapshot["observations"].as_object().unwrap().len(), 128);
-        assert_eq!(snapshot, *state.latest_snapshot.lock().unwrap());
+        assert_eq!(
+            snapshot,
+            serde_json::to_value(state.latest_snapshot.lock().unwrap().as_ref()).unwrap()
+        );
         assert!(!publish_current_state(
             &state,
             &profile_id,
             timestamp,
-            Value::Null,
+            &Value::Null,
             &mut publication
-        )
-        .unwrap());
+        ));
     }
 
     #[test]

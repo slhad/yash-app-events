@@ -10,7 +10,9 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{atomic_write_before_rename, EventRecord, EventState, StateSnapshot};
+use crate::{
+    atomic_write_before_rename, AtomicWriteDurability, EventRecord, EventState, StateSnapshot,
+};
 
 const MAXIMUM_TEMPLATE_BYTES: usize = 64 * 1024;
 const MAXIMUM_ARGUMENTS: usize = 64;
@@ -316,14 +318,26 @@ pub fn render_payload(
     context: &RouteContext<'_>,
 ) -> Result<Value, OutputRouteError> {
     route.validate()?;
-    let source = serde_json::to_value(context)?;
+    render_payload_validated(route, context)
+}
+
+fn render_payload_validated(
+    route: &OutputRoute,
+    context: &RouteContext<'_>,
+) -> Result<Value, OutputRouteError> {
     match &route.format {
         OutputFormat::Full => context.event.map_or_else(
             || serde_json::to_value(context.state).map_err(OutputRouteError::from),
             |event| serde_json::to_value(event).map_err(OutputRouteError::from),
         ),
-        OutputFormat::JsonTemplate { template } => render_value(template, &source),
-        OutputFormat::TextTemplate { template, .. } => render_text(template, &source),
+        OutputFormat::JsonTemplate { template } => {
+            let source = serde_json::to_value(context)?;
+            render_value(template, &source)
+        }
+        OutputFormat::TextTemplate { template, .. } => {
+            let source = serde_json::to_value(context)?;
+            render_text(template, &source)
+        }
     }
 }
 
@@ -336,7 +350,40 @@ pub fn execute_route(
     route: &OutputRoute,
     context: &RouteContext<'_>,
 ) -> Result<RouteReceipt, OutputRouteError> {
-    let payload = render_payload(route, context)?;
+    route.validate()?;
+    let payload = render_payload_validated(route, context)?;
+    execute_rendered_route_validated(route, &payload)
+}
+
+/// Delivers a payload that has already been rendered for the route.
+///
+/// This is useful when a caller needs to inspect the rendered value first, such as
+/// state-route deduplication. The route is still validated before reaching its sink.
+///
+/// # Errors
+///
+/// Returns route validation, serialization, file I/O, process, exit, or timeout errors.
+pub fn execute_rendered_route(
+    route: &OutputRoute,
+    payload: &Value,
+) -> Result<RouteReceipt, OutputRouteError> {
+    route.validate()?;
+    execute_rendered_route_validated(route, payload)
+}
+
+/// Delivers a rendered payload after the caller has already validated the route.
+///
+/// This is intended for the daemon's bounded route worker, which renders a state
+/// route before deduplication and therefore already validated it successfully.
+/// Callers handling untrusted route data should use [`execute_rendered_route`].
+///
+/// # Errors
+///
+/// Returns serialization, file I/O, process, exit, or timeout errors.
+pub fn execute_rendered_route_validated(
+    route: &OutputRoute,
+    payload: &Value,
+) -> Result<RouteReceipt, OutputRouteError> {
     let mut bytes = match &route.format {
         OutputFormat::TextTemplate { .. } => payload
             .as_str()
@@ -368,7 +415,11 @@ pub fn execute_route(
                     file.write_all(&bytes)?;
                     file.flush()?;
                 }
-                FileMode::Replace => atomic_write_before_rename(path, &bytes, || Ok(()))?,
+                FileMode::Replace => {
+                    atomic_write_before_rename(path, &bytes, AtomicWriteDurability::Flush, || {
+                        Ok(())
+                    })?;
+                }
             }
             None
         }

@@ -48,7 +48,20 @@ impl PreprocessPipeline {
     ///
     /// Rejects zero/oversized resize dimensions and invalid thresholds.
     pub fn apply(&self, input: &GrayImage) -> Result<GrayImage, &'static str> {
-        let mut image = input.clone();
+        self.apply_owned(input.clone())
+    }
+
+    /// Applies the pipeline while taking ownership of the input image.
+    ///
+    /// Detector hot paths already own the crop they just produced. Consuming
+    /// it avoids an otherwise unconditional full-image clone, including the
+    /// especially common empty-pipeline case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an operation has invalid dimensions, thresholds,
+    /// or morphology radius.
+    pub fn apply_owned(&self, mut image: GrayImage) -> Result<GrayImage, &'static str> {
         for operation in &self.operations {
             image = match *operation {
                 PreprocessOperation::Resize { width, height } => resize(&image, width, height)?,

@@ -60,6 +60,26 @@ impl Runtime {
         self.last_attempt
             .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(seconds))
     }
+
+    /// Reserves the next collection attempt before any frame-wide work begins.
+    ///
+    /// The live analysis loop calls this for every analyzed frame. Keeping the
+    /// admission check here means disabled, throttled, or already-writing
+    /// collectors never make the caller scan the full capture frame just to
+    /// discover that no item can be saved.
+    pub fn reserve_attempt(
+        &mut self,
+        now: Instant,
+        frame_sequence: u64,
+    ) -> Option<CollectionPolicy> {
+        if !self.due(now, frame_sequence) {
+            return None;
+        }
+        let policy = self.policy.clone()?;
+        self.last_attempt = Some(now);
+        self.write_in_progress = true;
+        Some(policy)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -452,6 +472,28 @@ mod tests {
     use super::*;
     use yash_app_events_capture::{FrameLayout, PixelFormat};
     use yash_app_events_profile::{DetectorId, ElementId};
+
+    #[test]
+    fn reservation_admits_only_enabled_due_attempts() {
+        let now = Instant::now();
+        let mut runtime = Runtime::default();
+        assert!(runtime.reserve_attempt(now, 0).is_none());
+        assert!(runtime.last_attempt.is_none());
+
+        runtime.policy = Some(CollectionPolicy::default());
+        assert!(runtime.reserve_attempt(now, 0).is_none());
+        assert!(runtime.last_attempt.is_none());
+
+        let policy = CollectionPolicy {
+            enabled: true,
+            ..CollectionPolicy::default()
+        };
+        runtime.policy = Some(policy.clone());
+        assert_eq!(runtime.reserve_attempt(now, 0), Some(policy));
+        assert!(runtime.last_attempt.is_some());
+        assert!(runtime.write_in_progress);
+        assert!(runtime.reserve_attempt(now, 1).is_none());
+    }
 
     fn frame(sequence: u64, changed: bool) -> Frame {
         let mut pixels = vec![40_u8; 64 * 36 * 4];

@@ -350,19 +350,106 @@ impl Worker {
 /// One in-memory capacity report, refreshed whenever the draft content changes.
 #[derive(Debug, Default)]
 struct CapacityCache {
-    entry: Option<(Profile, ProfileCapacityReport)>,
+    entry: Option<(ProfileId, ProfileCapacityReport)>,
 }
 
 impl CapacityCache {
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
+
     fn report(&mut self, profile: &Profile) -> &ProfileCapacityReport {
         if self
             .entry
             .as_ref()
-            .is_none_or(|(cached, _)| cached != profile)
+            .is_none_or(|(profile_id, _)| *profile_id != profile.id)
         {
-            self.entry = Some((profile.clone(), profile.analyze_capacity()));
+            self.entry = Some((profile.id, profile.analyze_capacity()));
         }
         &self.entry.as_ref().expect("capacity report initialized").1
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ObservationInputInfo {
+    name: String,
+    element_id: ElementId,
+    element_id_string: String,
+}
+
+#[derive(Clone, Debug)]
+struct ObservationInfo {
+    name: String,
+    kind: String,
+    region: Option<NormalizedRegion>,
+    format: Option<String>,
+    inputs: Vec<ObservationInputInfo>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObservationProfileIndex {
+    entries: HashMap<String, ObservationInfo>,
+    element_names: HashMap<ElementId, String>,
+    derived_inputs: Vec<(String, Vec<String>)>,
+}
+
+impl ObservationProfileIndex {
+    fn from_profile(profile: &Profile) -> Self {
+        let mut index = Self::default();
+        for element in &profile.elements {
+            let id_string = element.id.to_string();
+            index.element_names.insert(element.id, element.name.clone());
+            index.entries.insert(
+                id_string,
+                ObservationInfo {
+                    name: element.name.clone(),
+                    kind: detector_label(&element.detector).into(),
+                    region: Some(element.region),
+                    format: None,
+                    inputs: Vec::new(),
+                },
+            );
+        }
+        for derived in &profile.derived_observations {
+            let id_string = derived.id.to_string();
+            let inputs = derived
+                .inputs
+                .iter()
+                .map(|input| ObservationInputInfo {
+                    name: input.name.clone(),
+                    element_id: input.element_id,
+                    element_id_string: input.element_id.to_string(),
+                })
+                .collect::<Vec<_>>();
+            index.derived_inputs.push((
+                id_string.clone(),
+                inputs
+                    .iter()
+                    .map(|input| input.element_id_string.clone())
+                    .collect(),
+            ));
+            index.entries.insert(
+                id_string,
+                ObservationInfo {
+                    name: derived.name.clone(),
+                    kind: "structured text".into(),
+                    region: None,
+                    format: Some(derived.format.clone()),
+                    inputs,
+                },
+            );
+        }
+        index
+    }
+
+    fn hidden_components(&self, observations: &serde_json::Map<String, Value>) -> HashSet<String> {
+        let mut hidden = HashSet::new();
+        for (derived_id, input_ids) in &self.derived_inputs {
+            if observations.contains_key(derived_id) {
+                hidden.extend(input_ids.iter().cloned());
+            }
+        }
+        hidden
     }
 }
 
@@ -377,10 +464,13 @@ pub struct App {
     draft_saved: bool,
     status: Value,
     state: Value,
+    state_context_display: String,
+    state_events_display: String,
     error: Option<String>,
     error_request: Option<RequestKind>,
     capacity_error: Option<String>,
     capacity_cache: CapacityCache,
+    observation_index: Option<ObservationProfileIndex>,
     new_name: String,
     new_game: String,
     import_path: String,
@@ -496,10 +586,13 @@ impl App {
             draft_saved: false,
             status: json!({}),
             state: json!({}),
+            state_context_display: "—".into(),
+            state_events_display: "—".into(),
             error: None,
             error_request: None,
             capacity_error: None,
             capacity_cache: CapacityCache::default(),
+            observation_index: None,
             new_name: "New profile".into(),
             new_game: "game_id".into(),
             import_path: String::new(),
@@ -693,6 +786,8 @@ impl App {
                             self.last_state_sequence = sequence;
                         }
                         self.state = value;
+                        self.state_context_display = display_json(&self.state["context"]);
+                        self.state_events_display = display_json(&self.state["events"]);
                     }
                     RequestKind::Commit => {
                         self.dirty_since = None;
@@ -852,6 +947,7 @@ impl App {
     fn apply_profiles(&mut self, value: Value) {
         match serde_json::from_value::<Vec<Profile>>(value) {
             Ok(profiles) => {
+                self.observation_index = None;
                 let selected_id = self.draft.as_ref().map(|profile| profile.id);
                 self.profiles = profiles;
                 self.selected = selected_id
@@ -859,6 +955,7 @@ impl App {
                     .or_else(|| (!self.profiles.is_empty()).then_some(0));
                 if self.dirty_since.is_none() {
                     self.draft = self.selected.map(|index| self.profiles[index].clone());
+                    self.capacity_cache.invalidate();
                     if self.draft.as_mut().is_some_and(ensure_stage_derived) {
                         self.mark_dirty();
                     }
@@ -878,6 +975,8 @@ impl App {
     }
 
     fn mark_dirty(&mut self) {
+        self.capacity_cache.invalidate();
+        self.observation_index = None;
         self.dirty_since = Some(Instant::now());
         self.draft_saved = false;
     }
@@ -1199,6 +1298,8 @@ impl App {
             if let Some(index) = select_index {
                 self.selected=Some(index);
                 self.draft=Some(self.profiles[index].clone());
+                self.capacity_cache.invalidate();
+                self.observation_index = None;
                 self.dirty_since=None;
                 self.capacity_error=None;
                 self.preview_scope=None;
@@ -1214,7 +1315,8 @@ impl App {
                 self.worker.send(RequestKind::OutputRecipeList,method::OUTPUT_RECIPE_LIST,json!({"profile_id":self.profiles[index].id}));
             }
             ui.separator();
-            if let Some(profile) = self.draft.clone() {
+            let draft = self.draft.take();
+            if let Some(profile) = draft {
                 ui.horizontal(|ui| {
                     if ui.button("Duplicate").clicked() { self.worker.send(RequestKind::Mutation,method::PROFILE_DUPLICATE,json!({"profile_id":profile.id,"name":format!("{} copy",profile.name)})); }
                     if ui.button("Activate").clicked() { self.worker.send(RequestKind::Mutation,method::PROFILE_ACTIVATE,json!({"profile_id":profile.id})); }
@@ -1263,6 +1365,7 @@ impl App {
                     }
                 });
                 self.revision_history_ui(ui, &profile);
+                self.draft = Some(profile);
             }
         });
     }
@@ -1427,6 +1530,12 @@ impl App {
 
     #[allow(clippy::cast_precision_loss)]
     fn runtime_panel(&mut self, context: &egui::Context) {
+        if self.observation_index.is_none() {
+            self.observation_index = self
+                .draft
+                .as_ref()
+                .map(ObservationProfileIndex::from_profile);
+        }
         egui::SidePanel::right("runtime_evidence")
             .resizable(true)
             .default_width(360.0)
@@ -1459,17 +1568,13 @@ impl App {
                     ));
                     ui.separator();
                     ui.strong("Scene context");
-                    ui.label(display_json(&self.state["context"]));
+                    ui.label(&self.state_context_display);
                     ui.separator();
                     ui.strong("Observations");
-                    observations_ui(
-                        ui,
-                        &self.state["observations"],
-                        self.draft.as_ref(),
-                    );
+                    observations_ui(ui, &self.state["observations"], self.observation_index.as_ref());
                     ui.separator();
                     ui.strong("Event states");
-                    ui.label(display_json(&self.state["events"]));
+                    ui.label(&self.state_events_display);
                     ui.separator();
                     ui.strong("Latest detector test");
                     if let Some(observation) = self.detector_result["observations"].as_array().and_then(|items| items.last()) {
@@ -1515,11 +1620,11 @@ impl App {
                 if self.output_routes.is_empty() {
                     ui.label("No routes configured. Add one with `yash-eventsctl output set`. ");
                 }
-                for route in self.output_routes.clone() {
+                for route in &self.output_routes {
                     let Some(route_id) = route["id"].as_str() else {
                         continue;
                     };
-                    let summary = output_route_summary(&route);
+                    let summary = output_route_summary(route);
                     egui::CollapsingHeader::new(summary)
                         .id_salt(("output-route", route_id))
                         .default_open(false)
@@ -1593,17 +1698,20 @@ impl App {
             ui.label("This profile does not package any output recipes.");
             return;
         }
-        for (index, entry) in self.output_recipes.clone().iter().enumerate() {
-            let recipe = &entry["recipe"];
-            let installed = self.output_routes.iter().any(|route| {
-                route["source_recipe"]["recipe_id"] == recipe["id"]
-                    && route["source_recipe"]["sha256"] == entry["sha256"]
-            });
-            let label = format!(
-                "{}{}",
-                recipe["name"].as_str().unwrap_or("Unnamed recipe"),
-                if installed { " · installed" } else { "" }
-            );
+        for index in 0..self.output_recipes.len() {
+            let label = {
+                let entry = &self.output_recipes[index];
+                let recipe = &entry["recipe"];
+                let installed = self.output_routes.iter().any(|route| {
+                    route["source_recipe"]["recipe_id"] == recipe["id"]
+                        && route["source_recipe"]["sha256"] == entry["sha256"]
+                });
+                format!(
+                    "{}{}",
+                    recipe["name"].as_str().unwrap_or("Unnamed recipe"),
+                    if installed { " · installed" } else { "" }
+                )
+            };
             if ui
                 .selectable_label(self.selected_output_recipe == Some(index), label)
                 .clicked()
@@ -1864,7 +1972,7 @@ impl App {
                 });
                 ui.separator();
                 ui.strong(format!("Review batch ({})", self.collection_items.len()));
-                for item in self.collection_items.clone() {
+                for item in &self.collection_items {
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{} · {} · {} obs",
@@ -1966,6 +2074,7 @@ impl App {
                 if ui.button("Revert").clicked() {
                     if let Some(index) = self.selected {
                         profile = self.profiles[index].clone();
+                        self.capacity_cache.invalidate();
                         self.dirty_since = None;
                     }
                 }
@@ -2657,7 +2766,9 @@ impl App {
         let Some(derived) = profile.derived_observations.get_mut(index) else {
             return;
         };
-        ui.checkbox(&mut derived.enabled, "Enabled");
+        if ui.checkbox(&mut derived.enabled, "Enabled").changed() {
+            self.mark_dirty();
+        }
         ui.horizontal(|ui| {
             ui.label("Name");
             if ui.text_edit_singleline(&mut derived.name).changed() {
@@ -3466,7 +3577,15 @@ impl eframe::App for App {
         self.replay_panel(context);
         self.sidebar(context);
         self.editor(context);
-        context.request_repaint_after(Duration::from_millis(50));
+        let repaint_after =
+            if self.replay_playing || self.drawing || self.drag_origin.is_some() || self.resizing {
+                Duration::from_millis(50)
+            } else if (self.preview_enabled && !self.frozen) || self.continuous_test {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(250)
+            };
+        context.request_repaint_after(repaint_after);
     }
 }
 
@@ -3567,7 +3686,11 @@ fn sample_process_usage(sampler: &mut ProcessSampler) -> ProcessUsage {
     }
 }
 
-fn observations_ui(ui: &mut egui::Ui, observations: &Value, profile: Option<&Profile>) {
+fn observations_ui(
+    ui: &mut egui::Ui,
+    observations: &Value,
+    profile_index: Option<&ObservationProfileIndex>,
+) {
     let Some(observations) = observations.as_object() else {
         ui.label(display_json(observations));
         return;
@@ -3576,16 +3699,22 @@ fn observations_ui(ui: &mut egui::Ui, observations: &Value, profile: Option<&Pro
         ui.label("None yet");
         return;
     }
-    let hidden = hidden_observation_components(observations, profile);
+    let Some(profile_index) = profile_index else {
+        ui.label("Profile unavailable");
+        return;
+    };
+    let hidden = profile_index.hidden_components(observations);
     let mut items: Vec<_> = observations
         .iter()
         .filter(|(id, _)| !hidden.contains(*id))
         .map(|(id, observation)| {
-            let (name, kind) = observation_identity(id, profile);
+            let info = profile_index.entries.get(id);
+            let name = info.map_or(id.as_str(), |info| info.name.as_str());
+            let kind = info.map_or("unknown detector", |info| info.kind.as_str());
             (name, kind, id, observation)
         })
         .collect();
-    items.sort_by(|left, right| left.0.cmp(&right.0));
+    items.sort_by(|left, right| left.0.cmp(right.0));
     for (name, kind, element_id, observation) in items {
         let status = observation["status"].as_str().unwrap_or("unknown");
         let summary = format!(
@@ -3596,70 +3725,75 @@ fn observations_ui(ui: &mut egui::Ui, observations: &Value, profile: Option<&Pro
             .id_salt(("live-observation", element_id))
             .default_open(false)
             .show(ui, |ui| {
-                ui.label(format!("Value: {}", display_json(&observation["value"])));
-                ui.label(format!("Status: {status}"));
-                ui.label(format!(
-                    "Confidence: {}",
-                    display_json(&observation["confidence"])
-                ));
-                ui.label(format!(
-                    "Timestamp: {} ms",
-                    observation["timestamp_ms"].as_u64().unwrap_or(0)
-                ));
-                ui.monospace(format!("Element ID: {element_id}"));
-                ui.monospace(format!(
-                    "Detector ID: {}",
-                    observation["detector_id"].as_str().unwrap_or("—")
-                ));
-                ui.label(format!(
-                    "Diagnostic: {}",
-                    observation["diagnostic"].as_str().unwrap_or("—")
-                ));
-                if let Some(profile) = profile {
-                    if let Some(element) = profile
-                        .elements
-                        .iter()
-                        .find(|element| element.id.to_string() == *element_id)
-                    {
-                        ui.label(format!(
-                            "Region: x {:.5} · y {:.5} · w {:.5} · h {:.5}",
-                            element.region.x,
-                            element.region.y,
-                            element.region.width,
-                            element.region.height
-                        ));
-                    }
-                    if let Some(derived) = profile
-                        .derived_observations
-                        .iter()
-                        .find(|derived| derived.id.to_string() == *element_id)
-                    {
-                        ui.label(format!("Format: {}", derived.format));
-                        ui.label("Inputs:");
-                        for input in &derived.inputs {
-                            let source = profile
-                                .elements
-                                .iter()
-                                .find(|element| element.id == input.element_id)
-                                .map_or("missing", |element| element.name.as_str());
-                            let value =
-                                observations.get(&input.element_id.to_string()).map_or_else(
-                                    || "—".into(),
-                                    |item| observation_value_summary(&item["value"]),
-                                );
-                            ui.label(format!("  {} → {} — {}", input.name, source, value));
-                        }
-                    }
-                }
+                observation_details_ui(ui, observation, element_id, observations, profile_index);
             });
     }
 }
 
+fn observation_details_ui(
+    ui: &mut egui::Ui,
+    observation: &Value,
+    element_id: &str,
+    observations: &serde_json::Map<String, Value>,
+    profile_index: &ObservationProfileIndex,
+) {
+    ui.label(format!("Value: {}", display_json(&observation["value"])));
+    ui.label(format!(
+        "Status: {}",
+        observation["status"].as_str().unwrap_or("unknown")
+    ));
+    ui.label(format!(
+        "Confidence: {}",
+        display_json(&observation["confidence"])
+    ));
+    ui.label(format!(
+        "Timestamp: {} ms",
+        observation["timestamp_ms"].as_u64().unwrap_or(0)
+    ));
+    ui.monospace(format!("Element ID: {element_id}"));
+    ui.monospace(format!(
+        "Detector ID: {}",
+        observation["detector_id"].as_str().unwrap_or("—")
+    ));
+    ui.label(format!(
+        "Diagnostic: {}",
+        observation["diagnostic"].as_str().unwrap_or("—")
+    ));
+    if let Some(info) = profile_index.entries.get(element_id) {
+        if let Some(region) = info.region {
+            ui.label(format!(
+                "Region: x {:.5} · y {:.5} · w {:.5} · h {:.5}",
+                region.x, region.y, region.width, region.height
+            ));
+        }
+    }
+    if let Some(info) = profile_index.entries.get(element_id) {
+        if let Some(format) = &info.format {
+            ui.label(format!("Format: {format}"));
+        }
+        if !info.inputs.is_empty() {
+            ui.label("Inputs:");
+            for input in &info.inputs {
+                let source = profile_index
+                    .element_names
+                    .get(&input.element_id)
+                    .map_or("missing", String::as_str);
+                let value = observations.get(&input.element_id_string).map_or_else(
+                    || "—".into(),
+                    |item| observation_value_summary(&item["value"]),
+                );
+                ui.label(format!("  {} → {} — {}", input.name, source, value));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn hidden_observation_components(
     observations: &serde_json::Map<String, Value>,
     profile: Option<&Profile>,
-) -> Vec<String> {
-    let mut hidden = Vec::new();
+) -> HashSet<String> {
+    let mut hidden = HashSet::new();
     if let Some(profile) = profile {
         for derived in &profile.derived_observations {
             if observations.contains_key(&derived.id.to_string()) {
@@ -3673,29 +3807,6 @@ fn hidden_observation_components(
         }
     }
     hidden
-}
-
-fn observation_identity(element_id: &str, profile: Option<&Profile>) -> (String, String) {
-    if let Some(element) = profile.and_then(|profile| {
-        profile
-            .elements
-            .iter()
-            .find(|element| element.id.to_string() == element_id)
-    }) {
-        return (
-            element.name.clone(),
-            detector_label(&element.detector).into(),
-        );
-    }
-    if let Some(derived) = profile.and_then(|profile| {
-        profile
-            .derived_observations
-            .iter()
-            .find(|derived| derived.id.to_string() == element_id)
-    }) {
-        return (derived.name.clone(), "structured text".into());
-    }
-    (element_id.into(), "unknown detector".into())
 }
 
 fn observation_value_summary(value: &Value) -> String {
@@ -5199,6 +5310,7 @@ mod tests {
             .elements
             .push(default_element(profile.elements[0].region));
         assert_eq!(profile.revision, revision);
+        cache.invalidate();
         assert_eq!(cache.report(&profile).elements.used, 2);
         let other = profile_with_elements(3);
         assert_eq!(cache.report(&other).elements.used, 3);
@@ -5600,6 +5712,41 @@ mod tests {
         );
         assert!(rendered.contains("STAGE-1"));
         assert!(!rendered.contains(&element_id.to_string()));
+    }
+
+    #[test]
+    fn observation_profile_index_tracks_composed_inputs_without_rebuilding_maps() {
+        let mut profile = Profile::new("Game", "game", 1920, 1080);
+        let mut element = default_element(NormalizedRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
+        element.name = "Stage".into();
+        let element_id = element.id;
+        profile.elements.push(element);
+        let derived_id = ElementId::new();
+        profile.derived_observations.push(DerivedObservation {
+            id: derived_id,
+            detector_id: DetectorId::new(),
+            name: "Stage label".into(),
+            enabled: true,
+            format: "{stage}".into(),
+            inputs: vec![DerivedInput {
+                name: "stage".into(),
+                element_id,
+            }],
+        });
+        let index = ObservationProfileIndex::from_profile(&profile);
+        let input_key = element_id.to_string();
+        let derived_key = derived_id.to_string();
+        let mut observations =
+            serde_json::Map::from_iter([(input_key.clone(), json!({"status":"valid"}))]);
+        assert!(index.hidden_components(&observations).is_empty());
+        observations.insert(derived_key.clone(), json!({"status":"valid"}));
+        assert!(index.hidden_components(&observations).contains(&input_key));
+        assert_eq!(index.entries[&derived_key].inputs[0].name, "stage");
     }
 
     #[test]
