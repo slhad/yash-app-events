@@ -526,6 +526,27 @@ async fn dispatch(
                     .map_err(StoreError::from)
             })
             .map_err(store_error),
+        method::PROFILE_LIST_SUMMARIES => {
+            let params = if request.params.is_null() {
+                json!({})
+            } else {
+                request.params
+            };
+            parse::<ProfileSummaryParams>(params)
+                .and_then(|params| {
+                    if !(1..=128).contains(&params.limit) {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            "limit must be between 1 and 128",
+                        ));
+                    }
+                    state
+                        .profiles
+                        .list_summaries(params.after, params.limit)
+                        .map_err(store_error)
+                })
+                .and_then(|page| serde_json::to_value(page).map_err(internal_error))
+        }
         method::PROFILE_GET => parse::<ProfileIdParam>(request.params)
             .and_then(|params| state.profiles.load(params.profile_id).map_err(store_error))
             .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
@@ -7287,6 +7308,19 @@ struct ProfileIdParam {
     profile_id: ProfileId,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileSummaryParams {
+    #[serde(default)]
+    after: Option<ProfileId>,
+    #[serde(default = "default_profile_summary_limit")]
+    limit: usize,
+}
+
+fn default_profile_summary_limit() -> usize {
+    128
+}
+
+#[derive(Deserialize)]
 struct RevisionParams {
     profile_id: ProfileId,
     revision: u64,
@@ -7974,6 +8008,74 @@ mod tests {
         )
         .await;
         assert_eq!(old["result"]["revision"], 1);
+        call(&mut client, 8, method::SHUTDOWN, Value::Null).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_summary_rpc_isolates_bad_identity_and_preserves_legacy_contract() {
+        // SPEC-UI-002 / SPEC-IPC-004: healthy metadata stays discoverable over real IPC.
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path().join("data"), 20);
+        let healthy = Profile::new("BlazBlue", "blazblue", 1920, 1080);
+        store.create(&healthy).unwrap();
+        let invalid_id = ProfileId::new();
+        let invalid_path = store.profile_directory(invalid_id).join("profile.json");
+        yash_app_events_profile::save_profile(&invalid_path, &healthy).unwrap();
+        let original = fs::read(&invalid_path).unwrap();
+        let (socket, task) = start(directory.path()).await;
+        let mut client = BufReader::new(UnixStream::connect(&socket).await.unwrap());
+        handshake(&mut client).await;
+        let summary = call(&mut client, 2, method::PROFILE_LIST_SUMMARIES, Value::Null).await;
+        assert_eq!(
+            summary["result"]["profiles"][0]["id"],
+            healthy.id.to_string()
+        );
+        assert_eq!(summary["result"]["profiles"][0]["name"], "BlazBlue");
+        assert!(summary["result"]["profiles"][0].get("elements").is_none());
+        assert_eq!(
+            summary["result"]["errors"][0]["profile_id"],
+            invalid_id.to_string()
+        );
+        assert!(summary["result"]["errors"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("identity mismatch"));
+        assert!(summary["result"]["next_after"].is_null());
+        for limit in [0, 129] {
+            let invalid = call(
+                &mut client,
+                3,
+                method::PROFILE_LIST_SUMMARIES,
+                json!({"limit":limit}),
+            )
+            .await;
+            assert_eq!(invalid["error"]["code"], error_code::INVALID_PARAMS);
+        }
+        let legacy = call(&mut client, 4, method::PROFILE_LIST, Value::Null).await;
+        assert_eq!(legacy["error"]["code"], error_code::INTERNAL_ERROR);
+        let rejected = call(
+            &mut client,
+            5,
+            method::PROFILE_GET,
+            json!({"profile_id":invalid_id}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], error_code::INTERNAL_ERROR);
+        let loaded = call(
+            &mut client,
+            6,
+            method::PROFILE_GET,
+            json!({"profile_id":healthy.id}),
+        )
+        .await;
+        assert_eq!(loaded["result"]["id"], healthy.id.to_string());
+        assert!(loaded["result"]["elements"].is_array());
+        assert_eq!(original, fs::read(&invalid_path).unwrap());
+        fs::remove_dir_all(store.profile_directory(invalid_id)).unwrap();
+        let legacy = call(&mut client, 7, method::PROFILE_LIST, Value::Null).await;
+        assert_eq!(legacy["result"].as_array().unwrap().len(), 1);
+        assert!(legacy["result"][0]["elements"].is_array());
         call(&mut client, 8, method::SHUTDOWN, Value::Null).await;
         task.await.unwrap().unwrap();
     }

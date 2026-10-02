@@ -275,6 +275,21 @@ The initial GUI shall use Rust with `eframe`/`egui`, unless an implementation sp
 
 The GUI shall list profiles and provide create, rename, duplicate, import, export, trash, restore, and activate operations.
 
+Profile discovery shall isolate invalid committed documents: valid profiles remain
+available and rejected profile IDs carry visible diagnostics without changing their
+stored data or admitting them to editing or activation. The GUI shall browse bounded
+pages of metadata through the shared control protocol, load full documents only for
+the selected profile, and provide a searchable, scrollable profile list.
+
+Acceptance:
+
+- Identity mismatch, malformed JSON, and revision regression in one profile do not
+  hide other valid profiles; direct loading remains fail-closed.
+- Pagination advances over successful and rejected entries, excludes external backup
+  directories, and respects the protocol message limit even with escaped metadata.
+- An isolated native Wayland GUI lists and opens a valid profile from a library with
+  a rejected entry and more than one discovery page.
+
 ### SPEC-UI-003 — Source setup
 
 The GUI shall expose capture source selection, permission state, live status, capture metrics, preview start/stop, and frozen-frame inspection.
@@ -942,9 +957,9 @@ SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link m
 SPEC-PROFILE-012 | VERIFIED | 124-test workspace suite and strict Clippy pass; `profiles` publication run 29623649827 produced immutable package SHA-256 `07efe534ec49d723cd4ce06fa6ea0becc085ee4b71ba63288e97ec9f612c05b4` plus `catalog-v1-r000001.json`; downloaded bytes match a local deterministic rebuild; a fresh daemon fetched, cached, verified, and installed the profile inactive with two inert recipes and zero routes; native workspace-4 GUI review passed without cua-driver (2026-07-18)
 SPEC-ARCH-001 | VERIFIED | daemon exclusively owns profiles, portal session, latest-frame/analysis worker, outputs, and protocol state; GUI/CLI are protocol-v1 clients and render thread performs no I/O (2026-07-11)
 SPEC-IPC-001 | VERIFIED | Tokio Unix-socket integration tests verify documented path configuration, runtime dir 0700, socket 0600, safe stale recovery, and no network listener (2026-07-11)
-SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB message, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)
+SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB request, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)
 SPEC-IPC-003 | VERIFIED | transport test rejects pre-handshake methods and accepts protocol-v1 identification; incompatible version has stable structured code (2026-07-11)
-SPEC-IPC-004 | VERIFIED | documented protocol-v1 implements system, complete profile lifecycle, capture/snapshot, detector/template test, replay, state, bounded subscriptions, and preview lease/freeze methods with daemon integration evidence (2026-07-11)
+SPEC-IPC-004 | VERIFIED | documented protocol-v1 implements system, complete profile lifecycle, capture/snapshot, detector/template test, replay, state, bounded subscriptions, and preview lease/freeze; additive profile metadata pagination and diagnostics pass real-socket and CLI tests while legacy full-document listing remains strict (updated 2026-10-02)
 SPEC-IPC-006 | VERIFIED | capacity-64 per-subscriber broadcast path emits `subscription.lagged`; bounded-channel test proves overwrite/lag behavior (2026-07-11)
 SPEC-IPC-005 | VERIFIED | `yash-eventsctl` is a negotiated RPC client with global compact `--json`, stable exit categories, timeouts, live event follow, profile lifecycle commands, and shared-library offline validation; golden and daemon-backed tests (2026-07-11)
 SPEC-CAP-001 | VERIFIED | backend-neutral validated CPU frame carries monotonic timestamp, dimensions, padded stride, RGB/RGBA format, memory bytes, and source identity; portal callback tests (2026-07-11)
@@ -984,7 +999,7 @@ SPEC-SEC-004 | VERIFIED | capture callback has no persistence path; snapshot/tem
 SPEC-PERF-001 | VERIFIED | lazy replay/release and pre-decode dimension tests, bounded image-worker admission surviving caller cancellation, pre-worker live rate gating with latest-frame polling, indexed rule and scene dispatch, typed derived composition, immutable snapshot sharing, cached status `/proc` sampling, one-shot no-fabrication and single-read PNG analysis, atomic output-route delivery without a per-delivery sync barrier, cached GUI observation indexes, coalesced bounded GUI queues, adaptive GUI repaint, and 4,096 bit-exact optimized template comparisons pass; all 200 workspace tests and strict Clippy pass; 33 game cases/126 assertions pass with 61 concurrent status requests at 4.245 ms median and 5.730 ms maximum; details and limitations in `docs/performance.md` (updated 2026-09-21)
 SPEC-PERF-002 | VERIFIED | release daemon with stopped capture/no preview measured 0 CPU scheduler ticks over two seconds at CLK_TCK=100; image task lifecycle and prompt stop are tested/documented in `docs/performance.md` (2026-07-11)
 SPEC-UI-001 | VERIFIED | `yash-app-events` uses eframe/egui 0.32 and completed a five-second native Wayland startup smoke with daemon connection (2026-07-11)
-SPEC-UI-002 | VERIFIED | GUI exposes list/create/rename-by-commit/duplicate/import/export/trash/restore/activate over the same revision-aware protocol methods tested by CLI/daemon integration; native Wayland startup smoke passes (2026-07-11)
+SPEC-UI-002 | VERIFIED | shared profile lifecycle plus bounded summary discovery, identity/JSON/lineage failure isolation, cursor and escaped-metadata limits, selected-document/stale-response/draft protection, and CLI/socket tests pass; native isolated labwc GUI opens BlazBlue from 144 valid profiles across two pages with one rejected entry, searchable list, scrolling, and visible diagnostics; see `docs/profile-discovery-acceptance.md` (updated 2026-10-02)
 SPEC-UI-003 | VERIFIED | native GUI source selection, permission/capture state, live preview/freeze/metrics, interactive request progress, and daemon-late reconnect/profile recovery pass on Hyprland with screenshot/RPC evidence in `docs/gui-acceptance-report.md` (2026-07-11)
 SPEC-UI-004 | VERIFIED | normalized canvas supports draw/select/move/resize/duplicate/enable, explicit named zone listing/selection, aspect-preserving zoom/pan, labels/reference pixels, original and processed crop panels, and observation diagnostics; native screenshot evidence is in `docs/gui-acceptance-report.md` (2026-07-11)
 SPEC-UI-008 | VERIFIED | dedicated GUI worker owns RPC/reconnect/timeouts/PNG decode; capacity reports are memory-only, cached, and skipped when collapsed; profile-derived observation indexes are cached outside the repaint loop; polling coalesces with 64-entry request/response bounds, queue errors remain visible, and failed draft/test requests recover; GUI tests pass (updated 2026-09-21)

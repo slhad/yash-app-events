@@ -40,6 +40,11 @@ part of this audit.
 
 ## Active work
 
+Profile-manager recovery completed on 2026-10-02 under `SPEC-UI-002`,
+`SPEC-PROFILE-003/006`, and `SPEC-IPC-004`. Paged metadata discovery isolates invalid
+profiles, and the searchable GUI loads selected documents. Automated and native
+virtual-desktop evidence is in `docs/profile-discovery-acceptance.md`.
+
 No product milestone is currently scheduled. The optional Quickshell status integration
 completed on 2026-10-02 under `SPEC-OBS-004`. It adds fresh-analysis status evidence,
 an Omarchy bar plugin, optional installation, and protocol/native-QML/installer tests.

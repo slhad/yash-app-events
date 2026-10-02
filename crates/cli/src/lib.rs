@@ -270,6 +270,13 @@ pub enum DiagnosticCommand {
 #[derive(Debug, Subcommand)]
 pub enum ProfileCommand {
     List,
+    /// Browse one bounded metadata page, including diagnostics for unavailable profiles.
+    ListSummaries {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 128)]
+        limit: usize,
+    },
     Get {
         profile_id: String,
     },
@@ -540,6 +547,9 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
             Command::Shutdown => client.call(method::SHUTDOWN, Value::Null).await?,
             Command::Profile { command } => match command {
                 ProfileCommand::List => client.call(method::PROFILE_LIST, Value::Null).await?,
+                ProfileCommand::ListSummaries { after, limit } => client
+                    .call(method::PROFILE_LIST_SUMMARIES, json!({"after":after,"limit":limit}))
+                    .await?,
                 ProfileCommand::Get { profile_id } => {
                     client
                         .call(method::PROFILE_GET, json!({"profile_id": profile_id}))
@@ -1442,6 +1452,17 @@ mod tests {
         assert_eq!(profiles.as_array().unwrap().len(), 1);
         assert_eq!(profiles[0]["name"], "Demo");
         let profile_id = profiles[0]["id"].as_str().unwrap().to_owned();
+        cli.command = Command::Profile {
+            command: ProfileCommand::ListSummaries {
+                after: None,
+                limit: 1,
+            },
+        };
+        let summaries = execute(&cli).await.unwrap();
+        assert_eq!(summaries["profiles"][0]["id"], profile_id);
+        assert!(summaries["profiles"][0].get("elements").is_none());
+        assert!(summaries["errors"].as_array().unwrap().is_empty());
+        assert!(summaries["next_after"].is_null());
         cli.command = Command::Profile {
             command: ProfileCommand::Revisions {
                 profile_id: profile_id.clone(),

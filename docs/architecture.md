@@ -2,6 +2,10 @@
 
 The daemon is the only state-owning process. The GUI and CLI are protocol clients.
 
+Profile discovery uses bounded `profile.list_summaries` pages with validated metadata
+and independent rejected-entry diagnostics. The GUI worker collects pages, then fetches
+only the selected document through `profile.get`; the render thread keeps summaries
+and the selected committed/draft document instead of every full profile.
 The optional [Omarchy Quickshell widget](quickshell.md) is another read-only
 protocol-1 client. It polls status and caches the active profile name over a persistent
 Unix socket; it performs no capture, detector work, persistence, or route delivery.
