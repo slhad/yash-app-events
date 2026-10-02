@@ -120,6 +120,14 @@ use the normal event subscription and durable output.
 alongside capture/analysis rates and detector latency. CPU is derived from Linux
 process user+system time over the sampling interval rather than one thread.
 
+Status also includes optional `last_analysis_age_ms`, the monotonic age since the
+last completed live profile analysis, and `capture_error`, the current capture backend
+failure. Age is null before the first analysis and resets when a new live session starts.
+It can continue increasing after capture stops, so consumers must also check
+`capture_active`. Both fields default to null when reading older status payloads.
+Capture/analysis FPS are session averages and do not prove current processing.
+The optional [Quickshell integration](quickshell.md) uses these fields for its bar state.
+
 For schema-2 profiles, `state.get` adds `context` with the recognized scene, ranked
 candidates, active/uncertain overlays, and evaluated/gated/throttled detector counts.
 Subscriptions emit `scene_changed` and `overlays_changed` records when that context

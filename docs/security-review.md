@@ -61,6 +61,13 @@ Reviewed 2026-09-20 against protocol 1, profile schema 2, and capture/output sch
 - Event and state output is daemon-owned. State/config writes use same-directory
   temporary files, flush/sync/rename, and failure tests retain the previous valid file.
 
+- The Quickshell boundary was reviewed on 2026-10-02. The optional widget negotiates
+  on the same user-local socket and only
+  requests status and the active profile. Replies and requests are time/size bounded,
+  displayed text strips control characters and uses plain text, and GUI launch requires
+  a click and directly invokes one configured executable. It never persists frames,
+  starts capture, activates profiles, or executes content from a profile.
+
 Known release limitations: there is no remote control transport or authentication
 because no network listener exists. A user with access to the same Unix account can
 read that account's files and connect to its socket. Portal/compositor capture

@@ -113,6 +113,12 @@ pub struct Status {
     pub analysis_fps: f32,
     pub replaced_frames: u64,
     pub last_processing_latency_ms: Option<f64>,
+    /// Monotonic age of the last completed live analysis, absent before the first frame.
+    #[serde(default)]
+    pub last_analysis_age_ms: Option<u64>,
+    /// Current capture backend failure, separate from historical detector errors.
+    #[serde(default)]
+    pub capture_error: Option<String>,
     pub detector_errors: u64,
     pub output_error: Option<String>,
     pub daemon_cpu_percent: f32,
@@ -233,6 +239,27 @@ pub mod error_code {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_status_payload_defaults_new_optional_fields() {
+        let value = serde_json::json!({
+            "daemon_instance": Uuid::nil(), "capture_active": false,
+            "selected_source": null, "connected_clients": 1, "active_profile": null,
+            "input_fps": 0.0, "analysis_fps": 10.0, "replaced_frames": 0,
+            "last_processing_latency_ms": null, "detector_errors": 0,
+            "output_error": null, "daemon_cpu_percent": 0.0, "daemon_rss_bytes": 0
+        });
+        let status: Status = serde_json::from_value(value).unwrap();
+        assert_eq!(status.last_analysis_age_ms, None);
+        assert_eq!(status.capture_error, None);
+        let mut updated = status;
+        updated.last_analysis_age_ms = Some(30_000);
+        updated.capture_error = Some("source closed".into());
+        let encoded = serde_json::to_value(&updated).unwrap();
+        assert_eq!(encoded["last_analysis_age_ms"], 30_000);
+        assert_eq!(encoded["capture_error"], "source closed");
+        assert_eq!(serde_json::from_value::<Status>(encoded).unwrap(), updated);
+    }
 
     #[test]
     fn response_shape_is_stable_compact_json() {

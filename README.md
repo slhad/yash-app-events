@@ -72,6 +72,19 @@ the documented Hyprland environment. GNOME and KDE are not currently claimed.
 
 ## Workflow
 
+On Omarchy, install the optional Quickshell status widget to see the active profile
+and whether it is processing without opening the GUI:
+
+```bash
+./scripts/install-quickshell.sh --enable
+```
+
+The compact HUD icon indicates activity and errors with a status dot. Hover for status,
+source, metrics, and the profile name during capture. Stopped capture hides the profile.
+Left click opens the GUI; right click
+refreshes the profile name. It uses the existing local protocol and never starts
+capture. See [Quickshell setup and limits](docs/quickshell.md).
+
 1. Start the daemon or let socket activation start it.
 2. Open the GUI.
 3. Select a game window through the desktop portal.
@@ -361,7 +374,11 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 bash scripts/check-readme-claims.sh
 cargo doc --workspace --no-deps
+node --test integrations/quickshell/tests/*.test.cjs
 ```
+
+For native Quickshell validation, run `python3 scripts/test-quickshell-smoke.py` on
+a machine with Quickshell 0.3.1. It runs offscreen against a temporary test socket.
 
 The CI-safe replay vertical slice is covered by the daemon test
 `synthetic_health_replay_reaches_files_state_and_live_subscription`; it asserts that

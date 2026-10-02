@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.yash-app-events.status",
+  "name": "Yash Events",
+  "version": "0.1.1",
+  "author": "yash-app-events contributors",
+  "license": "MIT",
+  "description": "Daemon, profile, and capture processing status over local JSON-RPC.",
+  "activation": "on-demand",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Yash Events",
+    "description": "Live profile processing status. Click to open the editor.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {"socketPath": "", "guiPath": "yash-app-events"},
+    "schema": [
+      {"key": "socketPath", "type": "path", "label": "Control socket override", "defaultValue": ""},
+      {"key": "guiPath", "type": "path", "label": "GUI executable", "defaultValue": "yash-app-events"}
+    ]
+  }
+}

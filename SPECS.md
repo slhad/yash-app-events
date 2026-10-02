@@ -832,6 +832,41 @@ Acceptance:
 - Export is atomic and a failed export leaves the previous destination intact.
 - GUI and CLI use the same versioned plan/review/export protocol.
 
+### SPEC-OBS-004 — Optional Quickshell status widget
+
+An optional Omarchy Quickshell bar plugin shall show daemon availability, active
+profile, capture activity, and whether profile analysis completed recently without
+requiring the GUI. It shall distinguish idle, stopped, capturing without a profile,
+waiting for initial analysis, stalled analysis, processing, and capture/output errors.
+Historical detector-error counts shall remain diagnostics rather than permanent alarms.
+
+The bar shall use a compact custom vector icon and an activity/error indicator, with
+names and detailed status available on hover. When capture is stopped, the selected
+profile shall be hidden and no profile-name lookup shall be performed.
+
+The plugin shall negotiate protocol 1 over the existing user-local control socket,
+perform bounded asynchronous polling with at most one outstanding request, discard
+stale status on disconnect/timeout, and reconnect after daemon restart. It shall never
+start capture, activate a profile, write daemon state, or persist images. Opening the
+GUI shall require a user click. Profile names are display data; requests use stable IDs.
+
+`system.status` shall add optional `last_analysis_age_ms` and `capture_error` fields.
+Age is measured monotonically since the last completed live analysis, and is null
+before any analysis completes. Existing protocol-1 clients and older status payloads
+shall remain compatible. A client shall not infer fresh processing from average FPS.
+
+Acceptance:
+
+- Tests cover display states, stale analysis despite nonzero FPS, old status payloads,
+  capture/output errors, safe display names, and profile changes.
+- Tests verify stopped-profile hiding, same-ID capture restart, and installation/loading
+  of the vector icon. Horizontal and vertical bars use one fixed icon slot.
+- Tests cover handshake ordering, mismatched/malformed replies, timeout, disconnect,
+  restart, and bounded requests.
+- The plugin validates and loads in Quickshell; a real daemon status is displayed.
+- Installation is optional, respects XDG configuration paths, and preserves existing
+  bar settings. Current setup/removal instructions and dated evidence are maintained.
+
 ## 13. Performance targets
 
 ### SPEC-PERF-001 — Responsiveness
@@ -888,6 +923,8 @@ SPEC-CAP-002 | VERIFIED | tests/portal_smoke.md and CI job linux-wayland-smoke
 ```
 
 No requirements are verified at repository initialization.
+
+SPEC-OBS-004 | VERIFIED | twelve JavaScript/installer tests, native Quickshell 0.3.1 SVG-loading/stopped-profile-hiding/eight-state fragmented-RPC/timeout/restart/recovery smoke, protocol compatibility and monotonic/live analysis-age tests, manifest/QML validation, and workspace gates pass; compact fixed-slot HUD icon installed/enabled on Omarchy with existing shell settings preserved; initial real-daemon stopped-profile evidence and 0.1.1 compact-icon follow-up are recorded in `docs/quickshell-acceptance.md`; fresh portal capture was not repeated (2026-10-02)
 
 SPEC-ARCH-002 | VERIFIED | Cargo workspace manifests and `docs/architecture.md`; `cargo fmt --all -- --check`, strict workspace Clippy, tests, and docs pass (2026-07-11)
 SPEC-OBS-001 | VERIFIED | daemon initializes `tracing` with configurable `RUST_LOG`, structured startup fields, and no frame/token logging paths; security review records redaction boundary (2026-07-11)
@@ -960,7 +997,7 @@ SPEC-UI-007 | VERIFIED | always-visible live evidence panel and bounded timeline
 SPEC-DET-005 | VERIFIED | redistributable English/localized/scale/animation/glow fixtures and reproducible Tesseract 5 versus RapidOCR/ONNX Runtime accuracy/latency/confidence/CPU/memory benchmark select Tesseract; typed native detector, bounded change-triggered refresh with binary retry and last-valid retention on transient empty reads, profile validation, daemon/GUI configuration, frozen diagnostics, fixture regression tests, and common-path image replay text event pass; recorded BlazBlue structured-stage replay recognizes group `2` and counters `05` and `10`, composing `STAGE-2 : 10` (2026-07-12)
 SPEC-DET-008 | VERIFIED | generic fixed-layout seven-segment detector validates digit/separator layout, discovers glyph bounds, handles narrow `1` glyphs, emits typed text/confidence/diagnostics, supports GUI/profile/image replay, and decoded live BlazBlue timer `31:44`, `32:04`, `32:07`, and `36:10` exactly at 3840×2160 (2026-07-12)
 SPEC-DET-006 | VERIFIED | generated eight-case noisy/shifted orb-versus-cross HUD-icon dataset and 765-byte ONNX model with manifest/hash; path/size/SHA/labels/dimensions/output/scheduling validation, bounded change cache, CPU `ort` inference, GUI configuration/diagnostics, daemon image replay and text event pass; 80,000-case release benchmark records 100% fixture accuracy, confidence, 0.00333 ms latency, 26 CPU ticks and 26792 KiB peak RSS; clean-prefix installed-daemon replay returns typed labels and precision/recall 1.0 (2026-07-11)
-SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, connected clients, and process-wide daemon/GUI CPU plus RSS memory (2026-07-12)
+SPEC-OBS-002 | VERIFIED | status/capture RPC and GUI/CLI expose input/analysis FPS, processing latency, replacements, detector/output errors, frame age/resolution/format, connected clients, and process-wide daemon/GUI CPU plus RSS memory; additive system status analysis-age/capture-error fields pass old-payload compatibility, socket, and live-worker tests for Quickshell freshness (updated 2026-10-02)
 SPEC-OBS-003 | VERIFIED | protocol-v1 plan/review/export is shared by CLI and GUI; exact entry/size disclosure, visible privacy confirmation, recursive secret/binding/token redaction, explicit frozen element crops, PNG/name/count/file/total limits, atomic ZIP output, failure cleanup, and daemon/output adversarial tests pass (2026-07-11)
 SPEC-SEC-001 | VERIFIED | Unix-only socket with private runtime directory/socket modes, safe stale recovery, connection/message limits, and no network listener; integration tests and security review (2026-07-11)
 SPEC-SEC-002 | VERIFIED | resource-limited staged archive validation rejects traversal, links, expansion, size/count/hash/schema/asset failures with actionable typed errors (2026-07-11)

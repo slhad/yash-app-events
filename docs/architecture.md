@@ -2,6 +2,10 @@
 
 The daemon is the only state-owning process. The GUI and CLI are protocol clients.
 
+The optional [Omarchy Quickshell widget](quickshell.md) is another read-only
+protocol-1 client. It polls status and caches the active profile name over a persistent
+Unix socket; it performs no capture, detector work, persistence, or route delivery.
+
 Dependencies flow inward from binaries to narrow libraries:
 
 ```text

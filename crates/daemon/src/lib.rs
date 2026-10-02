@@ -163,6 +163,13 @@ struct AnalysisMetrics {
     detector_errors: u64,
 }
 
+impl AnalysisMetrics {
+    fn last_age_ms(&self) -> Option<u64> {
+        self.last
+            .and_then(|last| u64::try_from(last.elapsed().as_millis()).ok())
+    }
+}
+
 #[derive(Debug)]
 struct PreviewLease {
     state: Arc<State>,
@@ -7141,6 +7148,7 @@ fn status(state: &State) -> Status {
         .last_processing_latency
         .map(|latency| latency.as_secs_f64() * 1000.0);
     let detector_errors = analysis.detector_errors;
+    let last_analysis_age_ms = analysis.last_age_ms();
     drop(analysis);
     Status {
         daemon_instance: state.instance,
@@ -7159,6 +7167,8 @@ fn status(state: &State) -> Status {
             |metrics| metrics.replaced_frames,
         ),
         last_processing_latency_ms,
+        last_analysis_age_ms,
+        capture_error: capture_metrics.and_then(|metrics| metrics.error),
         detector_errors,
         daemon_cpu_percent: usage.cpu_percent,
         daemon_rss_bytes: usage.rss_bytes,
@@ -7629,6 +7639,17 @@ mod tests {
     }
 
     #[test]
+    fn analysis_age_distinguishes_unstarted_fresh_and_stalled_work() {
+        // SPEC-OBS-004: historical FPS must not imply that live work is fresh.
+        let mut metrics = AnalysisMetrics::default();
+        assert_eq!(metrics.last_age_ms(), None);
+        metrics.last = Some(Instant::now());
+        assert!(metrics.last_age_ms().unwrap() < 1000);
+        metrics.last = Instant::now().checked_sub(Duration::from_secs(30));
+        assert!(metrics.last_age_ms().unwrap() >= 30_000);
+    }
+
+    #[test]
     fn process_cpu_time_parses_stat_fields_without_allocating_a_field_list() {
         assert_eq!(
             process_cpu_time_ns("42 (game ) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13"),
@@ -7876,6 +7897,10 @@ mod tests {
         handshake(&mut second).await;
         let first_status = call(&mut first, 2, method::STATUS, Value::Null).await;
         let second_status = call(&mut second, 2, method::STATUS, Value::Null).await;
+        assert_eq!(first_status["result"]["last_analysis_age_ms"], Value::Null);
+        assert_eq!(first_status["result"]["capture_error"], Value::Null);
+        assert!(first_status["result"].get("last_analysis_age_ms").is_some());
+        assert!(first_status["result"].get("capture_error").is_some());
         assert!(
             first_status["result"]["connected_clients"]
                 .as_u64()
@@ -9801,6 +9826,7 @@ mod tests {
         analysis.task.await.unwrap();
         let analyzed = state.analysis_metrics.lock().unwrap().frames;
         assert!((4..=20).contains(&analyzed), "analyzed {analyzed} frames");
+        assert!(status(&state).last_analysis_age_ms.unwrap() < 1000);
         assert_eq!(state.latest_frame.replacements(), 59);
         assert_eq!(
             fs::read_to_string(directory.path().join("state/events.jsonl"))
