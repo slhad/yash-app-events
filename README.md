@@ -102,6 +102,11 @@ The profile sidebar includes daemon-backed revision history. Selecting a retaine
 revision shows a stable-ID comparison; rollback requires confirmation and creates a
 new revision, leaving the replaced revision recoverable.
 
+The profile list is searchable and scrollable. It loads metadata in bounded pages and
+fetches a full profile when selected. An invalid stored profile appears under
+**Unavailable profiles** with its ID and reason while valid profiles remain available;
+discovery leaves stored profile files unchanged. Upgrade the daemon and GUI together.
+
 Detection hierarchy supports daemon-owned derived text observations. Selecting a derived
 parent exposes its name, enabled state, format placeholders, named detector inputs, live
 value, and text event rule; selecting a child opens that detector's tuning controls.
@@ -162,6 +167,7 @@ Implemented CLI usage:
 ```bash
 yash-eventsctl status
 yash-eventsctl profile list
+yash-eventsctl --json profile list-summaries --limit 128
 yash-eventsctl profile create "My game" my_game
 yash-eventsctl profile validate ./profile.json
 yash-eventsctl profile pack ./portable-profile ./portable-profile.hudprofile

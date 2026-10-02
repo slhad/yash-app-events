@@ -51,6 +51,10 @@ Reviewed 2026-09-20 against protocol 1, profile schema 2, and capture/output sch
 - Profile listing accepts only canonical UUID-named directories and rejects a profile
   document whose stable ID differs from its directory. External backups may inform
   revision rebasing without entering the active profile list.
+  The additive `profile.list_summaries` discovery path isolates rejected entries with
+  explicit diagnostics while preserving strict get/edit/activation validation. Pages
+  examine at most 128 entries, bound escaped metadata below 1 MiB, and leave profile
+  documents untouched. The legacy full-document listing remains strict.
 - Schema-2 interaction targets are inert rectangles and optional safe points. Neither
   the daemon, CLI, GUI, nor Wayland adapter converts them into input automatically.
 - Diagnostic bundles require plan/review/export. The plan discloses every redacted

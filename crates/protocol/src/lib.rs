@@ -160,6 +160,7 @@ pub mod method {
     pub const STATUS: &str = "system.status";
     pub const SHUTDOWN: &str = "system.shutdown";
     pub const PROFILE_LIST: &str = "profile.list";
+    pub const PROFILE_LIST_SUMMARIES: &str = "profile.list_summaries";
     pub const PROFILE_GET: &str = "profile.get";
     pub const PROFILE_REVISIONS: &str = "profile.revisions";
     pub const PROFILE_REVISION_GET: &str = "profile.revision_get";

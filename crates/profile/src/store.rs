@@ -22,6 +22,30 @@ const OUTPUT_RECIPES_DIRECTORY: &str = "output-recipes";
 const MAXIMUM_OUTPUT_RECIPES: usize = 32;
 const MAXIMUM_OUTPUT_RECIPE_BYTES: u64 = 64 * 1024;
 
+/// Lightweight profile metadata for browsing without loading every editor document.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileSummary {
+    pub id: ProfileId,
+    pub name: String,
+    pub game: String,
+    pub revision: u64,
+}
+
+/// A committed profile that was rejected during discovery. Its data is left untouched.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileListIssue {
+    pub profile_id: ProfileId,
+    pub detail: String,
+}
+
+/// One bounded page of validated metadata and rejected-profile diagnostics.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileSummaryPage {
+    pub profiles: Vec<ProfileSummary>,
+    pub errors: Vec<ProfileListIssue>,
+    pub next_after: Option<ProfileId>,
+}
+
 /// Validated portable recipe plus integrity metadata shown during local installation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct OutputRecipeEntry {
@@ -165,10 +189,59 @@ impl ProfileStore {
     ///
     /// Returns an error if any stored profile cannot be loaded safely.
     pub fn list(&self) -> Result<Vec<Profile>, StoreError> {
-        if !self.profiles.exists() {
-            return Ok(Vec::new());
+        self.committed_ids()?
+            .into_iter()
+            .map(|id| self.load(id))
+            .collect()
+    }
+
+    /// Discovers valid profiles while reporting individual failures independently.
+    ///
+    /// At most 128 canonical directories are examined per page. Names/game labels
+    /// are bounded to 512 characters and diagnostics to 1,024 characters, so even
+    /// escaped metadata fits within the control protocol's 1 MiB message limit.
+    /// The cursor advances over rejected profiles as well as successful ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns directory-enumeration errors; individual load errors stay in the page.
+    pub fn list_summaries(
+        &self,
+        after: Option<ProfileId>,
+        limit: usize,
+    ) -> Result<ProfileSummaryPage, StoreError> {
+        let ids: Vec<_> = self
+            .committed_ids()?
+            .into_iter()
+            .filter(|id| after.is_none_or(|after| id.0 > after.0))
+            .collect();
+        let limit = limit.clamp(1, 128);
+        let mut page = ProfileSummaryPage::default();
+        for id in ids.iter().take(limit).copied() {
+            match self.load(id) {
+                Ok(profile) => page.profiles.push(ProfileSummary {
+                    id: profile.id,
+                    name: profile.name.chars().take(512).collect(),
+                    game: profile.game.chars().take(512).collect(),
+                    revision: profile.revision,
+                }),
+                Err(error) => page.errors.push(ProfileListIssue {
+                    profile_id: id,
+                    detail: error.to_string().chars().take(1024).collect(),
+                }),
+            }
         }
-        let mut profiles = Vec::new();
+        if ids.len() > limit {
+            page.next_after = Some(ids[limit - 1]);
+        }
+        Ok(page)
+    }
+
+    fn committed_ids(&self) -> Result<Vec<ProfileId>, StoreError> {
+        let mut ids = Vec::new();
+        if !self.profiles.exists() {
+            return Ok(ids);
+        }
         for entry in fs::read_dir(&self.profiles)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -182,11 +255,12 @@ impl ProfileStore {
             if entry.path() == self.profile_directory(id)
                 && entry.path().join(PROFILE_FILE).is_file()
             {
-                profiles.push(self.load(id)?);
+                ids.push(id);
             }
         }
-        profiles.sort_by_key(|profile| profile.id.to_string());
-        Ok(profiles)
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Lists every retained committed revision, including the current profile.
@@ -1210,6 +1284,107 @@ mod tests {
                 if expected == id && actual == replaced.id)
             );
         }
+    }
+
+    #[test]
+    fn summary_pages_isolate_invalid_profiles_and_advance_past_rejections() {
+        // SPEC-UI-002 / SPEC-PROFILE-003/006: discovery must not weaken load safety.
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        let healthy = populated_profile();
+        store.create(&healthy).unwrap();
+        let regressed = populated_profile();
+        store.create(&regressed).unwrap();
+        store.commit(regressed.clone(), 0).unwrap();
+        let regressed_path = store.profile_directory(regressed.id).join(PROFILE_FILE);
+        crate::save_profile(&regressed_path, &regressed).unwrap();
+        let mismatched_id = ProfileId::new();
+        let mismatched_path = store.profile_directory(mismatched_id).join(PROFILE_FILE);
+        crate::save_profile(&mismatched_path, &healthy).unwrap();
+        let malformed_id = ProfileId::new();
+        let malformed_path = store.profile_directory(malformed_id).join(PROFILE_FILE);
+        fs::create_dir_all(malformed_path.parent().unwrap()).unwrap();
+        fs::write(&malformed_path, b"invalid JSON").unwrap();
+        // An external backup must not become another profile or another warning.
+        let backup = store
+            .profiles
+            .join(format!("{}-backup", healthy.id))
+            .join(PROFILE_FILE);
+        crate::save_profile(&backup, &healthy).unwrap();
+        let before: Vec<_> = [&mismatched_path, &malformed_path, &regressed_path]
+            .map(|path| fs::read(path).unwrap())
+            .into();
+
+        let mut after = None;
+        let mut found = Vec::new();
+        let mut errors = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = store.list_summaries(after, 1).unwrap();
+            assert_eq!(page.profiles.len() + page.errors.len(), 1);
+            found.extend(page.profiles);
+            errors.extend(page.errors);
+            pages += 1;
+            let Some(next) = page.next_after else {
+                break;
+            };
+            assert!(after.is_none_or(|previous: ProfileId| next.0 > previous.0));
+            after = Some(next);
+        }
+        assert_eq!(pages, 4);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, healthy.id);
+        assert_eq!(errors.len(), 3);
+        assert!(errors
+            .iter()
+            .any(|e| e.profile_id == mismatched_id && e.detail.contains("identity mismatch")));
+        assert!(errors.iter().any(|e| e.profile_id == malformed_id));
+        assert!(errors
+            .iter()
+            .any(|e| e.profile_id == regressed.id && e.detail.contains("lineage floor")));
+        assert!(store.load(mismatched_id).is_err());
+        assert!(store.load(malformed_id).is_err());
+        assert!(store.load(regressed.id).is_err());
+        assert!(store.list().is_err()); // The legacy full-document API remains strict.
+        let after: Vec<_> = [&mismatched_path, &malformed_path, &regressed_path]
+            .map(|path| fs::read(path).unwrap())
+            .into();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn summary_page_count_and_escaped_metadata_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(directory.path(), 20);
+        for _ in 0..129 {
+            let mut profile = populated_profile();
+            profile.name = "x\u{0001}".repeat(1000);
+            store.create(&profile).unwrap();
+        }
+        let page = store.list_summaries(None, usize::MAX).unwrap();
+        assert_eq!(page.profiles.len(), 128);
+        assert!(page.next_after.is_some());
+        assert!(page.profiles.iter().all(|p| p.name.chars().count() == 512));
+        assert!(serde_json::to_vec(&page).unwrap().len() < 1024 * 1024 - 1024);
+        let last = store.list_summaries(page.next_after, 128).unwrap();
+        assert_eq!(last.profiles.len(), 1);
+        assert!(last.next_after.is_none());
+        assert!(store
+            .list_summaries(Some(last.profiles[0].id), 128)
+            .unwrap()
+            .profiles
+            .is_empty());
+
+        let worst_errors = ProfileSummaryPage {
+            errors: (0..128)
+                .map(|_| ProfileListIssue {
+                    profile_id: ProfileId::new(),
+                    detail: "\u{0001}".repeat(1024),
+                })
+                .collect(),
+            ..ProfileSummaryPage::default()
+        };
+        assert!(serde_json::to_vec(&worst_errors).unwrap().len() < 1024 * 1024 - 1024);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 The daemon listens only on `$XDG_RUNTIME_DIR/yash-app-events/control.sock`. The
 runtime directory is mode `0700` and the socket is mode `0600`. Each message is one
-compact JSON object followed by `\n`; messages are limited to 1 MiB and nesting depth
+compact JSON object followed by `\n`; requests are limited to 1 MiB and nesting depth
 32. Each connection must first call `system.handshake` with protocol `1`, client name,
 and client version.
 
@@ -10,7 +10,7 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
 
 - `system.handshake`, `system.version`, `system.capabilities`, `system.status`,
   `system.shutdown`
-- `profile.list`, `profile.get`, `profile.revisions`, `profile.revision_get`,
+- `profile.list`, `profile.list_summaries`, `profile.get`, `profile.revisions`, `profile.revision_get`,
   `profile.rollback`, `profile.create`, `profile.commit`,
   `profile.duplicate`, `profile.validate`, `profile.import`, `profile.export`,
   `profile.trash`, `profile.restore`, `profile.activate`
@@ -58,6 +58,33 @@ archive's revision for a new profile ID. If the ID already has local lineage, th
 rebase the imported document to the next known revision before publishing it. The
 returned profile contains that final revision; portable archive contents are not
 changed.
+
+`profile.list_summaries` accepts optional `after` (a profile UUID cursor) and `limit`
+(1–128, default 128). Null parameters are equivalent to `{}`. Its response is:
+
+```json
+{
+  "profiles": [
+    {"id": "00000000-0000-0000-0000-000000000001", "name": "Example", "game": "example", "revision": 3}
+  ],
+  "errors": [],
+  "next_after": null
+}
+```
+
+Each page examines at most `limit` canonical UUID directories in stable UUID order.
+Rejected profiles consume a page entry and appear in `errors` as `profile_id` and
+`detail`; the cursor advances past them. Set `after` to `next_after` until it is null.
+Names and game labels are truncated to 512 characters and error details to 1,024
+characters, keeping even escaped metadata pages below 1 MiB. Directory enumeration
+failures remain RPC errors. Stored documents are not repaired or removed by discovery.
+
+The GUI uses this method and loads the selected document through `profile.get`.
+The CLI exposes individual pages as `profile list-summaries --limit 128 --after <uuid>`;
+omit `--after` for the first page. The existing `profile.list` / CLI `profile list`
+retain their full-document array and fail if any committed profile cannot load safely.
+Direct get, editing, and activation retain identity, validation, and revision checks.
+Upgrade daemon and GUI together; older daemons do not implement this additive method.
 
 `analysis.evaluate_image` accepts exactly one of `profile_id` or `bundle`, an explicit local PNG
 `path`, and a bounded `timeout_ms`. `profile_id` keeps the legacy single-profile behavior.

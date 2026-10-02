@@ -5,9 +5,21 @@ widget state, texture upload, and normalized-coordinate interaction. A dedicated
 thread owns the Tokio runtime, Unix RPC connection, reconnects, timeouts, and PNG
 decoding. The daemon remains the only owner of capture, profiles, drafts, and outputs.
 
+The profile sidebar sorts names and supports case-insensitive search by name, game,
+or UUID, with a scrollable list and manual refresh. The worker fetches every bounded
+metadata page before publishing the list; selecting a profile loads its full document.
+Late selection responses and refreshes cannot overwrite an unsaved draft. Revert uses
+the selected committed snapshot. **Unavailable profiles** discloses rejected IDs and
+diagnostics without hiding healthy profiles or changing stored files. Both daemon and
+GUI must be upgraded for this additive protocol method.
+See the dated [profile discovery acceptance](profile-discovery-acceptance.md) for
+large-library and invalid-profile verification on an isolated native Wayland desktop.
+
 Implemented controls include:
 
 - profile create, rename/save, duplicate, activate, import/export, trash, and restore;
+- searchable, scrollable profile metadata with bounded background pagination,
+  selected-document loading, and visible diagnostics for unavailable profiles;
 - recoverable draft autosave, revert, validation/RPC errors, and revision-conflict
   visibility;
 - portal source selection, stop, metrics, opt-in preview, and freeze;

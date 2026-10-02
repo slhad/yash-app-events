@@ -21,7 +21,10 @@ pub use bundle::{
     PROFILE_BUNDLE_SCHEMA_VERSION,
 };
 pub use local::{CaptureBinding, CollectionPolicy, LocalConfig, LocalConfigError, Settings};
-pub use store::{OutputRecipeEntry, ProfileStore, StoreError};
+pub use store::{
+    OutputRecipeEntry, ProfileListIssue, ProfileStore, ProfileSummary, ProfileSummaryPage,
+    StoreError,
+};
 pub use yash_app_events_output::OutputRoute;
 
 /// Current portable profile schema version.

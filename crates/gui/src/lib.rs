@@ -16,14 +16,15 @@ use yash_app_events_profile::{
     DetectorId, Element, ElementId, EventRule, InteractionCaution, InteractionPoint,
     InteractionRole, InteractionTarget, InteractionTargetId, NormalizedRegion,
     ObservationCondition, Overlay, OverlayId, PreprocessOperation, Profile, ProfileCapacityReport,
-    ProfileId, ProfileLimits, ProfileStore, RecognitionCondition, RecognitionExpression, RuleId,
-    RulePredicate, Scene, SceneId,
+    ProfileId, ProfileLimits, ProfileListIssue, ProfileStore, ProfileSummary, ProfileSummaryPage,
+    RecognitionCondition, RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RequestKind {
     Profiles,
+    Profile,
     Status,
     State,
     Create,
@@ -101,6 +102,39 @@ struct PreviewImage {
     width: usize,
     height: usize,
     rgba: Vec<u8>,
+}
+
+async fn load_profile_summaries(client: &mut UnixRpcClient) -> Result<Value, ClientError> {
+    let mut combined = ProfileSummaryPage::default();
+    let mut after = None;
+    loop {
+        let value = client
+            .call(
+                method::PROFILE_LIST_SUMMARIES,
+                json!({"after": after, "limit":128}),
+            )
+            .await?;
+        let page: ProfileSummaryPage = serde_json::from_value(value)?;
+        combined.profiles.extend(page.profiles);
+        combined.errors.extend(page.errors);
+        let Some(next) = page.next_after else {
+            break;
+        };
+        if after.is_some_and(|previous: ProfileId| next.to_string() <= previous.to_string()) {
+            return Err(ClientError::Rpc(yash_app_events_protocol::RpcError::new(
+                -32603,
+                "profile list cursor did not advance",
+            )));
+        }
+        after = Some(next);
+    }
+    Ok(serde_json::to_value(combined)?)
+}
+
+fn profile_matches_search(profile: &ProfileSummary, search: &str) -> bool {
+    profile.name.to_lowercase().contains(search)
+        || profile.game.to_lowercase().contains(search)
+        || profile.id.to_string().contains(search)
 }
 
 #[derive(Debug)]
@@ -191,12 +225,11 @@ impl Worker {
                                 continue;
                             }
                         }
-                        if reconnected && request.method != method::PROFILE_LIST {
-                            let refresh = client
-                                .as_mut()
-                                .expect("client was initialized")
-                                .call(method::PROFILE_LIST, Value::Null)
-                                .await;
+                        if reconnected && request.method != method::PROFILE_LIST_SUMMARIES {
+                            let refresh = load_profile_summaries(
+                                client.as_mut().expect("client was initialized"),
+                            )
+                            .await;
                             match refresh {
                                 Ok(value) => {
                                     let _ = response_sender.send(Response {
@@ -234,7 +267,9 @@ impl Worker {
                         let result = match params {
                             Ok(params) => {
                                 let client = client.as_mut().expect("client was initialized");
-                                if request.method == method::CAPTURE_SELECT
+                                if request.kind == RequestKind::Profiles {
+                                    load_profile_summaries(client).await
+                                } else if request.method == method::CAPTURE_SELECT
                                     || request.kind == RequestKind::Replay
                                     || request.method == method::CATALOG_REFRESH
                                     || request.kind == RequestKind::CatalogInstall
@@ -457,7 +492,10 @@ impl ObservationProfileIndex {
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     worker: Worker,
-    profiles: Vec<Profile>,
+    profiles: Vec<ProfileSummary>,
+    profile_errors: Vec<ProfileListIssue>,
+    profile_search: String,
+    committed_profile: Option<Profile>,
     selected: Option<usize>,
     draft: Option<Profile>,
     dirty_since: Option<Instant>,
@@ -566,7 +604,11 @@ impl App {
         let socket =
             std::env::var_os("YASH_APP_EVENTS_SOCKET").map_or_else(default_socket, PathBuf::from);
         let worker = Worker::spawn(socket);
-        worker.send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+        worker.send(
+            RequestKind::Profiles,
+            method::PROFILE_LIST_SUMMARIES,
+            Value::Null,
+        );
         worker.send(RequestKind::Status, method::STATUS, Value::Null);
         worker.send(
             RequestKind::CatalogStatus,
@@ -580,6 +622,9 @@ impl App {
         Self {
             worker,
             profiles: Vec::new(),
+            profile_errors: Vec::new(),
+            profile_search: String::new(),
+            committed_profile: None,
             selected: None,
             draft: None,
             dirty_since: None,
@@ -763,6 +808,7 @@ impl App {
                 }
                 Payload::Json(value) => match response.kind {
                     RequestKind::Profiles => self.apply_profiles(value),
+                    RequestKind::Profile => self.apply_profile(value),
                     RequestKind::RevisionHistory => {
                         match serde_json::from_value::<Vec<Profile>>(value) {
                             Ok(revisions) => {
@@ -793,19 +839,28 @@ impl App {
                         self.dirty_since = None;
                         self.draft_saved = false;
                         self.capacity_error = None;
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        self.worker.send(
+                            RequestKind::Profiles,
+                            method::PROFILE_LIST_SUMMARIES,
+                            Value::Null,
+                        );
                     }
                     RequestKind::Draft => self.draft_saved = true,
                     RequestKind::Mutation | RequestKind::Create => {
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        self.worker.send(
+                            RequestKind::Profiles,
+                            method::PROFILE_LIST_SUMMARIES,
+                            Value::Null,
+                        );
                     }
                     RequestKind::Rollback => {
                         self.rollback_confirm = false;
                         self.dirty_since = None;
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        self.worker.send(
+                            RequestKind::Profiles,
+                            method::PROFILE_LIST_SUMMARIES,
+                            Value::Null,
+                        );
                         if let Some(profile) = &self.draft {
                             self.worker.send(
                                 RequestKind::RevisionHistory,
@@ -900,8 +955,11 @@ impl App {
                     RequestKind::CatalogInstall => {
                         self.catalog_pending = false;
                         self.catalog_install_reviewed = false;
-                        self.worker
-                            .send(RequestKind::Profiles, method::PROFILE_LIST, Value::Null);
+                        self.worker.send(
+                            RequestKind::Profiles,
+                            method::PROFILE_LIST_SUMMARIES,
+                            Value::Null,
+                        );
                         self.worker.send(
                             RequestKind::CatalogList,
                             method::CATALOG_LIST,
@@ -945,26 +1003,73 @@ impl App {
     }
 
     fn apply_profiles(&mut self, value: Value) {
-        match serde_json::from_value::<Vec<Profile>>(value) {
-            Ok(profiles) => {
-                self.observation_index = None;
-                let selected_id = self.draft.as_ref().map(|profile| profile.id);
-                self.profiles = profiles;
+        match serde_json::from_value::<ProfileSummaryPage>(value) {
+            Ok(mut page) => {
+                let selected_id = self
+                    .selected
+                    .and_then(|i| self.profiles.get(i))
+                    .map(|p| p.id);
+                page.profiles.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then(a.id.to_string().cmp(&b.id.to_string()))
+                });
+                self.profiles = page.profiles;
+                self.profile_errors = page.errors;
                 self.selected = selected_id
                     .and_then(|id| self.profiles.iter().position(|profile| profile.id == id))
-                    .or_else(|| (!self.profiles.is_empty()).then_some(0));
+                    .or_else(|| {
+                        (self.dirty_since.is_none() && !self.profiles.is_empty()).then_some(0)
+                    });
                 if self.dirty_since.is_none() {
-                    self.draft = self.selected.map(|index| self.profiles[index].clone());
-                    self.capacity_cache.invalidate();
-                    if self.draft.as_mut().is_some_and(ensure_stage_derived) {
-                        self.mark_dirty();
+                    if let Some(index) = self.selected {
+                        if self.draft.as_ref().map(|p| p.id) == Some(self.profiles[index].id) {
+                            self.worker.send(
+                                RequestKind::Profile,
+                                method::PROFILE_GET,
+                                json!({"profile_id": self.profiles[index].id}),
+                            );
+                        } else {
+                            self.select_profile(index);
+                        }
+                    } else {
+                        self.draft = None;
+                        self.committed_profile = None;
+                        self.capacity_cache.invalidate();
+                        self.observation_index = None;
                     }
+                }
+            }
+            Err(error) => self.error = Some(format!("invalid profile list response: {error}")),
+        }
+    }
+
+    fn apply_profile(&mut self, value: Value) {
+        match serde_json::from_value::<Profile>(value) {
+            Ok(profile) => {
+                // Ignore a late response for a previously selected profile or an unsaved edit.
+                if self
+                    .selected
+                    .and_then(|i| self.profiles.get(i))
+                    .map(|p| p.id)
+                    != Some(profile.id)
+                    || self.dirty_since.is_some()
+                {
+                    return;
+                }
+                self.committed_profile = Some(profile.clone());
+                self.draft = Some(profile);
+                self.capacity_cache.invalidate();
+                self.observation_index = None;
+                if self.draft.as_mut().is_some_and(ensure_stage_derived) {
+                    self.mark_dirty();
                 }
                 if let Some(profile) = &self.draft {
                     self.worker.send(
                         RequestKind::RevisionHistory,
                         method::PROFILE_REVISIONS,
-                        json!({"profile_id":profile.id}),
+                        json!({"profile_id": profile.id}),
                     );
                 }
                 self.refresh_collection();
@@ -972,6 +1077,31 @@ impl App {
             }
             Err(error) => self.error = Some(format!("invalid profile response: {error}")),
         }
+    }
+
+    fn select_profile(&mut self, index: usize) {
+        self.selected = Some(index);
+        self.draft = None;
+        self.committed_profile = None;
+        self.capacity_cache.invalidate();
+        self.observation_index = None;
+        self.dirty_since = None;
+        self.draft_saved = false;
+        self.capacity_error = None;
+        self.preview_scope = None;
+        self.selected_region = None;
+        self.selected_derived = None;
+        self.revisions.clear();
+        self.selected_revision = None;
+        self.rollback_confirm = false;
+        self.output_routes.clear();
+        self.output_recipes.clear();
+        self.selected_output_recipe = None;
+        self.worker.send(
+            RequestKind::Profile,
+            method::PROFILE_GET,
+            json!({"profile_id": self.profiles[index].id}),
+        );
     }
 
     fn mark_dirty(&mut self) {
@@ -1293,27 +1423,34 @@ impl App {
             ui.separator();
             ui.collapsing("Profile Catalog", |ui| self.profile_catalog_ui(ui));
             ui.separator();
-            let mut select_index = None;
-            for (index,profile) in self.profiles.iter().enumerate() { if ui.selectable_label(self.selected == Some(index),format!("{} · rev {}",profile.name,profile.revision)).clicked() { select_index=Some(index); } }
-            if let Some(index) = select_index {
-                self.selected=Some(index);
-                self.draft=Some(self.profiles[index].clone());
-                self.capacity_cache.invalidate();
-                self.observation_index = None;
-                self.dirty_since=None;
-                self.capacity_error=None;
-                self.preview_scope=None;
-                self.selected_region=None;
-                self.revisions.clear();
-                self.selected_revision=None;
-                self.rollback_confirm=false;
-                self.output_routes.clear();
-                self.output_recipes.clear();
-                self.selected_output_recipe=None;
-                self.worker.send(RequestKind::RevisionHistory,method::PROFILE_REVISIONS,json!({"profile_id":self.profiles[index].id}));
-                self.worker.send(RequestKind::OutputRoutes,method::OUTPUT_LIST,json!({"profile_id":self.profiles[index].id}));
-                self.worker.send(RequestKind::OutputRecipeList,method::OUTPUT_RECIPE_LIST,json!({"profile_id":self.profiles[index].id}));
+            if !self.profile_errors.is_empty() {
+                ui.collapsing(format!("Unavailable profiles ({})", self.profile_errors.len()), |ui| {
+                    egui::ScrollArea::vertical().id_salt("profile-errors").max_height(120.0).show(ui, |ui| {
+                        for issue in &self.profile_errors {
+                            ui.colored_label(egui::Color32::YELLOW, format!("{}: {}", issue.profile_id, issue.detail));
+                        }
+                    });
+                    ui.label("Stored files are unchanged. Repair or restore these profiles before opening them.");
+                });
             }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.profile_search).hint_text("Search profiles")
+                    .desired_width(200.0));
+                if ui.small_button("Refresh").clicked() {
+                    self.worker.poll(RequestKind::Profiles, method::PROFILE_LIST_SUMMARIES, Value::Null);
+                }
+            });
+            let search = self.profile_search.to_lowercase();
+            let mut select_index = None;
+            egui::ScrollArea::vertical().id_salt("profile-list").max_height(260.0).show(ui, |ui| {
+                for (index, profile) in self.profiles.iter().enumerate() {
+                    if profile_matches_search(profile, &search)
+                        && ui.selectable_label(self.selected == Some(index), format!("{} · rev {}", profile.name, profile.revision)).clicked() {
+                        select_index = Some(index);
+                    }
+                }
+            });
+            if let Some(index) = select_index { self.select_profile(index); }
             ui.separator();
             let draft = self.draft.take();
             if let Some(profile) = draft {
@@ -2072,8 +2209,8 @@ impl App {
                     );
                 }
                 if ui.button("Revert").clicked() {
-                    if let Some(index) = self.selected {
-                        profile = self.profiles[index].clone();
+                    if let Some(committed) = &self.committed_profile {
+                        profile = committed.clone();
                         self.capacity_cache.invalidate();
                         self.dirty_since = None;
                     }
@@ -5210,6 +5347,164 @@ fn default_element(region: NormalizedRegion) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_test_app() -> (App, tokio_mpsc::Receiver<Request>) {
+        let (requests, receiver) = tokio_mpsc::channel(64);
+        let (_, responses) = mpsc::sync_channel(64);
+        (
+            App::with_worker(Worker {
+                requests,
+                responses,
+                pending_polls: RefCell::default(),
+                send_errors: RefCell::default(),
+            }),
+            receiver,
+        )
+    }
+
+    fn summary(profile: &Profile) -> ProfileSummary {
+        ProfileSummary {
+            id: profile.id,
+            name: profile.name.clone(),
+            game: profile.game.clone(),
+            revision: profile.revision,
+        }
+    }
+
+    #[test]
+    fn long_profile_rows_do_not_expand_the_sidebar_across_repaints() {
+        let (mut app, _requests) = profile_test_app();
+        let profile = Profile::new("Long profile name ".repeat(20), "game", 1920, 1080);
+        app.profiles = vec![summary(&profile)];
+        let context = egui::Context::default();
+        for _ in 0..100 {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 1000.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |context| {
+                    app.sidebar(context);
+                    assert!(
+                        context.available_rect().width() > 900.0,
+                        "profile sidebar must leave room for the editor: {:?}",
+                        context.available_rect()
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn profile_discovery_keeps_warnings_and_loads_only_the_selection() {
+        let (mut app, mut requests) = profile_test_app();
+        let first = Profile::new("BlazBlue", "blazblue", 1920, 1080);
+        let second = Profile::new("Queen Blade", "queen_blade", 558, 992);
+        let issue = ProfileListIssue {
+            profile_id: ProfileId::new(),
+            detail: "profile identity mismatch".into(),
+        };
+        app.apply_profiles(json!(ProfileSummaryPage {
+            profiles: vec![summary(&second), summary(&first)],
+            errors: vec![issue.clone()],
+            next_after: None,
+        }));
+        assert_eq!(app.profiles[0].id, first.id);
+        assert!(app.draft.is_none());
+        let get = requests.try_recv().unwrap();
+        assert_eq!(get.method, method::PROFILE_GET);
+        assert_eq!(get.params["profile_id"], first.id.to_string());
+        assert!(requests.try_recv().is_err());
+        app.select_profile(1);
+        app.apply_profile(json!(first)); // Late first selection must not replace the second.
+        assert!(app.draft.is_none());
+        app.apply_profile(json!(second));
+        assert_eq!(app.draft.as_ref().unwrap().id, second.id);
+        assert_eq!(app.committed_profile.as_ref().unwrap().id, second.id);
+        app.draft.as_mut().unwrap().name = "Unsaved".into();
+        app.mark_dirty();
+        app.apply_profile(json!(second));
+        assert_eq!(app.draft.as_ref().unwrap().name, "Unsaved");
+        assert_eq!(app.committed_profile.as_ref().unwrap().name, "Queen Blade");
+        app.apply_profiles(json!(ProfileSummaryPage {
+            profiles: vec![summary(&second), summary(&first)],
+            errors: vec![issue.clone()],
+            next_after: None,
+        }));
+        assert_eq!(app.profiles[app.selected.unwrap()].id, second.id);
+        assert_eq!(app.draft.as_ref().unwrap().name, "Unsaved");
+        app.drain(&egui::Context::default());
+        assert_eq!(app.profile_errors, vec![issue]);
+        assert!(profile_matches_search(&summary(&first), "blaz"));
+        assert!(profile_matches_search(&summary(&second), "queen_blade"));
+        assert!(profile_matches_search(
+            &summary(&first),
+            &first.id.to_string()
+        ));
+        assert!(!profile_matches_search(&summary(&second), "blaz"));
+    }
+
+    #[tokio::test]
+    async fn profile_discovery_fetches_all_pages_and_rejected_entry_diagnostics() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        use tokio::net::UnixListener;
+        let path = std::env::temp_dir().join(format!("yash-gui-summary-{}.sock", ProfileId::new()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let profile = Profile::new("BlazBlue", "blazblue", 1920, 1080);
+        let id = profile.id;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = BufReader::new(reader);
+            for i in 0..3 {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match i {
+                    0 => json!({"protocol":1}),
+                    1 => {
+                        assert_eq!(request["method"], method::PROFILE_LIST_SUMMARIES);
+                        assert!(request["params"]["after"].is_null());
+                        json!(ProfileSummaryPage {
+                            errors: vec![ProfileListIssue {
+                                profile_id: id,
+                                detail: "invalid JSON".into()
+                            }],
+                            next_after: Some(id),
+                            ..ProfileSummaryPage::default()
+                        })
+                    }
+                    _ => {
+                        assert_eq!(request["params"]["after"], id.to_string());
+                        json!(ProfileSummaryPage {
+                            profiles: vec![summary(&profile)],
+                            ..ProfileSummaryPage::default()
+                        })
+                    }
+                };
+                let mut bytes = serde_json::to_vec(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+        });
+        let mut client = UnixRpcClient::connect(&path, Duration::from_secs(3), "test", "test")
+            .await
+            .unwrap();
+        let page: ProfileSummaryPage =
+            serde_json::from_value(load_profile_summaries(&mut client).await.unwrap()).unwrap();
+        assert_eq!(page.profiles.len(), 1);
+        assert_eq!(page.errors.len(), 1);
+        assert_eq!(page.profiles[0].id, id);
+        assert!(page.next_after.is_none());
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn polling_coalesces_while_manual_commands_and_queue_errors_remain_visible() {
