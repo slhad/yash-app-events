@@ -44,7 +44,8 @@ jobs:
       - name: Review exact media-free archive inventories
         shell: bash
         run: |
-          for package in target/profile-catalog/*.hudprofile; do
+          shopt -s nullglob
+          for package in target/profile-catalog/*.hudprofile target/profile-catalog/*.hudbundle; do
             echo "Inventory for $(basename "$package")"
             unzip -Z1 "$package"
             if unzip -Z1 "$package" | grep -Eiq '\.(png|jpe?g|webp|gif|mp4|webm|mkv|wav|ogg|mp3)$'; then
@@ -71,7 +72,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          for package in target/profile-catalog/*.hudprofile; do
+          shopt -s nullglob
+          for package in target/profile-catalog/*.hudprofile target/profile-catalog/*.hudbundle; do
             name=$(basename "$package")
             local_digest="sha256:$(sha256sum "$package" | cut -d' ' -f1)"
             remote_digest=$(gh release view profiles --json assets --jq ".assets[] | select(.name == \"${name}\") | .digest")
@@ -120,6 +122,7 @@ jobs:
           name: profile-catalog-publication
           path: |
             target/profile-catalog/*.hudprofile
+            target/profile-catalog/*.hudbundle
             target/profile-catalog/catalog-v1-r*.json
             target/profile-catalog/catalog-entries.json
           if-no-files-found: error

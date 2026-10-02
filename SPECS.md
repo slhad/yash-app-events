@@ -265,6 +265,41 @@ and likely email addresses. The generated package shall contain only portable pr
 and validated inert output recipes. Private regression media may verify a package but shall
 not be published with it.
 
+### SPEC-PROFILE-013 — Discoverable and portable routing collections
+
+An existing routing bundle shall be browsable as one collection with its router and
+exact member profiles. Discovery shall support existing `*.profile-bundle.json` files
+in the profiles root and daemon-installed collections, expose bounded metadata and
+diagnostics over the shared protocol, and leave imported/local documents untouched.
+The GUI shall group the router and members and keep other profiles for that game
+available under a collapsed section. Search shall reveal matching members and other
+installed profiles without changing identity or ownership.
+
+A portable collection shall contain its routing manifest and every referenced
+profile with declared assets and inert recipes. Integrity, paths, schemas, identity,
+revision pins, game/layout compatibility, router route IDs, and aggregate expansion
+limits shall be validated before installation. Collection expansion is bounded to
+256 MiB and 2,048 files; each nested profile retains its existing 128 MiB allowance
+and 32 MiB per-file limit. Packaging calls use blocking workers so status/control
+clients remain responsive. All documents shall be staged before
+one atomic collection-directory publication. Imports shall reject live identity
+collisions, preserve revision lineage, and rebase retained IDs and manifest pins
+together. Catalog publication/install shall treat a collection as one immutable
+package/entry, preserving existing single-profile formats and inactive installation.
+
+This requirement does not add bundle-wide live capture or automatic cleanup of older
+profile copies. Bundles retain their existing screenshot-analysis routing behavior.
+
+Acceptance:
+
+- Tests cover legacy discovery, grouped membership, search, bad references, cursor
+  bounds, archive round trips, tampering, traversal/links, collisions, missing assets,
+  aggregate resource limits, lineage rebasing, and failed-install cleanup.
+- Shared RPC/CLI and catalog tests prove one collection entry, inactive installation,
+  and backward compatibility with existing single-profile packages.
+- Native isolated Wayland GUI evidence proves Queen Blade appears once with its ten
+  members, other copies remain accessible, and BlazBlue remains available.
+
 ## 6. Visual configuration UI
 
 ### SPEC-UI-001 — Toolkit
@@ -955,6 +990,7 @@ SPEC-PROFILE-001 | VERIFIED | `.hudprofile` ZIP export/import round trip include
 SPEC-PROFILE-009 | VERIFIED | explicit schema dispatcher rejects unsupported versions without source writes; reviewed `profile-v1.json` golden fixture loads in tests (2026-07-11)
 SPEC-PROFILE-010 | VERIFIED | staged import validates enclosed paths, ZIP link modes, declared entries, hashes, schemas, IDs/assets, per-file/count/total limits; malicious fixtures prove traversal, symlink, and expansion rejection (2026-07-11)
 SPEC-PROFILE-012 | VERIFIED | 124-test workspace suite and strict Clippy pass; `profiles` publication run 29623649827 produced immutable package SHA-256 `07efe534ec49d723cd4ce06fa6ea0becc085ee4b71ba63288e97ec9f612c05b4` plus `catalog-v1-r000001.json`; downloaded bytes match a local deterministic rebuild; a fresh daemon fetched, cached, verified, and installed the profile inactive with two inert recipes and zero routes; native workspace-4 GUI review passed without cua-driver (2026-07-18)
+SPEC-PROFILE-013 | VERIFIED | bounded legacy/managed discovery and shared RPC/CLI, exact GUI grouping/search, atomic collection admission, integrity/path/link/reference/aggregate/lineage tests, one catalog package/entry and inactive install, schema-1 package hash compatibility, and native isolated Wayland Queen Blade/BlazBlue/older-copy/stale-pin/export evidence pass; the real collection round trip preserves 11 profiles and all 989 payload files; 223 workspace tests, strict Clippy, docs, README claims, JSON/links, and local installation checks pass; original profile files and active selection are preserved; evidence in `docs/profile-bundles-acceptance.md` (2026-10-02)
 SPEC-ARCH-001 | VERIFIED | daemon exclusively owns profiles, portal session, latest-frame/analysis worker, outputs, and protocol state; GUI/CLI are protocol-v1 clients and render thread performs no I/O (2026-07-11)
 SPEC-IPC-001 | VERIFIED | Tokio Unix-socket integration tests verify documented path configuration, runtime dir 0700, socket 0600, safe stale recovery, and no network listener (2026-07-11)
 SPEC-IPC-002 | VERIFIED | newline-framed compact JSON with 1 MiB request, depth-32 nesting, connection, and bounded subscription limits; protocol golden and transport tests (2026-07-11)

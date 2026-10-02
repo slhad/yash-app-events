@@ -14,6 +14,8 @@ Requests and responses use JSON-RPC 2.0. Version 1 defines:
   `profile.rollback`, `profile.create`, `profile.commit`,
   `profile.duplicate`, `profile.validate`, `profile.import`, `profile.export`,
   `profile.trash`, `profile.restore`, `profile.activate`
+- `profile.bundle_list`, `profile.bundle_get`, `profile.bundle_export`, and
+  `profile.bundle_import` (bounded collection discovery and daemon-owned packaging)
 - `profile.draft` (recoverable, separate from the committed revision)
 - `catalog.status`, `catalog.refresh`, `catalog.list`, and `catalog.install` (fixed-origin,
   bounded and cached public profile discovery; install requires the reviewed revision/hash
@@ -85,6 +87,23 @@ omit `--after` for the first page. The existing `profile.list` / CLI `profile li
 retain their full-document array and fail if any committed profile cannot load safely.
 Direct get, editing, and activation retain identity, validation, and revision checks.
 Upgrade daemon and GUI together; older daemons do not implement this additive method.
+
+`profile.bundle_list` accepts optional string `after` and `limit` 1–16, default 16.
+Null parameters equal `{}`. It returns `bundles`, `errors`, and `next_after`.
+Each summary has router `id`, `name`, `game`, ordered unique `profile_ids`, and nullable
+`error` for bad references. Malformed manifests return `source`/`detail` diagnostics.
+Sources use sorted `local:<basename>` or `installed:<uuid>` cursors; pass `next_after`
+until null. Discovery caps sources at 256 and installed collections at 128. Names
+are bounded by manifest validation; game is capped at 128 characters and diagnostics
+at 1,024 characters. Cursor input is capped at 512 bytes.
+
+`profile.bundle_get` accepts `profile_id`, the router ID, and returns the routing
+manifest. Duplicate manifests for one router make get/export fail as ambiguous.
+`profile.bundle_export` accepts `profile_id` and `path`, validates the whole collection,
+and returns its portable archive manifest. `profile.bundle_import` accepts `path` and
+returns the installed routing manifest with final revision pins. Both paths are local
+current-user paths. Imports remain inactive. These are additive protocol-v1 methods;
+upgrade daemon, CLI, and GUI together. See [collection packaging](profile-bundles.md).
 
 `analysis.evaluate_image` accepts exactly one of `profile_id` or `bundle`, an explicit local PNG
 `path`, and a bounded `timeout_ms`. `profile_id` keeps the legacy single-profile behavior.

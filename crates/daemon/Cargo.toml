@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+tempfile.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 png.workspace = true
@@ -29,6 +30,3 @@ yash-app-events-output = { path = "../output" }
 yash-app-events-profile = { path = "../profile" }
 yash-app-events-protocol = { path = "../protocol" }
 yash-app-events-vision = { path = "../vision" }
-
-[dev-dependencies]
-tempfile.workspace = true

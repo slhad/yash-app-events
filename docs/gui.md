@@ -15,6 +15,14 @@ GUI must be upgraded for this additive protocol method.
 See the dated [profile discovery acceptance](profile-discovery-acceptance.md) for
 large-library and invalid-profile verification on an isolated native Wayland desktop.
 
+Profile collections appear once with their router and exact members in an expandable
+group. Other copies for the same game remain under **Other installed profiles**.
+Search reveals matching members/copies and opens groups; a collection-name match
+shows every member. Collection errors stay visible, and healthy unrelated profiles
+remain available. Collection import/export use background shared RPC calls and an
+explicit local path. See [collection packaging](profile-bundles.md) and the dated
+[collection acceptance](profile-bundles-acceptance.md).
+
 Implemented controls include:
 
 - profile create, rename/save, duplicate, activate, import/export, trash, and restore;

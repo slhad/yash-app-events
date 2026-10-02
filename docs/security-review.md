@@ -1,5 +1,14 @@
 # Security and privacy review
 
+Portable collections reuse hardened profile archives inside an integrity-checked
+outer ZIP. Both inventories and aggregate expanded payloads are bounded. Unique
+regular manifests, safe paths, links, exact inventory, hashes, schemas, all profile
+pins/game/layout, and router routes are checked before one directory publication.
+Failed imports remove staging and preserve live profiles. Catalog installation also
+compares actual contained identities/game/schema to reviewed metadata. Catalog bundle
+sources accept only approved JSON files and declared JSON assets; media-free sources
+reject all detector assets. See [collection packaging](profile-bundles.md).
+
 Reviewed 2026-09-20 against protocol 1, profile schema 2, and capture/output schema 1.
 
 - Control is local-only: the daemon binds no TCP listener, creates its runtime

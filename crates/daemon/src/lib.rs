@@ -26,7 +26,7 @@ use uuid::Uuid;
 use yash_app_events_capture::LatestFrameSlot;
 use yash_app_events_capture::{Frame, FrameLayout, PixelFormat};
 use yash_app_events_capture_pw::{PortalCapture, PortalOptions, SourceSelection};
-use yash_app_events_catalog::{Catalog, CatalogError, CatalogService};
+use yash_app_events_catalog::{Catalog, CatalogEntry, CatalogError, CatalogService, PackageKind};
 use yash_app_events_engine::collection::{
     CollectedFrame, CollectionItem, CollectionReason, ReviewRecord, ReviewStatus,
 };
@@ -51,10 +51,10 @@ use yash_app_events_output::{
 #[cfg(test)]
 use yash_app_events_output::{FileMode, OutputRecipe, OutputRecipeSink};
 use yash_app_events_profile::{
-    export_profile, load_profile, load_profile_bundle, BarDirection, CollectionPolicy,
-    Detector as ProfileDetector, DetectorId, ElementId, ImportLimits, LocalConfig,
-    NormalizedRegion, OcrExpectedFormat, OverlayId, Profile, ProfileBundle, ProfileBundleMember,
-    ProfileId, ProfileStore, RuleId, RulePredicate, SceneId, StoreError,
+    export_profile, load_profile, load_profile_bundle, profile_document_schema, BarDirection,
+    CollectionPolicy, Detector as ProfileDetector, DetectorId, ElementId, ImportLimits,
+    LocalConfig, NormalizedRegion, OcrExpectedFormat, OverlayId, Profile, ProfileBundle,
+    ProfileBundleMember, ProfileId, ProfileStore, RuleId, RulePredicate, SceneId, StoreError,
 };
 use yash_app_events_protocol::{
     error_code, method, nesting_within_limit, HandshakeParams, HandshakeResult, Notification,
@@ -509,7 +509,7 @@ async fn dispatch(
             Ok(json!({"version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}))
         }
         method::CAPABILITIES => Ok(
-            json!({"profiles":true,"profile_catalog":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"image_analysis":{"json_first":true,"crop_escalation":true},"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
+            json!({"profiles":true,"profile_catalog":true,"profile_bundles":true,"profile_revisions":true,"subscriptions":true,"capture":true,"preview":true,"diagnostic_bundle":true,"output_routes":true,"output_recipes":true,"image_analysis":{"json_first":true,"crop_escalation":true},"detectors":["color_bar","template","region_change","ocr","seven_segment","classifier"]}),
         ),
         method::STATUS => serde_json::to_value(status(state)).map_err(internal_error),
         method::SHUTDOWN => {
@@ -526,6 +526,9 @@ async fn dispatch(
                     .map_err(StoreError::from)
             })
             .map_err(store_error),
+        method::PROFILE_GET => parse::<ProfileIdParam>(request.params)
+            .and_then(|params| state.profiles.load(params.profile_id).map_err(store_error))
+            .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
         method::PROFILE_LIST_SUMMARIES => {
             let params = if request.params.is_null() {
                 json!({})
@@ -547,9 +550,67 @@ async fn dispatch(
                 })
                 .and_then(|page| serde_json::to_value(page).map_err(internal_error))
         }
-        method::PROFILE_GET => parse::<ProfileIdParam>(request.params)
-            .and_then(|params| state.profiles.load(params.profile_id).map_err(store_error))
-            .and_then(|profile| serde_json::to_value(profile).map_err(internal_error)),
+        method::PROFILE_BUNDLE_LIST => {
+            let params = if request.params.is_null() {
+                json!({})
+            } else {
+                request.params
+            };
+            parse::<BundleListParams>(params)
+                .and_then(|params| {
+                    if !(1..=16).contains(&params.limit)
+                        || params.after.as_ref().is_some_and(|a| a.len() > 512)
+                    {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            "bundle limit must be 1..=16 and cursor at most 512 bytes",
+                        ));
+                    }
+                    state
+                        .profiles
+                        .list_bundles(params.after.as_deref(), params.limit)
+                        .map_err(internal_error)
+                })
+                .and_then(|page| serde_json::to_value(page).map_err(internal_error))
+        }
+        method::PROFILE_BUNDLE_GET => parse::<ProfileIdParam>(request.params)
+            .and_then(|params| {
+                state
+                    .profiles
+                    .load_bundle(params.profile_id)
+                    .map_err(internal_error)
+            })
+            .and_then(|bundle| serde_json::to_value(bundle).map_err(internal_error)),
+        method::PROFILE_BUNDLE_EXPORT => match parse::<ExportParams>(request.params) {
+            Ok(params) => {
+                let state = Arc::clone(state);
+                tokio::task::spawn_blocking(move || {
+                    state
+                        .profiles
+                        .export_bundle(params.profile_id, &params.path)
+                        .map_err(internal_error)
+                        .and_then(|manifest| serde_json::to_value(manifest).map_err(internal_error))
+                })
+                .await
+                .unwrap_or_else(|error| Err(internal_error(error)))
+            }
+            Err(error) => Err(error),
+        },
+        method::PROFILE_BUNDLE_IMPORT => match parse::<PathParam>(request.params) {
+            Ok(params) => {
+                let state = Arc::clone(state);
+                tokio::task::spawn_blocking(move || {
+                    state
+                        .profiles
+                        .import_bundle(&params.path, ImportLimits::for_bundle())
+                        .map_err(internal_error)
+                        .and_then(|bundle| serde_json::to_value(bundle).map_err(internal_error))
+                })
+                .await
+                .unwrap_or_else(|error| Err(internal_error(error)))
+            }
+            Err(error) => Err(error),
+        },
         method::PROFILE_REVISIONS => parse::<ProfileIdParam>(request.params)
             .and_then(|params| {
                 state
@@ -967,11 +1028,10 @@ fn catalog_listing_value(state: &State, catalog: &Catalog) -> Result<Value, Cata
         .compatible_profiles(&application)
         .into_iter()
         .map(|entry| {
-            let installed = state
-                .profiles
-                .profiles_root()
-                .join(entry.profile_id.to_string())
-                .is_dir();
+            let installed = entry.contained_profile_ids().into_iter().all(|id| {
+                serde_json::from_value(json!(id))
+                    .is_ok_and(|id| state.profiles.profile_directory(id).is_dir())
+            });
             let mut value = serde_json::to_value(entry)?;
             value["installed"] = json!(installed);
             Ok(value)
@@ -1013,15 +1073,13 @@ async fn install_catalog_profile(
             "catalog package changed; review it again before installing",
         ));
     }
-    if state
-        .profiles
-        .profiles_root()
-        .join(entry.profile_id.to_string())
-        .exists()
-    {
+    if entry.contained_profile_ids().into_iter().any(|id| {
+        serde_json::from_value(json!(id))
+            .is_ok_and(|id| state.profiles.profile_directory(id).exists())
+    }) {
         return Err(RpcError::new(
             error_code::INVALID_PARAMS,
-            "catalog profile version is already installed",
+            "a catalog package identity is already installed",
         ));
     }
     let package = state
@@ -1029,17 +1087,66 @@ async fn install_catalog_profile(
         .download_package(entry)
         .await
         .map_err(catalog_error)?;
-    let profile = state
-        .profiles
-        .import_archive(&package, ImportLimits::default())
-        .map_err(store_error)?;
-    Ok(json!({
-        "installed": true,
-        "catalog_id": entry.id,
-        "version": entry.version,
-        "profile": profile,
-        "active": false,
-    }))
+    verify_catalog_package(entry, &package).map_err(catalog_error)?;
+    let installed = if entry.kind == PackageKind::Bundle {
+        let bundle = state
+            .profiles
+            .import_bundle(&package, ImportLimits::for_bundle())
+            .map_err(internal_error)?;
+        json!({"bundle":bundle})
+    } else {
+        let profile = state
+            .profiles
+            .import_archive(&package, ImportLimits::default())
+            .map_err(store_error)?;
+        json!({"profile":profile})
+    };
+    let mut result =
+        json!({"installed":true,"catalog_id":entry.id,"version":entry.version,"active":false});
+    result
+        .as_object_mut()
+        .expect("object")
+        .extend(installed.as_object().expect("object").clone());
+    Ok(result)
+}
+
+fn verify_catalog_package(entry: &CatalogEntry, package: &Path) -> Result<(), CatalogError> {
+    let temporary = tempfile::tempdir()?;
+    let store = ProfileStore::new(temporary.path(), 0);
+    let profiles = if entry.kind == PackageKind::Bundle {
+        let bundle = store
+            .import_bundle(package, ImportLimits::for_bundle())
+            .map_err(|_| CatalogError::Invalid("catalog bundle archive is invalid"))?;
+        bundle
+            .profile_ids()
+            .into_iter()
+            .map(|id| store.load(id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CatalogError::Invalid("catalog bundle documents are invalid"))?
+    } else {
+        vec![store
+            .import_archive(package, ImportLimits::default())
+            .map_err(|_| CatalogError::Invalid("catalog profile archive is invalid"))?]
+    };
+    let ids: Vec<_> = profiles
+        .iter()
+        .map(|p| Uuid::parse_str(&p.id.to_string()).expect("profile UUID"))
+        .collect();
+    if ids != entry.contained_profile_ids()
+        || profiles.iter().any(|p| p.game != entry.game)
+        || profiles
+            .iter()
+            .map(|p| profile_document_schema(&store.profile_directory(p.id).join("profile.json")))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            != Some(entry.profile_schema)
+    {
+        return Err(CatalogError::Integrity(
+            "package identities/game/schema differ from reviewed entry",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7307,6 +7414,7 @@ async fn write_response(
 struct ProfileIdParam {
     profile_id: ProfileId,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileSummaryParams {
@@ -7319,7 +7427,17 @@ struct ProfileSummaryParams {
 fn default_profile_summary_limit() -> usize {
     128
 }
-
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleListParams {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_bundle_list_limit")]
+    limit: usize,
+}
+fn default_bundle_list_limit() -> usize {
+    16
+}
 #[derive(Deserialize)]
 struct RevisionParams {
     profile_id: ProfileId,
@@ -7851,6 +7969,215 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    fn bundle_fixture(root: &Path) -> (ProfileStore, ProfileBundle, PathBuf) {
+        let store = ProfileStore::new(root.join("source"), 20);
+        let router = Profile::new("Router", "demo_game", 100, 100);
+        let member = Profile::new("Member", "demo_game", 100, 100);
+        store.create(&router).unwrap();
+        store.create(&member).unwrap();
+        let bundle = ProfileBundle {
+            schema: 1,
+            name: "Collection".into(),
+            game: "demo_game".into(),
+            router_profile_id: router.id,
+            router_profile_revision: 0,
+            members: vec![ProfileBundleMember {
+                profile_id: member.id,
+                profile_revision: 0,
+                scene_ids: vec![],
+                overlay_ids: vec![],
+                priority: 0,
+                fallback: true,
+            }],
+        };
+        fs::write(
+            store.profiles_root().join("demo.profile-bundle.json"),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+        let package = root.join("fixture.hudbundle");
+        store.export_bundle(router.id, &package).unwrap();
+        (store, bundle, package)
+    }
+
+    #[tokio::test]
+    async fn bundle_socket_import_discovery_get_export_and_collision_stay_inactive() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, bundle, package) = bundle_fixture(directory.path());
+        let (socket, task) = start(directory.path()).await;
+        let mut client = BufReader::new(UnixStream::connect(socket).await.unwrap());
+        handshake(&mut client).await;
+        let imported = call(
+            &mut client,
+            2,
+            method::PROFILE_BUNDLE_IMPORT,
+            json!({"path":package}),
+        )
+        .await;
+        assert_eq!(
+            imported["result"]["router_profile_id"],
+            bundle.router_profile_id.to_string()
+        );
+        let page = call(
+            &mut client,
+            3,
+            method::PROFILE_BUNDLE_LIST,
+            json!({"limit":1}),
+        )
+        .await;
+        assert_eq!(page["result"]["bundles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            page["result"]["bundles"][0]["profile_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(page["result"]["bundles"][0]["error"].is_null());
+        let document = call(
+            &mut client,
+            4,
+            method::PROFILE_BUNDLE_GET,
+            json!({"profile_id":bundle.router_profile_id}),
+        )
+        .await;
+        assert_eq!(document["result"], json!(bundle));
+        let exported=call(&mut client,5,method::PROFILE_BUNDLE_EXPORT,json!({"profile_id":bundle.router_profile_id,"path":directory.path().join("exported.hudbundle")})).await;
+        assert_eq!(exported["result"]["files"].as_array().unwrap().len(), 3);
+        let collision = call(
+            &mut client,
+            6,
+            method::PROFILE_BUNDLE_IMPORT,
+            json!({"path":package}),
+        )
+        .await;
+        assert!(collision.get("error").is_some());
+        let bad_limit = call(
+            &mut client,
+            7,
+            method::PROFILE_BUNDLE_LIST,
+            json!({"limit":17}),
+        )
+        .await;
+        assert_eq!(bad_limit["error"]["code"], error_code::INVALID_PARAMS);
+        let status = call(&mut client, 8, method::STATUS, Value::Null).await;
+        assert_eq!(status["result"]["capture_active"], false);
+        assert!(status["result"]["active_profile"].is_null());
+        let profiles = call(&mut client, 9, method::PROFILE_LIST_SUMMARIES, Value::Null).await;
+        assert_eq!(profiles["result"]["profiles"].as_array().unwrap().len(), 2);
+        call(&mut client, 10, method::SHUTDOWN, Value::Null).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_bundle_download_installs_one_collection_and_validates_reviewed_inventory() {
+        use tokio::io::AsyncReadExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let (_, bundle, package) = bundle_fixture(directory.path());
+        let bytes = fs::read(&package).unwrap();
+        let ids = bundle
+            .profile_ids()
+            .into_iter()
+            .map(|id| Uuid::parse_str(&id.to_string()).unwrap())
+            .collect::<Vec<_>>();
+        let entry: CatalogEntry=serde_json::from_value(json!({
+            "kind":"bundle","bundle_profile_ids":ids,"id":"demo-game.collection","game":"demo_game","game_slug":"demo-game","profile_slug":"collection","profile_id":bundle.router_profile_id,
+            "name":"Collection","description":"Fixture collection","version":"1.0.0","package":"bundle--demo-game--collection--v1.0.0.hudbundle","bytes":bytes.len(),"sha256":yash_app_events_catalog::digest(&bytes),"profile_schema":yash_app_events_profile::PROFILE_SCHEMA_VERSION,"minimum_app_version":"0.0.1","media_free":true,"detectors":[],"tested_layouts":[],"output_recipes":[],"license":"MIT","verification":{"status":"verified","date":"2026-10-02","evidence":"fixture"}
+        })).unwrap();
+        entry.validate().unwrap();
+        let mut wrong = entry.clone();
+        wrong.bundle_profile_ids[1] = Uuid::new_v4();
+        assert!(verify_catalog_package(&wrong, &package).is_err());
+        wrong = entry.clone();
+        wrong.game = "wrong_game".into();
+        assert!(verify_catalog_package(&wrong, &package).is_err());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(count > 0);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let mut state = test_state(&directory.path().join("target"));
+        Arc::get_mut(&mut state).unwrap().catalog = CatalogService::with_endpoints(
+            directory.path().join("cache"),
+            &format!("http://{address}/release"),
+            &format!("http://{address}/download/"),
+        )
+        .unwrap();
+        fs::create_dir_all(directory.path().join("cache")).unwrap();
+        let catalog = Catalog {
+            schema: 1,
+            revision: 1,
+            generated_at: "fixture".into(),
+            profiles: vec![entry.clone()],
+        };
+        fs::write(
+            directory.path().join("cache/catalog.json"),
+            serde_json::to_vec(&catalog).unwrap(),
+        )
+        .unwrap();
+        let installed = install_catalog_profile(
+            &state,
+            CatalogInstallParams {
+                id: entry.id,
+                version: entry.version.to_string(),
+                catalog_revision: 1,
+                sha256: entry.sha256,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(installed["active"], false);
+        assert_eq!(
+            installed["bundle"]["router_profile_id"],
+            bundle.router_profile_id.to_string()
+        );
+        assert_eq!(
+            state.profiles.list_bundles(None, 16).unwrap().bundles.len(),
+            1
+        );
+        assert_eq!(state.profiles.list().unwrap().len(), 2);
+        assert!(state
+            .local_config
+            .load_settings()
+            .unwrap()
+            .active_profile
+            .is_none());
+        assert!(!status(&state).capture_active);
+        let listing = catalog_listing(&state).unwrap();
+        assert_eq!(listing["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["profiles"][0]["installed"], true);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn catalog_admission_preserves_schema_one_packages_before_in_memory_migration() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../catalog/profiles/blazblue-entropy-effect/stage-tracker/v1.0.0");
+        let output = tempfile::tempdir().unwrap();
+        let entry = yash_app_events_catalog::build_package(&source, output.path()).unwrap();
+        assert_eq!(entry.profile_schema, 1);
+        verify_catalog_package(&entry, &output.path().join(&entry.package)).unwrap();
+        let wrong = CatalogEntry {
+            profile_schema: 2,
+            ..entry
+        };
+        assert!(verify_catalog_package(&wrong, &output.path().join(&wrong.package)).is_err());
     }
 
     #[tokio::test]

@@ -12,12 +12,13 @@ use eframe::egui;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 use yash_app_events_profile::{
-    AtomicRulePredicate, BarDirection, CapacityUsage, DerivedInput, DerivedObservation, Detector,
-    DetectorId, Element, ElementId, EventRule, InteractionCaution, InteractionPoint,
-    InteractionRole, InteractionTarget, InteractionTargetId, NormalizedRegion,
-    ObservationCondition, Overlay, OverlayId, PreprocessOperation, Profile, ProfileCapacityReport,
-    ProfileId, ProfileLimits, ProfileListIssue, ProfileStore, ProfileSummary, ProfileSummaryPage,
-    RecognitionCondition, RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
+    AtomicRulePredicate, BarDirection, BundleDiscoveryIssue, BundleDiscoveryPage, BundleSummary,
+    CapacityUsage, DerivedInput, DerivedObservation, Detector, DetectorId, Element, ElementId,
+    EventRule, InteractionCaution, InteractionPoint, InteractionRole, InteractionTarget,
+    InteractionTargetId, NormalizedRegion, ObservationCondition, Overlay, OverlayId,
+    PreprocessOperation, Profile, ProfileCapacityReport, ProfileId, ProfileLimits,
+    ProfileListIssue, ProfileStore, ProfileSummary, ProfileSummaryPage, RecognitionCondition,
+    RecognitionExpression, RuleId, RulePredicate, Scene, SceneId,
 };
 use yash_app_events_protocol::{method, ClientError, UnixRpcClient};
 
@@ -128,6 +129,28 @@ async fn load_profile_summaries(client: &mut UnixRpcClient) -> Result<Value, Cli
         }
         after = Some(next);
     }
+    let mut after: Option<String> = None;
+    loop {
+        let value = client
+            .call(
+                method::PROFILE_BUNDLE_LIST,
+                json!({"after":after,"limit":16}),
+            )
+            .await?;
+        let page: BundleDiscoveryPage = serde_json::from_value(value)?;
+        combined.bundles.extend(page.bundles);
+        combined.bundle_errors.extend(page.errors);
+        let Some(next) = page.next_after else {
+            break;
+        };
+        if after.as_ref().is_some_and(|previous| next <= *previous) {
+            return Err(ClientError::Rpc(yash_app_events_protocol::RpcError::new(
+                -32603,
+                "bundle cursor did not advance",
+            )));
+        }
+        after = Some(next);
+    }
     Ok(serde_json::to_value(combined)?)
 }
 
@@ -135,6 +158,58 @@ fn profile_matches_search(profile: &ProfileSummary, search: &str) -> bool {
     profile.name.to_lowercase().contains(search)
         || profile.game.to_lowercase().contains(search)
         || profile.id.to_string().contains(search)
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ProfileGroups {
+    bundles: Vec<(usize, Vec<usize>)>,
+    standalone: Vec<usize>,
+    other: Vec<usize>,
+}
+
+fn compact_bundle_name(name: &str) -> String {
+    if name.chars().count() <= 42 {
+        name.to_owned()
+    } else {
+        format!("{}…", name.chars().take(42).collect::<String>())
+    }
+}
+
+fn profile_groups(
+    profiles: &[ProfileSummary],
+    bundles: &[BundleSummary],
+    search: &str,
+) -> ProfileGroups {
+    let mut groups = ProfileGroups::default();
+    let contained: HashSet<_> = bundles
+        .iter()
+        .flat_map(|b| b.profile_ids.iter().copied())
+        .collect();
+    for (index, bundle) in bundles.iter().enumerate() {
+        let bundle_match = bundle.name.to_lowercase().contains(search)
+            || bundle.game.to_lowercase().contains(search)
+            || bundle.id.to_string().contains(search);
+        let members: Vec<_> = bundle
+            .profile_ids
+            .iter()
+            .filter_map(|id| profiles.iter().position(|p| p.id == *id))
+            .filter(|i| bundle_match || profile_matches_search(&profiles[*i], search))
+            .collect();
+        if bundle_match || !members.is_empty() {
+            groups.bundles.push((index, members));
+        }
+    }
+    for (index, profile) in profiles.iter().enumerate() {
+        if contained.contains(&profile.id) || !profile_matches_search(profile, search) {
+            continue;
+        }
+        if bundles.iter().any(|b| b.game == profile.game) {
+            groups.other.push(index);
+        } else {
+            groups.standalone.push(index);
+        }
+    }
+    groups
 }
 
 #[derive(Debug)]
@@ -273,6 +348,8 @@ impl Worker {
                                     || request.kind == RequestKind::Replay
                                     || request.method == method::CATALOG_REFRESH
                                     || request.kind == RequestKind::CatalogInstall
+                                    || request.method == method::PROFILE_BUNDLE_EXPORT
+                                    || request.method == method::PROFILE_BUNDLE_IMPORT
                                 {
                                     client
                                         .call_with_timeout(
@@ -494,6 +571,8 @@ pub struct App {
     worker: Worker,
     profiles: Vec<ProfileSummary>,
     profile_errors: Vec<ProfileListIssue>,
+    bundles: Vec<BundleSummary>,
+    bundle_errors: Vec<BundleDiscoveryIssue>,
     profile_search: String,
     committed_profile: Option<Profile>,
     selected: Option<usize>,
@@ -512,6 +591,8 @@ pub struct App {
     new_name: String,
     new_game: String,
     import_path: String,
+    bundle_import_path: String,
+    bundle_export_path: String,
     export_path: String,
     restore_id: String,
     capture_status: Value,
@@ -623,6 +704,8 @@ impl App {
             worker,
             profiles: Vec::new(),
             profile_errors: Vec::new(),
+            bundles: Vec::new(),
+            bundle_errors: Vec::new(),
             profile_search: String::new(),
             committed_profile: None,
             selected: None,
@@ -641,6 +724,8 @@ impl App {
             new_name: "New profile".into(),
             new_game: "game_id".into(),
             import_path: String::new(),
+            bundle_import_path: String::new(),
+            bundle_export_path: String::new(),
             export_path: String::new(),
             restore_id: String::new(),
             capture_status: json!({}),
@@ -1017,6 +1102,8 @@ impl App {
                 });
                 self.profiles = page.profiles;
                 self.profile_errors = page.errors;
+                self.bundles = page.bundles;
+                self.bundle_errors = page.bundle_errors;
                 self.selected = selected_id
                     .and_then(|id| self.profiles.iter().position(|profile| profile.id == id))
                     .or_else(|| {
@@ -1369,6 +1456,14 @@ impl App {
             "SHA-256: {}",
             profile["sha256"].as_str().unwrap_or("missing")
         ));
+        if profile["kind"] == "bundle" {
+            ui.label(format!(
+                "Collection: one router and {} members",
+                profile["bundle_profile_ids"]
+                    .as_array()
+                    .map_or(0, |ids| ids.len().saturating_sub(1))
+            ));
+        }
         if let Some(recipes) = profile["output_recipes"].as_array() {
             ui.small(format!(
                 "Inert output recipes: {}",
@@ -1411,6 +1506,75 @@ impl App {
         }
     }
 
+    fn profile_picker_ui(&mut self, ui: &mut egui::Ui) {
+        let search = self.profile_search.to_lowercase();
+        let grouping = profile_groups(&self.profiles, &self.bundles, &search);
+        let mut select_index = None;
+        egui::ScrollArea::vertical().id_salt("profile-list").max_height(260.0).show(ui, |ui| {
+            for (bundle_index, members) in &grouping.bundles {
+                let bundle = &self.bundles[*bundle_index];
+                let title = compact_bundle_name(&bundle.name);
+                egui::CollapsingHeader::new(format!("{} · {} profiles{}", title, bundle.profile_ids.len(), if bundle.error.is_some() { " · unavailable" } else { "" }))
+                    .id_salt(("bundle", bundle.id))
+                    .open((!search.is_empty()).then_some(true))
+                    .show(ui, |ui| {
+                        ui.label(&bundle.name);
+                        if let Some(error) = &bundle.error { ui.colored_label(egui::Color32::YELLOW, error); }
+                        for index in members {
+                            let profile = &self.profiles[*index];
+                            let role = if profile.id == bundle.id { "Router" } else { "Member" };
+                            if ui.selectable_label(self.selected == Some(*index), format!("{role}: {} · rev {}", profile.name, profile.revision)).clicked() {
+                                select_index = Some(*index);
+                            }
+                        }
+                        ui.small("The router groups screenshot analysis. Activate individual profiles for live capture.");
+                        if ui.add_enabled(bundle.error.is_none() && !self.bundle_export_path.is_empty(), egui::Button::new("Export collection")).clicked() {
+                            self.worker.send(RequestKind::Mutation, method::PROFILE_BUNDLE_EXPORT, json!({"profile_id":bundle.id,"path":self.bundle_export_path}));
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut self.bundle_export_path).desired_width(200.0).hint_text("/path/collection.hudbundle"));
+                    });
+            }
+            for index in &grouping.standalone {
+                let profile = &self.profiles[*index];
+                if ui.selectable_label(self.selected == Some(*index), format!("{} · rev {}", profile.name, profile.revision)).clicked() { select_index = Some(*index); }
+            }
+            if !grouping.other.is_empty() {
+                egui::CollapsingHeader::new(format!("Other installed profiles ({})", grouping.other.len()))
+                    .id_salt("other-installed-profiles").open((!search.is_empty()).then_some(true))
+                    .show(ui, |ui| {
+                        for index in &grouping.other {
+                            let profile = &self.profiles[*index];
+                            if ui.selectable_label(self.selected == Some(*index), format!("{} · rev {}", profile.name, profile.revision)).clicked() { select_index = Some(*index); }
+                        }
+                    });
+            }
+            for issue in &self.bundle_errors { ui.colored_label(egui::Color32::YELLOW, format!("Bundle {}: {}", issue.source, issue.detail)); }
+        });
+        if let Some(index) = select_index {
+            self.select_profile(index);
+        }
+        ui.collapsing("Import collection", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.bundle_import_path)
+                    .desired_width(200.0)
+                    .hint_text("/path/collection.hudbundle"),
+            );
+            if ui
+                .add_enabled(
+                    !self.bundle_import_path.is_empty(),
+                    egui::Button::new("Install inactive"),
+                )
+                .clicked()
+            {
+                self.worker.send(
+                    RequestKind::Mutation,
+                    method::PROFILE_BUNDLE_IMPORT,
+                    json!({"path":self.bundle_import_path}),
+                );
+            }
+        });
+    }
+
     fn sidebar(&mut self, context: &egui::Context) {
         egui::SidePanel::left("profiles").resizable(true).default_width(300.0).show(context,|ui| {
             ui.heading("Profiles");
@@ -1440,17 +1604,7 @@ impl App {
                     self.worker.poll(RequestKind::Profiles, method::PROFILE_LIST_SUMMARIES, Value::Null);
                 }
             });
-            let search = self.profile_search.to_lowercase();
-            let mut select_index = None;
-            egui::ScrollArea::vertical().id_salt("profile-list").max_height(260.0).show(ui, |ui| {
-                for (index, profile) in self.profiles.iter().enumerate() {
-                    if profile_matches_search(profile, &search)
-                        && ui.selectable_label(self.selected == Some(index), format!("{} · rev {}", profile.name, profile.revision)).clicked() {
-                        select_index = Some(index);
-                    }
-                }
-            });
-            if let Some(index) = select_index { self.select_profile(index); }
+            self.profile_picker_ui(ui);
             ui.separator();
             let draft = self.draft.take();
             if let Some(profile) = draft {
@@ -5372,10 +5526,63 @@ mod tests {
     }
 
     #[test]
+    fn bundle_groups_exact_members_keeps_copies_and_searches_every_group() {
+        let router = Profile::new("Queen router", "queen", 558, 992);
+        let member = Profile::new("Guild battle", "queen", 558, 992);
+        let copy = Profile::new("Guild battle", "queen", 558, 992);
+        let blaze = Profile::new("BlazBlue", "blazblue", 1920, 1080);
+        let profiles = [&router, &member, &copy, &blaze]
+            .into_iter()
+            .map(summary)
+            .collect::<Vec<_>>();
+        let bundles = vec![BundleSummary {
+            id: router.id,
+            name: "Queen Blade".into(),
+            game: "queen".into(),
+            profile_ids: vec![router.id, member.id],
+            error: None,
+        }];
+        let groups = profile_groups(&profiles, &bundles, "");
+        assert_eq!(groups.bundles, vec![(0, vec![0, 1])]);
+        assert_eq!(groups.other, vec![2]);
+        assert_eq!(groups.standalone, vec![3]);
+        assert_eq!(
+            profile_groups(&profiles, &bundles, "queen blade").bundles[0].1,
+            vec![0, 1]
+        );
+        let searched = profile_groups(&profiles, &bundles, "guild");
+        assert_eq!(searched.bundles[0].1, vec![1]);
+        assert_eq!(searched.other, vec![2]);
+        assert_eq!(
+            profile_groups(&profiles, &bundles, "blaz").standalone,
+            vec![3]
+        );
+        let broken = vec![BundleSummary {
+            error: Some("stale pins".into()),
+            ..bundles[0].clone()
+        }];
+        assert_eq!(profile_groups(&profiles, &broken, "").standalone, vec![3]);
+        let (mut app, _requests) = profile_test_app();
+        app.apply_profiles(json!(ProfileSummaryPage {
+            profiles,
+            bundles: broken.clone(),
+            ..ProfileSummaryPage::default()
+        }));
+        assert_eq!(app.bundles, broken);
+    }
+
+    #[test]
     fn long_profile_rows_do_not_expand_the_sidebar_across_repaints() {
         let (mut app, _requests) = profile_test_app();
         let profile = Profile::new("Long profile name ".repeat(20), "game", 1920, 1080);
         app.profiles = vec![summary(&profile)];
+        app.bundles = vec![BundleSummary {
+            id: profile.id,
+            name: "A long collection name ".repeat(6),
+            game: profile.game.clone(),
+            profile_ids: vec![profile.id],
+            error: None,
+        }];
         let context = egui::Context::default();
         for _ in 0..100 {
             let _ = context.run(
@@ -5411,6 +5618,7 @@ mod tests {
             profiles: vec![summary(&second), summary(&first)],
             errors: vec![issue.clone()],
             next_after: None,
+            ..ProfileSummaryPage::default()
         }));
         assert_eq!(app.profiles[0].id, first.id);
         assert!(app.draft.is_none());
@@ -5433,6 +5641,7 @@ mod tests {
             profiles: vec![summary(&second), summary(&first)],
             errors: vec![issue.clone()],
             next_after: None,
+            ..ProfileSummaryPage::default()
         }));
         assert_eq!(app.profiles[app.selected.unwrap()].id, second.id);
         assert_eq!(app.draft.as_ref().unwrap().name, "Unsaved");
@@ -5459,7 +5668,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = tokio::io::split(stream);
             let mut reader = BufReader::new(reader);
-            for i in 0..3 {
+            for i in 0..4 {
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
@@ -5477,12 +5686,16 @@ mod tests {
                             ..ProfileSummaryPage::default()
                         })
                     }
-                    _ => {
+                    2 => {
                         assert_eq!(request["params"]["after"], id.to_string());
                         json!(ProfileSummaryPage {
                             profiles: vec![summary(&profile)],
                             ..ProfileSummaryPage::default()
                         })
+                    }
+                    _ => {
+                        assert_eq!(request["method"], method::PROFILE_BUNDLE_LIST);
+                        json!(BundleDiscoveryPage::default())
                     }
                 };
                 let mut bytes = serde_json::to_vec(
