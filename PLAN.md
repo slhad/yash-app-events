@@ -33,14 +33,18 @@ The final 2026-09-21 hot-path audit also removed duplicate one-shot PNG reads an
 sample replay, indexed scene-aware processor scheduling, moved the status `/proc` cache
 check before filesystem reads, avoided duplicate route validation and per-delivery sync
 barriers, reused canonical suite roots, and cached the GUI observation profile index.
-The canonical evidence is in `SPECS.md` and `docs/performance.md`. The current tree passes
+The canonical evidence is in `SPECS.md` and `docs/performance.md`. That audit passed
 200 workspace tests and strict workspace Clippy. The available 33-case, 126-assertion game
 suite and interactive portal/GUI runs remain dated evidence; no fresh interactive run was
 part of this audit.
 
 ## Active work
 
-No product milestone is currently scheduled.
+No product milestone is currently scheduled. The optional Quickshell status integration
+completed on 2026-10-02 under `SPEC-OBS-004`. It adds fresh-analysis status evidence,
+an Omarchy bar plugin, optional installation, and protocol/native-QML/installer tests.
+Current setup is in `docs/quickshell.md`; dated checks and interactive limits are in
+`docs/quickshell-acceptance.md`.
 
 Before a release that claims fresh desktop integration evidence, repeat the applicable portal
 and native GUI smoke tests in `docs/capture-smoke.md` and `docs/gui-acceptance-report.md`.

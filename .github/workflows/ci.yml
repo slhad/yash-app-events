@@ -29,3 +29,7 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: bash scripts/check-readme-claims.sh
       - run: cargo doc --workspace --no-deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test integrations/quickshell/tests/*.test.cjs
