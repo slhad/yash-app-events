@@ -44,6 +44,10 @@ pub struct ProfileSummaryPage {
     pub profiles: Vec<ProfileSummary>,
     pub errors: Vec<ProfileListIssue>,
     pub next_after: Option<ProfileId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<crate::BundleSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundle_errors: Vec<crate::BundleDiscoveryIssue>,
 }
 
 /// Validated portable recipe plus integrity metadata shown during local installation.
@@ -238,7 +242,7 @@ impl ProfileStore {
     }
 
     fn committed_ids(&self) -> Result<Vec<ProfileId>, StoreError> {
-        let mut ids = Vec::new();
+        let mut ids = self.installed_bundle_profile_ids()?;
         if !self.profiles.exists() {
             return Ok(ids);
         }
@@ -656,7 +660,12 @@ impl ProfileStore {
     /// Returns the portable directory for a stable profile ID.
     #[must_use]
     pub fn profile_directory(&self, id: ProfileId) -> PathBuf {
-        self.profiles.join(id.to_string())
+        let direct = self.profiles.join(id.to_string());
+        if direct.exists() {
+            direct
+        } else {
+            self.installed_profile_directory(id).unwrap_or(direct)
+        }
     }
 
     fn trash_directory(&self, id: ProfileId) -> PathBuf {
@@ -714,7 +723,7 @@ impl ProfileStore {
         Ok(())
     }
 
-    fn record_revision(&self, id: ProfileId, revision: u64) -> Result<(), StoreError> {
+    pub(crate) fn record_revision(&self, id: ProfileId, revision: u64) -> Result<(), StoreError> {
         let mut lineage = self.read_lineage()?;
         let key = id.to_string();
         if let Some(floor) = lineage.revisions.get(&key).copied() {
@@ -755,7 +764,7 @@ impl ProfileStore {
         Ok(())
     }
 
-    fn import_revision_floor(&self, id: ProfileId) -> Result<Option<u64>, StoreError> {
+    pub(crate) fn import_revision_floor(&self, id: ProfileId) -> Result<Option<u64>, StoreError> {
         let lineage = self.read_lineage()?;
         let key = id.to_string();
         let mut floor = lineage.revisions.get(&key).copied();
@@ -788,6 +797,11 @@ impl ProfileStore {
                 if path.is_file() {
                     paths.push(path);
                 }
+            }
+        }
+        for id in self.installed_bundle_profile_ids()? {
+            if let Some(root) = self.installed_profile_directory(id) {
+                paths.push(root.join(PROFILE_FILE));
             }
         }
         Ok(paths)

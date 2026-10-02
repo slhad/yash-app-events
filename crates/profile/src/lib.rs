@@ -13,12 +13,20 @@ use uuid::Uuid;
 
 mod archive;
 mod bundle;
+mod collection;
 mod local;
 mod store;
-pub use archive::{export_profile, import_profile, ArchiveError, ImportLimits, Manifest};
+pub use archive::{
+    declared_asset_paths, export_profile, import_profile, profile_document_schema, ArchiveError,
+    ImportLimits, Manifest, ManifestFile,
+};
 pub use bundle::{
     load_profile_bundle, ProfileBundle, ProfileBundleError, ProfileBundleMember,
     PROFILE_BUNDLE_SCHEMA_VERSION,
+};
+pub use collection::{
+    export_bundle, validate_bundle_profiles, BundleDiscoveryIssue, BundleDiscoveryPage,
+    BundlePackageManifest, BundleSummary, CollectionError,
 };
 pub use local::{CaptureBinding, CollectionPolicy, LocalConfig, LocalConfigError, Settings};
 pub use store::{

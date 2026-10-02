@@ -1,5 +1,13 @@
 # Architecture and dependency direction
 
+Routing collections keep existing profile boundaries. The profile store discovers
+legacy manifests and atomically installs complete nested collections under
+`bundles/<router-id>/`. Profile APIs locate standalone or managed member documents;
+the daemon remains their sole writer. The GUI worker fetches bounded collection
+pages alongside profile metadata, and its render thread groups exact IDs only.
+The catalog treats one collection as one archive/entry and validates every contained
+identity before admitting it. See [collection packaging](profile-bundles.md).
+
 The daemon is the only state-owning process. The GUI and CLI are protocol clients.
 
 Profile discovery uses bounded `profile.list_summaries` pages with validated metadata

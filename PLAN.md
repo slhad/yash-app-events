@@ -40,6 +40,12 @@ part of this audit.
 
 ## Active work
 
+Routing collection support completed on 2026-10-02 under `SPEC-PROFILE-013`.
+Shared discovery, grouped GUI, self-contained archives, atomic import, catalog support,
+and native Queen Blade tests passed. The implementation sequence is retained in
+`docs/profile-bundles-plan.md`; verified behavior and evidence are in
+`docs/profile-bundles.md` and `docs/profile-bundles-acceptance.md`.
+
 Profile-manager recovery completed on 2026-10-02 under `SPEC-UI-002`,
 `SPEC-PROFILE-003/006`, and `SPEC-IPC-004`. Paged metadata discovery isolates invalid
 profiles, and the searchable GUI loads selected documents. Automated and native

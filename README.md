@@ -172,6 +172,10 @@ yash-eventsctl profile create "My game" my_game
 yash-eventsctl profile validate ./profile.json
 yash-eventsctl profile pack ./portable-profile ./portable-profile.hudprofile
 yash-eventsctl --json profile bundle validate ./queen.profile-bundle.json
+yash-eventsctl --json profile bundle list --limit 16
+yash-eventsctl --json profile bundle get <router-uuid>
+yash-eventsctl --json profile bundle export <router-uuid> /path/to/queen.hudbundle
+yash-eventsctl --json profile bundle import /path/to/queen.hudbundle
 yash-eventsctl profile activate <profile-uuid>
 yash-eventsctl events follow --json
 yash-eventsctl state --json
@@ -234,6 +238,23 @@ still owned by the daemon's profile store. `profile bundle validate` checks the 
 while the daemon checks the router and selected member's revisions, game, layout, and router
 scene/overlay IDs. Bundle analysis remains pure and never activates a profile or publishes an
 event.
+
+Existing `*.profile-bundle.json` manifests in the profiles directory appear as one
+expandable GUI collection, with the router and exact members beneath it. Other profiles
+for that game remain under **Other installed profiles**. Search opens matching groups;
+BlazBlue and other games remain independently selectable. Unavailable collections show
+a diagnostic, and grouping never deletes profiles.
+
+A `.hudbundle` packages the routing manifest, all referenced profiles, their declared
+assets, and inert output recipes. `profile bundle export` requires every pinned revision
+and route to validate. `profile bundle import` stages the entire package, rejects live
+ID collisions, and publishes one collection directory atomically without activating it.
+Retained profile lineage rebases revisions and manifest pins together. Installed profiles
+remain editable; changing a pinned revision makes the collection show a stale-pin warning
+until its manifest is updated. The GUI also provides collection import and export.
+Catalog collection packages produce one entry with a router/member count. This support
+does not add Queen Blade to the public catalog or enable bundle-wide live capture.
+See [collection packaging](docs/profile-bundles.md) for the format and limits.
 
 For consecutive one-shot frames, `--context-json` can carry the previous recognized
 profile/scene/overlay IDs and optional expected scene/overlay names or stable IDs for the next
@@ -337,7 +358,7 @@ keeps the last valid catalog atomically below the XDG cache directory for offlin
 and verifies the declared size and SHA-256 before using the normal hardened profile importer.
 Installation never activates the profile or authorizes its inert output recipes.
 
-Catalog sources are reviewable under `catalog/profiles/`; generated `.hudprofile` packages
+Catalog sources are reviewable under `catalog/profiles/`; generated `.hudprofile` and `.hudbundle` packages
 and catalog indexes live only on the release. The initial BlazBlue Entropy Effect Stage
 Tracker contains OCR/seven-segment configuration and two raw-text output recipes, but no
 gameplay image, video, thumbnail, capture binding, local route, or restore token. See

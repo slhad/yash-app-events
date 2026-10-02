@@ -15,7 +15,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use yash_app_events_output::OutputRecipe;
 use yash_app_events_profile::{
-    export_profile, load_profile, Detector, Profile, PROFILE_SCHEMA_VERSION,
+    declared_asset_paths, export_bundle, export_profile, load_profile, load_profile_bundle,
+    profile_document_schema, validate_bundle_profiles, Detector, Profile, ProfileBundle,
+    PROFILE_SCHEMA_VERSION,
 };
 
 pub const CATALOG_SCHEMA_VERSION: u16 = 1;
@@ -34,8 +36,26 @@ pub struct Catalog {
     pub profiles: Vec<CatalogEntry>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    #[default]
+    Profile,
+    Bundle,
+}
+impl PackageKind {
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate takes a reference.
+    fn is_profile(&self) -> bool {
+        *self == Self::Profile
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogEntry {
+    #[serde(default, skip_serializing_if = "PackageKind::is_profile")]
+    pub kind: PackageKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundle_profile_ids: Vec<Uuid>,
     pub id: String,
     pub game: String,
     pub game_slug: String,
@@ -83,6 +103,8 @@ pub struct Verification {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceEntry {
+    #[serde(default, skip_serializing_if = "PackageKind::is_profile")]
+    pub kind: PackageKind,
     pub schema: u16,
     pub id: String,
     pub game: String,
@@ -342,7 +364,10 @@ impl Catalog {
             entry.validate()?;
             if !identities.insert((entry.id.as_str(), &entry.version))
                 || !packages.insert(entry.package.as_str())
-                || !profile_ids.insert(entry.profile_id)
+                || entry
+                    .contained_profile_ids()
+                    .iter()
+                    .any(|id| !profile_ids.insert(*id))
             {
                 return Err(CatalogError::Invalid("catalog entries are not unique"));
             }
@@ -385,11 +410,35 @@ impl CatalogEntry {
             || self.bytes == 0
             || self.bytes > MAXIMUM_PACKAGE_BYTES as u64
             || !is_sha256(&self.sha256)
-            || self.package != package_name(&self.game_slug, &self.profile_slug, &self.version)
+            || self.package
+                != package_name_for(
+                    self.kind,
+                    &self.game_slug,
+                    &self.profile_slug,
+                    &self.version,
+                )
         {
             return Err(CatalogError::Invalid("catalog package metadata is invalid"));
         }
+        let ids: HashSet<_> = self.bundle_profile_ids.iter().collect();
+        if (self.kind == PackageKind::Profile && !ids.is_empty())
+            || (self.kind == PackageKind::Bundle
+                && (!(1..=33).contains(&ids.len())
+                    || ids.len() != self.bundle_profile_ids.len()
+                    || self.bundle_profile_ids.first() != Some(&self.profile_id)))
+        {
+            return Err(CatalogError::Invalid("catalog bundle inventory is invalid"));
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn contained_profile_ids(&self) -> Vec<Uuid> {
+        if self.kind == PackageKind::Bundle {
+            self.bundle_profile_ids.clone()
+        } else {
+            vec![self.profile_id]
+        }
     }
 
     #[must_use]
@@ -488,6 +537,19 @@ pub fn package_name(game_slug: &str, profile_slug: &str, version: &Version) -> S
 }
 
 #[must_use]
+pub fn package_name_for(
+    kind: PackageKind,
+    game_slug: &str,
+    profile_slug: &str,
+    version: &Version,
+) -> String {
+    match kind {
+        PackageKind::Profile => package_name(game_slug, profile_slug, version),
+        PackageKind::Bundle => format!("bundle--{game_slug}--{profile_slug}--v{version}.hudbundle"),
+    }
+}
+
+#[must_use]
 pub fn catalog_filename(revision: u64) -> String {
     format!("catalog-v1-r{revision:06}.json")
 }
@@ -518,7 +580,11 @@ pub fn read_source_entry(directory: &Path) -> Result<SourceEntry, CatalogError> 
 /// Returns unsafe inventory, PII/secret, profile, recipe, or metadata failures.
 pub fn validate_source_directory(directory: &Path) -> Result<(SourceEntry, Profile), CatalogError> {
     let source = read_source_entry(directory)?;
-    let profile = load_profile(&directory.join("profile.json"))?;
+    let (bundle, profiles) = source_profiles(directory, source.kind)?;
+    let profile = profiles
+        .first()
+        .ok_or(CatalogError::Invalid("source inventory is empty"))?
+        .clone();
     if profile.game != source.game
         || profile.layout.reference_width == 0
         || profile.layout.reference_height == 0
@@ -528,9 +594,9 @@ pub fn validate_source_directory(directory: &Path) -> Result<(SourceEntry, Profi
         ));
     }
     validate_source_path(directory, &source)?;
-    let mut actual_detectors = profile
-        .elements
+    let mut actual_detectors = profiles
         .iter()
+        .flat_map(|p| &p.elements)
         .map(|element| match element.detector {
             Detector::ColorBar { .. } => "color_bar",
             Detector::Template { .. } => "template",
@@ -554,10 +620,11 @@ pub fn validate_source_directory(directory: &Path) -> Result<(SourceEntry, Profi
             "declared detectors differ from the profile",
         ));
     }
-    let mut actual_recipes = load_source_recipes(directory)?
-        .into_iter()
-        .map(|recipe| recipe.name)
-        .collect::<Vec<_>>();
+    let mut actual_recipes = Vec::new();
+    for p in &profiles {
+        let root = source_profile_directory(directory, source.kind, p);
+        actual_recipes.extend(load_source_recipes(&root)?.into_iter().map(|r| r.name));
+    }
     actual_recipes.sort();
     let mut declared_recipes = source.output_recipes.clone();
     declared_recipes.sort();
@@ -566,8 +633,42 @@ pub fn validate_source_directory(directory: &Path) -> Result<(SourceEntry, Profi
             "declared output recipes differ from source files",
         ));
     }
-    audit_source_files(directory, source.media_free)?;
+    audit_source_files(directory, &source, bundle.as_ref(), &profiles)?;
     Ok((source, profile))
+}
+
+fn source_profile_directory(directory: &Path, kind: PackageKind, profile: &Profile) -> PathBuf {
+    if kind == PackageKind::Bundle {
+        directory.join("profiles").join(profile.id.to_string())
+    } else {
+        directory.to_owned()
+    }
+}
+
+fn source_profiles(
+    directory: &Path,
+    kind: PackageKind,
+) -> Result<(Option<ProfileBundle>, Vec<Profile>), CatalogError> {
+    if kind == PackageKind::Profile {
+        return Ok((None, vec![load_profile(&directory.join("profile.json"))?]));
+    }
+    let bundle = load_profile_bundle(&directory.join("bundle.json"))
+        .map_err(|_| CatalogError::Invalid("source bundle is invalid"))?;
+    let profiles = bundle
+        .profile_ids()
+        .iter()
+        .map(|id| {
+            load_profile(
+                &directory
+                    .join("profiles")
+                    .join(id.to_string())
+                    .join("profile.json"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_bundle_profiles(&bundle, &profiles)
+        .map_err(|_| CatalogError::Invalid("source bundle references are invalid"))?;
+    Ok((Some(bundle), profiles))
 }
 
 fn validate_source_path(directory: &Path, source: &SourceEntry) -> Result<(), CatalogError> {
@@ -613,18 +714,54 @@ fn load_source_recipes(directory: &Path) -> Result<Vec<OutputRecipe>, CatalogErr
     Ok(values)
 }
 
-fn audit_source_files(directory: &Path, media_free: bool) -> Result<(), CatalogError> {
+fn audit_source_files(
+    directory: &Path,
+    source: &SourceEntry,
+    bundle: Option<&ProfileBundle>,
+    profiles: &[Profile],
+) -> Result<(), CatalogError> {
+    let media_free = source.media_free;
+    let mut allowed_files: HashSet<PathBuf> = ["catalog-entry.json", "verification.json"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    if bundle.is_some() {
+        allowed_files.insert(PathBuf::from("bundle.json"));
+    }
+    for profile in profiles {
+        let root = source_profile_directory(directory, source.kind, profile);
+        let prefix = root
+            .strip_prefix(directory)
+            .map_err(|_| CatalogError::Invalid("source path"))?;
+        allowed_files.insert(prefix.join("profile.json"));
+        for asset in declared_asset_paths(profile) {
+            // Catalog sources accept audited JSON templates/masks. Binary model/media admission remains separate.
+            if media_free || asset.extension().is_none_or(|e| e != "json") {
+                return Err(CatalogError::UnsafeSource(asset.display().to_string()));
+            }
+            if !root.join(&asset).is_file() {
+                return Err(CatalogError::UnsafeSource(asset.display().to_string()));
+            }
+            allowed_files.insert(prefix.join(asset));
+        }
+        let recipes = root.join("output-recipes");
+        if recipes.is_dir() {
+            for entry in fs::read_dir(&recipes)? {
+                let entry = entry?;
+                if entry.path().extension().is_none_or(|e| e != "json") {
+                    return Err(CatalogError::UnsafeSource(
+                        entry.path().display().to_string(),
+                    ));
+                }
+                allowed_files.insert(prefix.join("output-recipes").join(entry.file_name()));
+            }
+        }
+    }
     let mut files = Vec::new();
     collect_files(directory, directory, &mut files)?;
     for relative in files {
         let normalized = relative.to_string_lossy().replace('\\', "/");
-        let allowed = normalized == "profile.json"
-            || normalized == "catalog-entry.json"
-            || normalized == "verification.json"
-            || (normalized.starts_with("output-recipes/")
-                && Path::new(&normalized)
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json")));
+        let allowed = allowed_files.contains(&relative);
         if !allowed {
             return Err(CatalogError::UnsafeSource(normalized));
         }
@@ -749,26 +886,58 @@ fn is_media_path(path: &str) -> bool {
 /// Returns source audit, staging, archive, or output I/O failures.
 pub fn build_package(source_directory: &Path, output: &Path) -> Result<CatalogEntry, CatalogError> {
     let (source, profile) = validate_source_directory(source_directory)?;
+    let (bundle, profiles) = source_profiles(source_directory, source.kind)?;
     let staging = tempfile_directory(output)?;
     let result = (|| {
-        fs::copy(
-            source_directory.join("profile.json"),
-            staging.join("profile.json"),
-        )?;
-        let recipes = source_directory.join("output-recipes");
-        if recipes.is_dir() {
-            copy_directory(&recipes, &staging.join("output-recipes"))?;
-        }
-        let filename = package_name(&source.game_slug, &source.profile_slug, &source.version);
+        let filename = package_name_for(
+            source.kind,
+            &source.game_slug,
+            &source.profile_slug,
+            &source.version,
+        );
         fs::create_dir_all(output)?;
         let destination = output.join(&filename);
-        export_profile(&staging, &destination)?;
+        if let Some(bundle) = &bundle {
+            export_bundle(
+                bundle,
+                |id| source_directory.join("profiles").join(id.to_string()),
+                &destination,
+            )
+            .map_err(|_| CatalogError::Invalid("bundle export failed"))?;
+        } else {
+            fs::copy(
+                source_directory.join("profile.json"),
+                staging.join("profile.json"),
+            )?;
+            let recipes = source_directory.join("output-recipes");
+            if recipes.is_dir() {
+                copy_directory(&recipes, &staging.join("output-recipes"))?;
+            }
+            for asset in declared_asset_paths(&profile) {
+                let target = staging.join(&asset);
+                fs::create_dir_all(target.parent().ok_or(CatalogError::Invalid("asset path"))?)?;
+                fs::copy(source_directory.join(asset), target)?;
+            }
+            export_profile(&staging, &destination)?;
+        }
         let bytes = fs::read(&destination)?;
         Ok::<_, CatalogError>((filename, bytes))
     })();
     let _ = fs::remove_dir_all(&staging);
     let (filename, bytes) = result?;
     Ok(CatalogEntry {
+        kind: source.kind,
+        bundle_profile_ids: if bundle.is_some() {
+            profiles
+                .iter()
+                .map(|p| {
+                    Uuid::parse_str(&p.id.to_string())
+                        .map_err(|_| CatalogError::Invalid("profile ID is not a UUID"))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        },
         id: source.id,
         game: source.game,
         game_slug: source.game_slug,
@@ -781,7 +950,18 @@ pub fn build_package(source_directory: &Path, output: &Path) -> Result<CatalogEn
         package: filename,
         bytes: bytes.len() as u64,
         sha256: digest(&bytes),
-        profile_schema: profile.schema,
+        profile_schema: profiles
+            .iter()
+            .map(|p| {
+                profile_document_schema(
+                    &source_profile_directory(source_directory, source.kind, p)
+                        .join("profile.json"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(profile.schema),
         minimum_app_version: source.minimum_app_version,
         maximum_app_version: source.maximum_app_version,
         media_free: source.media_free,
@@ -875,6 +1055,8 @@ mod tests {
 
     fn entry() -> CatalogEntry {
         CatalogEntry {
+            kind: PackageKind::Profile,
+            bundle_profile_ids: Vec::new(),
             id: "demo-game.stage-tracker".into(),
             game: "demo_game".into(),
             game_slug: "demo-game".into(),
@@ -960,6 +1142,89 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn bundle_source_builds_one_reproducible_package_and_rejects_extra_files() {
+        use yash_app_events_profile::{ImportLimits, ProfileBundleMember, ProfileStore};
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("demo-game/stage-tracker/v1.0.0");
+        fs::create_dir_all(&directory).unwrap();
+        let router = Profile::new("Router", "demo_game", 100, 100);
+        let member = Profile::new("Member", "demo_game", 100, 100);
+        let bundle = ProfileBundle {
+            schema: 1,
+            name: "Collection".into(),
+            game: "demo_game".into(),
+            router_profile_id: router.id,
+            router_profile_revision: 0,
+            members: vec![ProfileBundleMember {
+                profile_id: member.id,
+                profile_revision: 0,
+                scene_ids: vec![],
+                overlay_ids: vec![],
+                priority: 0,
+                fallback: true,
+            }],
+        };
+        for profile in [&router, &member] {
+            let root = directory.join("profiles").join(profile.id.to_string());
+            fs::create_dir_all(&root).unwrap();
+            yash_app_events_profile::save_profile(&root.join("profile.json"), profile).unwrap();
+        }
+        fs::write(
+            directory.join("bundle.json"),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+        let mut metadata = serde_json::to_value(entry()).unwrap();
+        metadata["schema"] = serde_json::json!(1);
+        metadata["kind"] = serde_json::json!("bundle");
+        metadata["detectors"] = serde_json::json!([]);
+        fs::write(
+            directory.join("catalog-entry.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("verification.json"),
+            b"{\"status\":\"fixture\"}",
+        )
+        .unwrap();
+        let first = build_package(&directory, &temp.path().join("first")).unwrap();
+        let second = build_package(&directory, &temp.path().join("second")).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.kind, PackageKind::Bundle);
+        assert_eq!(first.bundle_profile_ids.len(), 2);
+        first.validate().unwrap();
+        let store = ProfileStore::new(temp.path().join("installed"), 20);
+        store
+            .import_bundle(
+                &temp.path().join("first").join(&first.package),
+                ImportLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(store.list_bundles(None, 16).unwrap().bundles.len(), 1);
+        assert_eq!(store.list().unwrap().len(), 2);
+        let mut wrong = first.clone();
+        wrong.bundle_profile_ids.push(wrong.profile_id);
+        assert!(wrong.validate().is_err());
+        let catalog = Catalog {
+            schema: 1,
+            revision: 1,
+            generated_at: "fixture".into(),
+            profiles: vec![first.clone(), first],
+        };
+        assert!(catalog.validate().is_err());
+        fs::write(
+            directory
+                .join("profiles")
+                .join(member.id.to_string())
+                .join("private.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert!(build_package(&directory, &temp.path().join("bad")).is_err());
     }
 
     #[tokio::test]

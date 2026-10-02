@@ -337,7 +337,7 @@ pub enum ProfileCommand {
     AnalyzeCapacity {
         path: PathBuf,
     },
-    /// Validate a read-only profile routing bundle without a daemon.
+    /// Discover, package, install, or validate a profile routing bundle.
     Bundle {
         #[command(subcommand)]
         command: ProfileBundleCommand,
@@ -346,7 +346,25 @@ pub enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ProfileBundleCommand {
-    Validate { path: PathBuf },
+    Validate {
+        path: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 16)]
+        limit: usize,
+    },
+    Get {
+        profile_id: String,
+    },
+    Export {
+        profile_id: String,
+        path: PathBuf,
+    },
+    Import {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -484,6 +502,12 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     let timeout_ms = if matches!(
         cli.command,
         Command::Suite { .. }
+            | Command::Profile {
+                command: ProfileCommand::Bundle {
+                    command: ProfileBundleCommand::Export { .. }
+                        | ProfileBundleCommand::Import { .. }
+                }
+            }
             | Command::Catalog {
                 command: CatalogCommand::Refresh | CatalogCommand::Install { .. }
             }
@@ -630,10 +654,16 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
                         )
                         .await?
                 }
+                ProfileCommand::Bundle { command } => match command {
+                    ProfileBundleCommand::List { after, limit } => client.call(method::PROFILE_BUNDLE_LIST, json!({"after":after,"limit":limit})).await?,
+                    ProfileBundleCommand::Get { profile_id } => client.call(method::PROFILE_BUNDLE_GET, json!({"profile_id":profile_id})).await?,
+                    ProfileBundleCommand::Export { profile_id, path } => client.call(method::PROFILE_BUNDLE_EXPORT, json!({"profile_id":profile_id,"path":path})).await?,
+                    ProfileBundleCommand::Import { path } => client.call(method::PROFILE_BUNDLE_IMPORT, json!({"path":path})).await?,
+                    ProfileBundleCommand::Validate { .. } => unreachable!(),
+                },
                 ProfileCommand::Validate { .. }
                 | ProfileCommand::Pack { .. }
-                | ProfileCommand::AnalyzeCapacity { .. }
-                | ProfileCommand::Bundle { .. } => unreachable!(),
+                | ProfileCommand::AnalyzeCapacity { .. } => unreachable!(),
             },
             Command::Catalog { command } => match command {
                 CatalogCommand::Status => {
@@ -1209,6 +1239,24 @@ mod tests {
 
     use super::*;
     use yash_app_events_profile::{Detector, DetectorId, Element, ElementId, NormalizedRegion};
+
+    #[test]
+    fn bundle_cli_exposes_shared_protocol_operations() {
+        for args in [
+            vec!["list", "--limit", "1"],
+            vec!["get", "00000000-0000-0000-0000-000000000001"],
+            vec![
+                "export",
+                "00000000-0000-0000-0000-000000000001",
+                "/tmp/collection.hudbundle",
+            ],
+            vec!["import", "/tmp/collection.hudbundle"],
+        ] {
+            let mut command = vec!["yash-eventsctl", "profile", "bundle"];
+            command.extend(args);
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+    }
 
     #[test]
     fn analyze_command_requires_image_and_profile() {

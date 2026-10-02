@@ -40,6 +40,17 @@ pub struct ImportLimits {
     pub maximum_total_bytes: u64,
 }
 
+impl ImportLimits {
+    /// Collection-wide expansion allowance; individual profile limits still apply.
+    #[must_use]
+    pub fn for_bundle() -> Self {
+        Self {
+            maximum_total_bytes: 256 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ImportLimits {
     fn default() -> Self {
         Self {
@@ -52,6 +63,20 @@ impl Default for ImportLimits {
             maximum_total_bytes: 128 * 1024 * 1024,
         }
     }
+}
+
+/// Reads the portable document schema before non-writing in-memory migration.
+///
+/// # Errors
+/// Rejects malformed documents and unsupported schema versions.
+pub fn profile_document_schema(path: &Path) -> Result<u16, ArchiveError> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let schema = value["schema"]
+        .as_u64()
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|v| *v > 0 && *v <= PROFILE_SCHEMA_VERSION)
+        .ok_or(ArchiveError::UnsupportedSchema)?;
+    Ok(schema)
 }
 
 /// Exports a self-contained portable profile directory.
@@ -87,7 +112,7 @@ pub fn export_profile(
     }
     let manifest = Manifest {
         schema: 1,
-        profile_schema: profile.schema,
+        profile_schema: profile_document_schema(&profile_directory.join(PROFILE_FILE))?,
         profile_id: profile.id,
         files: entries,
     };
@@ -140,14 +165,34 @@ pub fn import_profile(
     if archive.len() > limits.maximum_files.saturating_add(1) {
         return Err(ArchiveError::LimitExceeded("file count"));
     }
+    let mut manifest_count = 0;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        if entry.name() == MANIFEST_FILE {
+            manifest_count += 1;
+            if entry.is_dir() || is_symlink(entry.unix_mode()) {
+                return Err(ArchiveError::InvalidManifest);
+            }
+        }
+    }
+    if manifest_count != 1 {
+        return Err(ArchiveError::InvalidManifest);
+    }
     let manifest: Manifest = {
-        let mut entry = archive
+        let entry = archive
             .by_name(MANIFEST_FILE)
             .map_err(|_| ArchiveError::MissingManifest)?;
         if entry.size() > limits.maximum_file_bytes {
             return Err(ArchiveError::LimitExceeded("manifest size"));
         }
-        serde_json::from_reader(&mut entry)?
+        let mut bytes = Vec::new();
+        entry
+            .take(limits.maximum_file_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limits.maximum_file_bytes {
+            return Err(ArchiveError::LimitExceeded("manifest size"));
+        }
+        serde_json::from_slice(&bytes)?
     };
     if manifest.schema != 1
         || manifest.profile_schema == 0
@@ -171,7 +216,9 @@ pub fn import_profile(
     fs::create_dir(&staging)?;
     let result = extract_archive(&mut archive, &manifest, &staging, limits).and_then(|()| {
         let profile = load_profile(&staging.join(PROFILE_FILE))?;
-        if profile.id != manifest.profile_id {
+        if profile.id != manifest.profile_id
+            || profile_document_schema(&staging.join(PROFILE_FILE))? != manifest.profile_schema
+        {
             return Err(ArchiveError::InvalidManifest);
         }
         validate_declared_assets(&profile, &staging)?;
@@ -186,7 +233,7 @@ pub fn import_profile(
     result
 }
 
-fn extract_archive(
+pub(crate) fn extract_archive(
     archive: &mut ZipArchive<File>,
     manifest: &Manifest,
     staging: &Path,
@@ -287,7 +334,9 @@ fn collect_portable_files(
     Ok(())
 }
 
-fn declared_asset_paths(profile: &Profile) -> HashSet<PathBuf> {
+/// Returns the portable detector asset paths explicitly referenced by a profile.
+#[must_use]
+pub fn declared_asset_paths(profile: &Profile) -> HashSet<PathBuf> {
     let mut assets = HashSet::new();
     for element in &profile.elements {
         match &element.detector {
